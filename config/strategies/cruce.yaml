@@ -1,7 +1,8 @@
-name: Cruce de Ema
+strategy_name: cruce
 description: A custom built strategy
 symbol: BTC/USDT
 timeframe: 1d
+trade_direction: Long
 risk_management:
   take_profit:
     type: percentage

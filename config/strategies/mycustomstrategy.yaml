@@ -1,0 +1,18 @@
+strategy_name: MyCustomStrategy
+description: A custom built strategy
+symbol: BTC/USDT
+timeframe: 1m
+trade_direction: Long
+risk_management:
+  take_profit:
+    type: percentage
+    value: 5.0
+  stop_loss:
+    type: percentage
+    value: 2.0
+entry_conditions:
+  logic: AND
+  rules: []
+exit_conditions:
+  logic: OR
+  rules: []

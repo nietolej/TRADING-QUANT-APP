@@ -14,3 +14,4 @@ pytest
 requests
 PyQt6
 pyqtgraph
+yfinance

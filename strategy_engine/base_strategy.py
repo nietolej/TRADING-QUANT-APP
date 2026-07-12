@@ -8,8 +8,14 @@ class BaseStrategy:
     """
     Clase base para cargar y evaluar una estrategia desde un archivo YAML.
     """
-    def __init__(self, config_path: str):
-        self.config = self._load_config(config_path)
+    def __init__(self, config_or_path):
+        if isinstance(config_or_path, str):
+            self.config = self._load_config(config_or_path)
+        elif isinstance(config_or_path, dict):
+            self.config = config_or_path
+        else:
+            raise TypeError("Expected a string path or a dictionary config.")
+            
         self.name = self.config.get("strategy_name", "Unknown Strategy")
         self.symbol = self.config.get("symbol", "BTC/USDT")
         self.timeframe = self.config.get("timeframe", "1h")

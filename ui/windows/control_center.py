@@ -10,6 +10,7 @@ from ui.windows.strategy_analyzer import StrategyAnalyzerWindow
 from ui.windows.strategy_builder import StrategyBuilderWindow
 from ui.windows.market_analyzer import MarketAnalyzerWindow
 from ui.windows.backtest_history import BacktestHistoryWindow
+from ui.windows.strategy_optimizer import StrategyOptimizerWindow
 
 class ControlCenterWindow(QMainWindow):
     def __init__(self):
@@ -60,6 +61,9 @@ class ControlCenterWindow(QMainWindow):
         action_strategy_analyzer = new_menu.addAction("Strategy Analyzer")
         action_strategy_analyzer.triggered.connect(self.open_strategy_analyzer)
         
+        action_strategy_optimizer = new_menu.addAction("Strategy Optimizer (Grid Search)")
+        action_strategy_optimizer.triggered.connect(self.open_strategy_optimizer)
+        
         action_strategy_builder = new_menu.addAction("Strategy Builder")
         action_strategy_builder.triggered.connect(self.open_strategy_builder)
         
@@ -104,6 +108,11 @@ class ControlCenterWindow(QMainWindow):
         print("Abriendo Strategy Analyzer...")
         self.sa_window = StrategyAnalyzerWindow()
         self.sa_window.show()
+        
+    def open_strategy_optimizer(self):
+        print("Abriendo Strategy Optimizer...")
+        self.opt_window = StrategyOptimizerWindow()
+        self.opt_window.show()
 
     def open_market_analyzer(self):
         print("Abriendo Market Analyzer...")
