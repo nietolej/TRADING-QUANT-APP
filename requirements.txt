@@ -1,0 +1,16 @@
+ccxt
+python-binance
+pandas
+numpy
+ta
+streamlit
+plotly
+SQLAlchemy
+APScheduler
+python-telegram-bot
+PyYAML
+python-dotenv
+pytest
+requests
+PyQt6
+pyqtgraph

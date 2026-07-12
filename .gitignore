@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+env/
+.venv/
+
+# Databases
+*.db
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# Editor
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Temporary Git files
+mingit/
+mingit.zip

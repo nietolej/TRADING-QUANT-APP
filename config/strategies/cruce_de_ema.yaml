@@ -1,0 +1,29 @@
+name: Cruce de Ema
+description: A custom built strategy
+symbol: BTC/USDT
+timeframe: 1d
+risk_management:
+  take_profit:
+    type: none
+    value: 20.0
+  stop_loss:
+    type: none
+    value: 5.0
+entry_conditions:
+  logic: AND
+  rules:
+  - type: technical_indicator
+    indicator1: EMA
+    period1: 10
+    operator: crosses_above
+    indicator2: EMA
+    period2: 25
+exit_conditions:
+  logic: OR
+  rules:
+  - type: technical_indicator
+    indicator1: EMA
+    period1: 10
+    operator: crosses_below
+    indicator2: EMA
+    period2: 25
