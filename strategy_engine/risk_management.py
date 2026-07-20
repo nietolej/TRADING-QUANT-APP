@@ -90,3 +90,33 @@ class RiskManager:
         # Por defecto invertir todo el capital disponible
         # Asume que 'capital' es la fracción que se desea invertir si es fijo
         return capital / entry_price
+
+    def update_trailing_sl(self, current_sl: float, current_price: float, current_high: float, current_low: float, current_atr: float = None, side: str = "long") -> float:
+        """
+        Actualiza el Stop Loss para métodos de trailing stop (trailing_percent, chandelier).
+        """
+        sl_type = self.sl_config.get("type", "").replace(" ", "_")
+        
+        if sl_type == "trailing_percent":
+            sl_pct = self.sl_config.get("value", 0) / 100.0
+            if side == "long":
+                new_sl = current_high * (1 - sl_pct)
+                return max(current_sl, new_sl) if current_sl else new_sl
+            else:
+                new_sl = current_low * (1 + sl_pct)
+                return min(current_sl, new_sl) if current_sl else new_sl
+                
+        elif sl_type == "dynamic" and self.sl_config.get("dynamic_method") == "chandelier":
+            if current_atr is None:
+                return current_sl
+                
+            atr_mult = self.sl_config.get("atr_multiplier", 2.5)
+            if side == "long":
+                new_sl = current_high - (current_atr * atr_mult)
+                return max(current_sl, new_sl) if current_sl else new_sl
+            else:
+                new_sl = current_low + (current_atr * atr_mult)
+                return min(current_sl, new_sl) if current_sl else new_sl
+                
+        return current_sl
+

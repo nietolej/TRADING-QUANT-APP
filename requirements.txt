@@ -3,7 +3,6 @@ python-binance
 pandas
 numpy
 ta
-streamlit
 plotly
 SQLAlchemy
 APScheduler
@@ -12,6 +11,10 @@ PyYAML
 python-dotenv
 pytest
 requests
-PyQt6
-pyqtgraph
 yfinance
+fastapi
+uvicorn
+vectorbt
+nicegui
+scikit-learn
+joblib

@@ -1,5 +1,5 @@
 @echo off
-echo Iniciando NinjaTrader 8 Clone (Trading Quant App)...
-call .\venv\Scripts\activate.bat
-python nt8_app.py
+echo Iniciando Servidor Trading Quant (FastAPI + NiceGUI)...
+start http://127.0.0.1:8000
+.\venv\Scripts\uvicorn.exe api.main:app --reload --port 8000
 pause

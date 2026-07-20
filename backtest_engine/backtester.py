@@ -12,10 +12,73 @@ class Backtester:
         self.initial_capital = initial_capital
         self.commission_pct = commission_pct / 100.0
         self.slippage_pct = slippage_pct / 100.0
+        self.use_vectorbt = True  # Flag to use vectorized backtesting by default
+
+    def run_vectorized(self, df: pd.DataFrame) -> dict:
+        """
+        Ejecuta el backtest utilizando vectorbt para máxima velocidad.
+        Ideal para Grid Search y ML.
+        """
+        import vectorbt as vbt
+        
+        if df.empty:
+            raise ValueError("El DataFrame está vacío.")
+            
+        # Generar señales vectorizadas
+        df = self.strategy.generate_signals(df)
+        
+        # Si el modelo usa Machine Learning, las señales vendrán pre-calculadas en df['ml_signal']
+        entries = df.get('entry_long', pd.Series(False, index=df.index))
+        exits = df.get('exit_long', pd.Series(False, index=df.index))
+        
+        # Construir portfolio usando vectorbt
+        portfolio = vbt.Portfolio.from_signals(
+            close=df['close'],
+            entries=entries,
+            exits=exits,
+            init_cash=self.initial_capital,
+            fees=self.commission_pct,
+            slippage=self.slippage_pct,
+            freq='D' # Asumir diario por defecto o leer de config
+        )
+        
+        # Mapeo de métricas a nuestro formato
+        metrics = portfolio.stats()
+        
+        run_results = {
+            "run_id": str(uuid.uuid4()),
+            "strategy_name": self.strategy.name,
+            "config_snapshot": json.dumps(self.strategy.config),
+            "symbol": self.strategy.symbol,
+            "timeframe": self.strategy.timeframe,
+            "start_date": df.index[0] if isinstance(df.index, pd.DatetimeIndex) else None,
+            "end_date": df.index[-1] if isinstance(df.index, pd.DatetimeIndex) else None,
+            "created_at": datetime.now(),
+            "trades": portfolio.trades.records_readable,
+            "equity_curve": pd.DataFrame({"equity": portfolio.value()}),
+            "raw_data": df,
+            "cagr": metrics.get("CAGR [%]", 0) / 100,
+            "max_drawdown_pct": metrics.get("Max Drawdown [%]", 0),
+            "percent_profitable": metrics.get("Win Rate [%]", 0),
+            "profit_factor": metrics.get("Profit Factor", 0),
+            "total_trades": metrics.get("Total Trades", 0),
+            "average_trade_net_profit": metrics.get("Avg Winning Trade [%]", 0)
+        }
+        return run_results
+
         
     def run(self, df: pd.DataFrame) -> dict:
         """
-        Ejecuta el backtest sobre el DataFrame. 
+        Punto de entrada general.
+        """
+        if self.use_vectorbt:
+            return self.run_vectorized(df)
+            
+        return self.run_iterative(df)
+        
+    def run_iterative(self, df: pd.DataFrame) -> dict:
+        """
+        Ejecuta el backtest sobre el DataFrame (modo iterativo legacy). 
         Asume que df contiene 'open', 'high', 'low', 'close', y variables on-chain si son necesarias.
         """
         if df.empty:
@@ -46,13 +109,16 @@ class Backtester:
             
             # Revisar condiciones de salida o SL/TP si estamos en posición
             if position > 0:
-                # Actualizar Trailing Stop Loss
-                sl_type = self.strategy.risk_manager.config.get("stop_loss", {}).get("type")
-                if sl_type == "trailing_percent":
-                    sl_pct = self.strategy.risk_manager.config.get("stop_loss", {}).get("value", 0) / 100.0
-                    new_sl = row['high'] * (1 - sl_pct)
-                    if new_sl > sl_price:
-                        sl_price = new_sl
+                # Actualizar Trailing Stop Loss (incluye chandelier)
+                current_atr = row.get('ATR', None)
+                sl_price = self.strategy.risk_manager.update_trailing_sl(
+                    current_sl=sl_price, 
+                    current_price=row['close'], 
+                    current_high=row['high'], 
+                    current_low=row['low'], 
+                    current_atr=current_atr, 
+                    side="long"
+                )
                 
                 exit_reason = None
                 exit_p = row['close']
@@ -91,12 +157,15 @@ class Backtester:
             
             elif position < 0:
                 # Actualizar Trailing Stop Loss (Inverso: SL baja cuando precio baja)
-                sl_type = self.strategy.risk_manager.config.get("stop_loss", {}).get("type")
-                if sl_type == "trailing_percent":
-                    sl_pct = self.strategy.risk_manager.config.get("stop_loss", {}).get("value", 0) / 100.0
-                    new_sl = row['low'] * (1 + sl_pct)
-                    if new_sl < sl_price or sl_price == 0:
-                        sl_price = new_sl
+                current_atr = row.get('ATR', None)
+                sl_price = self.strategy.risk_manager.update_trailing_sl(
+                    current_sl=sl_price, 
+                    current_price=row['close'], 
+                    current_high=row['high'], 
+                    current_low=row['low'], 
+                    current_atr=current_atr, 
+                    side="short"
+                )
                 
                 exit_reason = None
                 exit_p = row['close']
