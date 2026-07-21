@@ -1,6 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from api.routes import backtest_router, data_router
+from data_layer.storage import init_db
+
+init_db()
 
 app = FastAPI(
     title="Trading Quant API",

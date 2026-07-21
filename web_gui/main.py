@@ -17,8 +17,8 @@ def create_gui(app):
             ui.label('Trading Quant App - Web Version').classes('text-2xl font-bold')
             ui.button('Configuración', icon='settings', color='transparent').classes('text-white')
             
-        with ui.row().classes('w-full justify-center q-pt-xl'):
-            with ui.card().classes('w-full max-w-6xl q-pa-none'):
+        with ui.row().classes('w-full q-px-md q-pt-md'):
+            with ui.card().classes('w-full q-pa-none'):
                 
                 with ui.tabs().classes('w-full bg-gray-100 text-gray-700 font-bold') as tabs:
                     tab_builder = ui.tab('Strategy Builder', icon='build')

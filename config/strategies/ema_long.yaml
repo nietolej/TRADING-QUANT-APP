@@ -1,0 +1,38 @@
+strategy_name: EMA LONG
+description: EMA
+trade_direction: Long
+parameters:
+  FAST: '0'
+  LOW: '0'
+  SL: '0'
+  TP: '0'
+  param_5: '0'
+risk_management:
+  take_profit:
+    type: percentage
+    value: TP
+  stop_loss:
+    type: percentage
+    value: SL
+entry_conditions:
+  logic: AND
+  rules:
+  - name: rule_1784650631280
+    type: technical_indicator
+    indicator1: EMA
+    period1: FAST
+    operator: crosses_above
+    indicator2: EMA
+    period2: LOW
+    details: EMA(FAST) crosses_above EMA(LOW)
+exit_conditions:
+  logic: OR
+  rules:
+  - name: rule_1784650646048
+    type: technical_indicator
+    indicator1: EMA
+    period1: FAST
+    operator: crosses_below
+    indicator2: EMA
+    period2: LOW
+    details: EMA(FAST) crosses_below EMA(LOW)

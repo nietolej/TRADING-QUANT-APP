@@ -34,7 +34,7 @@ class RiskManager:
                 sl_price = entry_price * (1 + sl_val)
         elif sl_type == "dynamic":
             method = self.sl_config.get("dynamic_method", "atr")
-            if method == "atr":
+            if method in ["atr", "chandelier"]:
                 atr_period = self.sl_config.get("atr_period", 14)
                 atr_mult = self.sl_config.get("atr_multiplier", 2.0)
                 if 'ATR' not in df.columns:

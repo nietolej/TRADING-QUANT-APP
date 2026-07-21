@@ -160,23 +160,74 @@ class StrategyBuilderWindow(QMainWindow):
         
         # Take Profit
         self.tp_type = QComboBox()
-        self.tp_type.addItems(["None", "Percentage", "Fixed Price"])
+        self.tp_type.addItems(["None", "Percentage", "Fixed Price", "Dynamic (Risk Reward)"])
+        self.tp_type.currentIndexChanged.connect(self.on_tp_type_changed)
         layout.addRow("Take Profit Type:", self.tp_type)
         
         self.tp_val = QDoubleSpinBox()
-        self.tp_val.setRange(0, 1000)
+        self.tp_val.setRange(0, 1000000)
         self.tp_val.setValue(5.0)
-        layout.addRow("Take Profit Value (%):", self.tp_val)
+        layout.addRow("Take Profit Value:", self.tp_val)
+        
+        self.tp_rr = QDoubleSpinBox()
+        self.tp_rr.setRange(0.1, 100)
+        self.tp_rr.setValue(2.0)
+        layout.addRow("Risk Reward Ratio:", self.tp_rr)
         
         # Stop Loss
         self.sl_type = QComboBox()
-        self.sl_type.addItems(["None", "Percentage", "Trailing Percent"])
+        self.sl_type.addItems(["None", "Percentage", "Trailing Percent", "Dynamic (ATR)", "Dynamic (Chandelier)"])
+        self.sl_type.currentIndexChanged.connect(self.on_sl_type_changed)
         layout.addRow("Stop Loss Type:", self.sl_type)
         
         self.sl_val = QDoubleSpinBox()
         self.sl_val.setRange(0, 1000)
         self.sl_val.setValue(2.0)
         layout.addRow("Stop Loss Value (%):", self.sl_val)
+        
+        self.sl_atr_period = QDoubleSpinBox()
+        self.sl_atr_period.setRange(1, 1000)
+        self.sl_atr_period.setDecimals(0)
+        self.sl_atr_period.setValue(14)
+        layout.addRow("ATR Period:", self.sl_atr_period)
+        
+        self.sl_atr_mult = QDoubleSpinBox()
+        self.sl_atr_mult.setRange(0.1, 100)
+        self.sl_atr_mult.setValue(2.0)
+        layout.addRow("ATR Multiplier:", self.sl_atr_mult)
+        
+        self.on_tp_type_changed()
+        self.on_sl_type_changed()
+
+    def on_tp_type_changed(self):
+        tp_t = self.tp_type.currentText()
+        show_val = tp_t in ["Percentage", "Fixed Price"]
+        show_rr = tp_t == "Dynamic (Risk Reward)"
+        
+        self.tp_val.setVisible(show_val)
+        lbl_val = self.tab_risk.layout().labelForField(self.tp_val)
+        if lbl_val: lbl_val.setVisible(show_val)
+        
+        self.tp_rr.setVisible(show_rr)
+        lbl_rr = self.tab_risk.layout().labelForField(self.tp_rr)
+        if lbl_rr: lbl_rr.setVisible(show_rr)
+
+    def on_sl_type_changed(self):
+        sl_t = self.sl_type.currentText()
+        show_val = sl_t in ["Percentage", "Trailing Percent"]
+        show_atr = sl_t in ["Dynamic (ATR)", "Dynamic (Chandelier)"]
+        
+        self.sl_val.setVisible(show_val)
+        lbl_val = self.tab_risk.layout().labelForField(self.sl_val)
+        if lbl_val: lbl_val.setVisible(show_val)
+        
+        self.sl_atr_period.setVisible(show_atr)
+        lbl_p = self.tab_risk.layout().labelForField(self.sl_atr_period)
+        if lbl_p: lbl_p.setVisible(show_atr)
+        
+        self.sl_atr_mult.setVisible(show_atr)
+        lbl_m = self.tab_risk.layout().labelForField(self.sl_atr_mult)
+        if lbl_m: lbl_m.setVisible(show_atr)
         
     def setup_entry_tab(self):
         layout = QVBoxLayout(self.tab_entry)
@@ -246,6 +297,46 @@ class StrategyBuilderWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Strategy Name is required.")
             return
             
+        # Build Take Profit configuration
+        tp_type_str = self.tp_type.currentText()
+        tp_config = {}
+        if tp_type_str == "None":
+            tp_config = {"type": "none", "value": 0.0}
+        elif tp_type_str == "Percentage":
+            tp_config = {"type": "percentage", "value": float(self.tp_val.value())}
+        elif tp_type_str == "Fixed Price":
+            tp_config = {"type": "fixed_price", "value": float(self.tp_val.value())}
+        elif tp_type_str == "Dynamic (Risk Reward)":
+            tp_config = {
+                "type": "dynamic",
+                "dynamic_method": "risk_reward_ratio",
+                "risk_reward_ratio": float(self.tp_rr.value())
+            }
+
+        # Build Stop Loss configuration
+        sl_type_str = self.sl_type.currentText()
+        sl_config = {}
+        if sl_type_str == "None":
+            sl_config = {"type": "none", "value": 0.0}
+        elif sl_type_str == "Percentage":
+            sl_config = {"type": "percentage", "value": float(self.sl_val.value())}
+        elif sl_type_str == "Trailing Percent":
+            sl_config = {"type": "trailing_percent", "value": float(self.sl_val.value())}
+        elif sl_type_str == "Dynamic (ATR)":
+            sl_config = {
+                "type": "dynamic",
+                "dynamic_method": "atr",
+                "atr_period": int(self.sl_atr_period.value()),
+                "atr_multiplier": float(self.sl_atr_mult.value())
+            }
+        elif sl_type_str == "Dynamic (Chandelier)":
+            sl_config = {
+                "type": "dynamic",
+                "dynamic_method": "chandelier",
+                "atr_period": int(self.sl_atr_period.value()),
+                "atr_multiplier": float(self.sl_atr_mult.value())
+            }
+
         config = {
             "strategy_name": self.name_input.text() or "MyStrategy",
             "description": self.desc_input.text(),
@@ -253,14 +344,8 @@ class StrategyBuilderWindow(QMainWindow):
             "timeframe": self.timeframe_input.currentText(),
             "trade_direction": self.direction_input.currentText(),
             "risk_management": {
-                "take_profit": {
-                    "type": self.tp_type.currentText().lower(),
-                    "value": float(self.tp_val.value())
-                },
-                "stop_loss": {
-                    "type": self.sl_type.currentText().lower().replace(" ", "_"),
-                    "value": float(self.sl_val.value())
-                }
+                "take_profit": tp_config,
+                "stop_loss": sl_config
             },
             "entry_conditions": {
                 "logic": self.entry_logic_combo.currentText(),
@@ -303,15 +388,41 @@ class StrategyBuilderWindow(QMainWindow):
             if idx >= 0: self.direction_input.setCurrentIndex(idx)
             
             rm = config.get("risk_management", {})
-            tp = rm.get("take_profit", {})
-            idx = self.tp_type.findText(tp.get("type", "none").replace("_", " ").title())
-            if idx >= 0: self.tp_type.setCurrentIndex(idx)
-            self.tp_val.setValue(float(tp.get("value", 0)))
             
+            # Load Take Profit
+            tp = rm.get("take_profit", {})
+            tp_type_lower = tp.get("type", "none").lower()
+            if tp_type_lower == "none":
+                self.tp_type.setCurrentText("None")
+            elif tp_type_lower == "percentage":
+                self.tp_type.setCurrentText("Percentage")
+                self.tp_val.setValue(float(tp.get("value", 5.0)))
+            elif tp_type_lower == "fixed_price":
+                self.tp_type.setCurrentText("Fixed Price")
+                self.tp_val.setValue(float(tp.get("value", 0.0)))
+            elif tp_type_lower == "dynamic" and tp.get("dynamic_method") == "risk_reward_ratio":
+                self.tp_type.setCurrentText("Dynamic (Risk Reward)")
+                self.tp_rr.setValue(float(tp.get("risk_reward_ratio", 2.0)))
+            
+            # Load Stop Loss
             sl = rm.get("stop_loss", {})
-            idx = self.sl_type.findText(sl.get("type", "none").replace("_", " ").title())
-            if idx >= 0: self.sl_type.setCurrentIndex(idx)
-            self.sl_val.setValue(float(sl.get("value", 0)))
+            sl_type_lower = sl.get("type", "none").lower()
+            if sl_type_lower == "none":
+                self.sl_type.setCurrentText("None")
+            elif sl_type_lower == "percentage":
+                self.sl_type.setCurrentText("Percentage")
+                self.sl_val.setValue(float(sl.get("value", 2.0)))
+            elif sl_type_lower == "trailing_percent":
+                self.sl_type.setCurrentText("Trailing Percent")
+                self.sl_val.setValue(float(sl.get("value", 2.0)))
+            elif sl_type_lower == "dynamic":
+                method = sl.get("dynamic_method", "atr")
+                if method == "atr":
+                    self.sl_type.setCurrentText("Dynamic (ATR)")
+                elif method == "chandelier":
+                    self.sl_type.setCurrentText("Dynamic (Chandelier)")
+                self.sl_atr_period.setValue(float(sl.get("atr_period", 14)))
+                self.sl_atr_mult.setValue(float(sl.get("atr_multiplier", 2.0)))
             
             self.entry_rules = []
             self.entry_table.setRowCount(0)

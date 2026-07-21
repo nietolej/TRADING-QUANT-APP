@@ -1,0 +1,37 @@
+strategy_name: EMA SHORT
+description: EMASHORT
+trade_direction: Short
+parameters:
+  LENTA: 30
+  RAPIDA: 16
+  TP: 50.0
+  SL: 5.0
+risk_management:
+  take_profit:
+    type: percentage
+    value: TP
+  stop_loss:
+    type: percentage
+    value: SL
+entry_conditions:
+  logic: AND
+  rules:
+  - name: rule_1784653652089
+    type: technical_indicator
+    indicator1: EMA
+    period1: RAPIDA
+    operator: crosses_below
+    indicator2: EMA
+    period2: LENTA
+    details: EMA(RAPIDA) crosses_below EMA(LENTA)
+  - name: rule_1784653660234
+    type: technical_indicator
+    indicator1: EMA
+    period1: RAPIDA
+    operator: crosses_above
+    indicator2: EMA
+    period2: LENTA
+    details: EMA(RAPIDA) crosses_above EMA(LENTA)
+exit_conditions:
+  logic: OR
+  rules: []

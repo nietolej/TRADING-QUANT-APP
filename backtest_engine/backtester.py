@@ -45,6 +45,19 @@ class Backtester:
         # Mapeo de métricas a nuestro formato
         metrics = portfolio.stats()
         
+        vbt_trades = portfolio.trades.records_readable
+        trades_df = pd.DataFrame()
+        if not vbt_trades.empty:
+            trades_df['entry_time'] = vbt_trades['Entry Timestamp']
+            trades_df['exit_time'] = vbt_trades['Exit Timestamp']
+            trades_df['side'] = vbt_trades['Direction'].str.lower()
+            trades_df['entry_price'] = vbt_trades['Avg Entry Price']
+            trades_df['exit_price'] = vbt_trades['Avg Exit Price']
+            trades_df['quantity'] = vbt_trades['Size']
+            trades_df['pnl'] = vbt_trades['PnL']
+            trades_df['exit_reason'] = "Signal"
+            trades_df['portfolio_value'] = vbt_trades['PnL'].cumsum() + self.initial_capital
+            
         run_results = {
             "run_id": str(uuid.uuid4()),
             "strategy_name": self.strategy.name,
@@ -54,7 +67,7 @@ class Backtester:
             "start_date": df.index[0] if isinstance(df.index, pd.DatetimeIndex) else None,
             "end_date": df.index[-1] if isinstance(df.index, pd.DatetimeIndex) else None,
             "created_at": datetime.now(),
-            "trades": portfolio.trades.records_readable,
+            "trades": trades_df,
             "equity_curve": pd.DataFrame({"equity": portfolio.value()}),
             "raw_data": df,
             "cagr": metrics.get("CAGR [%]", 0) / 100,
@@ -71,7 +84,13 @@ class Backtester:
         """
         Punto de entrada general.
         """
-        if self.use_vectorbt:
+        sl_type = self.strategy.risk_manager.sl_config.get("type", "none").lower()
+        tp_type = self.strategy.risk_manager.tp_config.get("type", "none").lower()
+        has_sl = sl_type not in ["none", ""]
+        has_tp = tp_type not in ["none", ""]
+        
+        # Si la estrategia tiene SL o TP activos, usamos el backtester iterativo para simularlos con precisión
+        if self.use_vectorbt and not (has_sl or has_tp):
             return self.run_vectorized(df)
             
         return self.run_iterative(df)

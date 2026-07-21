@@ -77,6 +77,7 @@ class ConditionEvaluator:
         
         def get_series(ind, p):
             if ind == "Price": return df['close']
+            if ind == "Volume": return df['volume']
             if ind == "SMA": return ta.trend.sma_indicator(df['close'], window=p)
             if ind == "EMA": return ta.trend.ema_indicator(df['close'], window=p)
             return df['close']

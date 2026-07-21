@@ -1,0 +1,34 @@
+strategy_name: CRUCE EMA SHORT 1D
+description: CRUCE SHORT EMA EN RANGO DIARIO
+symbol: BTC/USDT
+timeframe: 1d
+trade_direction: Short
+risk_management:
+  take_profit:
+    type: percentage
+    value: 100.0
+  stop_loss:
+    type: percentage
+    value: 5.0
+entry_conditions:
+  logic: AND
+  rules:
+  - name: rule_1784583830951
+    type: technical_indicator
+    indicator1: EMA
+    period1: 1
+    operator: crosses_below
+    indicator2: EMA
+    period2: 16
+    details: EMA(1) crosses_below EMA(16)
+exit_conditions:
+  logic: OR
+  rules:
+  - name: rule_1784583843985
+    type: technical_indicator
+    indicator1: EMA
+    period1: 1
+    operator: crosses_above
+    indicator2: EMA
+    period2: 16
+    details: EMA(1) crosses_above EMA(16)

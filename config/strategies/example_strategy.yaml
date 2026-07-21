@@ -2,12 +2,18 @@ strategy_name: "SMA_Cross_OnChain_Confirm"
 symbol: "BTC/USDT"
 timeframe: "4h"
 
+parameters:
+  fast_period: 20
+  slow_period: 50
+  risk_pct: 1.0
+  atr_mult: 2.5
+
 entry_conditions:
   logic: "OR"
   rules:
     - type: "ma_cross"
-      fast_period: 20
-      slow_period: 50
+      fast_period: "fast_period"
+      slow_period: "slow_period"
       ma_type: "EMA"
       direction: "bullish"
     - type: "onchain_threshold"
@@ -20,8 +26,8 @@ exit_conditions:
   logic: "OR"
   rules:
     - type: "ma_cross"
-      fast_period: 20
-      slow_period: 50
+      fast_period: "fast_period"
+      slow_period: "slow_period"
       ma_type: "EMA"
       direction: "bearish"
     - type: "rsi_threshold"
@@ -32,14 +38,14 @@ exit_conditions:
 risk_management:
   position_sizing:
     method: "fixed_fractional"
-    risk_per_trade_pct: 1.0
+    risk_per_trade_pct: "risk_pct"
 
   stop_loss:
     type: "dynamic" 
     fixed_pct: 2.0
     dynamic_method: "atr"
     atr_period: 14
-    atr_multiplier: 2.5
+    atr_multiplier: "atr_mult"
 
   take_profit:
     type: "fixed"

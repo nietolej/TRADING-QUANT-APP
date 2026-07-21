@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import time
 
 from data_layer.storage import SessionLocal
-from data_layer.market_data import MarketDataManager
+from data_layer.market_data import MarketDataManager, get_binance_exchange
 
 class DownloadWorker(QThread):
     progress = pyqtSignal(str)
@@ -158,7 +158,7 @@ class BulkDownloaderDialog(QDialog):
     def load_markets(self):
         try:
             self.log_output.append("Fetching markets from Binance...")
-            exchange = ccxt.binanceus({'enableRateLimit': True})
+            exchange = get_binance_exchange({'enableRateLimit': True})
             markets = exchange.load_markets()
             
             # Filtramos por defecto los de USDT

@@ -1,0 +1,34 @@
+strategy_name: CRUCE EMAS
+description: EMA LONG
+symbol: BTC/USDT
+timeframe: 1d
+trade_direction: Long
+risk_management:
+  take_profit:
+    type: percentage
+    value: 50.0
+  stop_loss:
+    type: percentage
+    value: 5.0
+entry_conditions:
+  logic: AND
+  rules:
+  - name: rule_1784579428070
+    type: technical_indicator
+    indicator1: SMA
+    period1: 1
+    operator: crosses_above
+    indicator2: SMA
+    period2: 16
+    details: SMA(1) crosses_above SMA(16)
+exit_conditions:
+  logic: OR
+  rules:
+  - name: rule_1784579459853
+    type: technical_indicator
+    indicator1: SMA
+    period1: 1
+    operator: crosses_below
+    indicator2: SMA
+    period2: 16
+    details: SMA(1) crosses_below SMA(16)

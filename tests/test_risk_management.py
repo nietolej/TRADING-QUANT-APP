@@ -98,5 +98,22 @@ class TestRiskManagement(unittest.TestCase):
         new_sl = rm.update_trailing_sl(new_sl, current_price=105.0, current_high=106.0, current_low=104.0, current_atr=None, side="long")
         self.assertAlmostEqual(new_sl, 107.8)
         
+    def test_dynamic_chandelier_sl_long(self):
+        config = {
+            "stop_loss": {
+                "type": "dynamic", 
+                "dynamic_method": "chandelier", 
+                "atr_period": 2, 
+                "atr_multiplier": 2.5
+            }
+        }
+        rm = RiskManager(config)
+        sl, tp = rm.compute_sl_tp(self.df, entry_index=1, side="long")
+        # Ensure initial sl is set and is less than current entry price
+        self.assertTrue(sl is not None)
+        self.assertTrue(sl < 102.0)
+        # Check if 'ATR' column was added to df
+        self.assertTrue('ATR' in self.df.columns)
+
 if __name__ == '__main__':
     unittest.main()
