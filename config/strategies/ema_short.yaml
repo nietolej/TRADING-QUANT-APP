@@ -1,5 +1,5 @@
 strategy_name: EMA SHORT
-description: EMASHORT
+description: EMA SHORT
 trade_direction: Short
 parameters:
   LENTA: 30
@@ -16,7 +16,7 @@ risk_management:
 entry_conditions:
   logic: AND
   rules:
-  - name: rule_1784653652089
+  - name: rule_1784835407023
     type: technical_indicator
     indicator1: EMA
     period1: RAPIDA
@@ -24,7 +24,10 @@ entry_conditions:
     indicator2: EMA
     period2: LENTA
     details: EMA(RAPIDA) crosses_below EMA(LENTA)
-  - name: rule_1784653660234
+exit_conditions:
+  logic: OR
+  rules:
+  - name: rule_1784835417447
     type: technical_indicator
     indicator1: EMA
     period1: RAPIDA
@@ -32,6 +35,3 @@ entry_conditions:
     indicator2: EMA
     period2: LENTA
     details: EMA(RAPIDA) crosses_above EMA(LENTA)
-exit_conditions:
-  logic: OR
-  rules: []

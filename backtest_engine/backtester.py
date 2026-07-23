@@ -38,14 +38,19 @@ class Backtester:
             exits=exits,
             init_cash=self.initial_capital,
             fees=self.commission_pct,
-            slippage=self.slippage_pct,
-            freq='D' # Asumir diario por defecto o leer de config
+            slippage=self.slippage_pct
         )
         
         # Mapeo de métricas a nuestro formato
         metrics = portfolio.stats()
-        
-        vbt_trades = portfolio.trades.records_readable
+        try:
+            vbt_trades = portfolio.trades.records_readable
+        except AttributeError:
+            try:
+                vbt_trades = portfolio.trades.records
+            except Exception:
+                vbt_trades = pd.DataFrame()
+
         trades_df = pd.DataFrame()
         if not vbt_trades.empty:
             trades_df['entry_time'] = vbt_trades['Entry Timestamp']
@@ -83,18 +88,28 @@ class Backtester:
     def run(self, df: pd.DataFrame) -> dict:
         """
         Punto de entrada general.
+        Intenta vectorbt si no hay SL/TP activos; cae a iterativo si falla.
         """
         sl_type = self.strategy.risk_manager.sl_config.get("type", "none").lower()
         tp_type = self.strategy.risk_manager.tp_config.get("type", "none").lower()
         has_sl = sl_type not in ["none", ""]
         has_tp = tp_type not in ["none", ""]
         
-        # Si la estrategia tiene SL o TP activos, usamos el backtester iterativo para simularlos con precisión
-        if self.use_vectorbt and not (has_sl or has_tp):
-            return self.run_vectorized(df)
+        # Con SL/TP activos siempre usamos modo iterativo (más preciso)
+        if has_sl or has_tp:
+            return self.run_iterative(df)
+        
+        # Sin SL/TP intentamos vectorbt; si falla, caemos a iterativo
+        if self.use_vectorbt:
+            try:
+                return self.run_vectorized(df)
+            except Exception as vbt_err:
+                import warnings
+                warnings.warn(f"vectorbt falló ({vbt_err}), usando backtester iterativo.")
             
         return self.run_iterative(df)
         
+
     def run_iterative(self, df: pd.DataFrame) -> dict:
         """
         Ejecuta el backtest sobre el DataFrame (modo iterativo legacy). 

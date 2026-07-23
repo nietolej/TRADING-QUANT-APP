@@ -3,9 +3,16 @@ import yaml
 import os
 import glob
 
+# Ruta absoluta a la raíz del proyecto (2 niveles arriba de este archivo)
+_PAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.abspath(os.path.join(_PAGE_DIR, '..', '..'))
+STRATEGIES_DIR = os.path.join(BASE_DIR, 'config', 'strategies')
+
 def render_strategy_builder():
     with ui.column().classes('w-full q-pa-md'):
-        ui.label('Strategy Builder').classes('text-2xl font-bold text-primary q-mb-md')
+        with ui.row().classes('w-full justify-between items-center q-mb-md'):
+            ui.label('Strategy Builder').classes('text-2xl font-bold text-primary')
+            ui.button('Ver Catálogo de Estrategias', on_click=lambda: load_catalog(), icon='list').classes('bg-blue-600 text-white font-bold')
         
         # State
         state = {
@@ -274,7 +281,7 @@ def render_strategy_builder():
             
             def load_catalog():
                 rows = []
-                for f_path in glob.glob("config/strategies/*.yaml"):
+                for f_path in glob.glob(os.path.join(STRATEGIES_DIR, '*.yaml')):
                     try:
                         with open(f_path, 'r') as f:
                             data = yaml.safe_load(f)
@@ -294,12 +301,22 @@ def render_strategy_builder():
                 catalog_table.update()
                 catalog_dialog.open()
                 
-            def edit_strategy(e):
-                row = e.args
-                strategy_name = row['name']
-                f_path = f"config/strategies/{strategy_name.lower().replace(' ', '_')}.yaml"
+            def load_strategy_data(strategy_name):
+                matched_file = None
+                for f_path in glob.glob(os.path.join(STRATEGIES_DIR, '*.yaml')):
+                    try:
+                        with open(f_path, 'r', encoding='utf-8') as f:
+                            data = yaml.safe_load(f)
+                            if data and data.get('strategy_name') == strategy_name:
+                                matched_file = f_path
+                                break
+                    except Exception:
+                        pass
+                if not matched_file:
+                    matched_file = os.path.join(STRATEGIES_DIR, f"{strategy_name.lower().replace(' ', '_')}.yaml")
+                    
                 try:
-                    with open(f_path, 'r') as f:
+                    with open(matched_file, 'r', encoding='utf-8') as f:
                         data = yaml.safe_load(f)
                         if data:
                             state['strategy_name'] = data.get('strategy_name', strategy_name)
@@ -328,22 +345,43 @@ def render_strategy_builder():
                             exit_table.update()
                             strat_name_input.update()
                             
-                            ui.notify(f"Estrategia {strategy_name} cargada para editar", type='info')
-                            catalog_dialog.close()
+                            ui.notify(f"Estrategia '{strategy_name}' cargada para editar", type='info')
                 except Exception as ex:
                     ui.notify(f"Error cargando estrategia: {str(ex)}", type='negative')
 
             def delete_strategy(e):
                 row = e.args
                 strategy_name = row['name']
-                f_path = f"config/strategies/{strategy_name.lower().replace(' ', '_')}.yaml"
+                matched_file = None
+                for f_path in glob.glob(os.path.join(STRATEGIES_DIR, '*.yaml')):
+                    try:
+                        with open(f_path, 'r', encoding='utf-8') as f:
+                            data = yaml.safe_load(f)
+                            if data and data.get('strategy_name') == strategy_name:
+                                matched_file = f_path
+                                break
+                    except Exception:
+                        pass
+                if not matched_file:
+                    matched_file = os.path.join(STRATEGIES_DIR, f"{strategy_name.lower().replace(' ', '_')}.yaml")
+
                 try:
-                    if os.path.exists(f_path):
-                        os.remove(f_path)
-                        ui.notify(f"Estrategia {strategy_name} eliminada", type='positive')
-                        load_catalog()
+                    if os.path.exists(matched_file):
+                        os.remove(matched_file)
+                        ui.notify(f"Estrategia '{strategy_name}' eliminada correctamente", type='positive')
+                    else:
+                        ui.notify(f"No se encontró el archivo de la estrategia '{strategy_name}'", type='warning')
+                    
+                    nonlocal strategy_names
+                    strategy_files = glob.glob(os.path.join(STRATEGIES_DIR, '*.yaml'))
+                    strategy_names = [os.path.basename(f).replace('.yaml', '') for f in strategy_files]
                 except Exception as ex:
                     ui.notify(f"Error eliminando estrategia: {str(ex)}", type='negative')
+
+            def edit_strategy(e):
+                row = e.args
+                load_strategy_data(row['name'])
+                catalog_dialog.close()
 
             catalog_table.on('edit', edit_strategy)
             catalog_table.on('delete', delete_strategy)
@@ -353,3 +391,5 @@ def render_strategy_builder():
         with ui.row().classes('w-full justify-between q-mt-lg'):
             ui.button('Ver Estrategias Configuradas', on_click=load_catalog, icon='list').classes('px-8 py-2 bg-blue-500 text-white')
             ui.button('Save Strategy', on_click=save_strategy, color='positive').classes('px-8 py-2')
+
+        return {'load_strategy_data': load_strategy_data}

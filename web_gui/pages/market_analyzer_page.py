@@ -7,7 +7,7 @@ import pandas as pd
 
 def render_market_analyzer():
     with ui.column().classes('w-full q-pa-md'):
-        ui.label('Market Analyzer & Data Catalog').classes('text-2xl font-bold text-primary q-mb-md')
+        ui.label('Datos Almacenados y Catálogo de Mercado').classes('text-2xl font-bold text-primary q-mb-md')
         
         # ----------------- Main Data Catalog Table -----------------
         columns = [

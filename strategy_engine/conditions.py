@@ -76,10 +76,14 @@ class ConditionEvaluator:
         p2 = rule.get("period2", 50)
         
         def get_series(ind, p):
+            try:
+                p_int = max(1, int(float(p)))
+            except (ValueError, TypeError):
+                p_int = 20
             if ind == "Price": return df['close']
             if ind == "Volume": return df['volume']
-            if ind == "SMA": return ta.trend.sma_indicator(df['close'], window=p)
-            if ind == "EMA": return ta.trend.ema_indicator(df['close'], window=p)
+            if ind == "SMA": return ta.trend.sma_indicator(df['close'], window=p_int)
+            if ind == "EMA": return ta.trend.ema_indicator(df['close'], window=p_int)
             return df['close']
             
         s1 = get_series(ind1, p1)

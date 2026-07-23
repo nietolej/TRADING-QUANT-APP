@@ -42,6 +42,36 @@ def ensure_utc(dt: datetime) -> datetime:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
+def normalize_timeframe(tf: str) -> str:
+    """
+    Normaliza el timeframe convirtiendo traducciones del navegador (ej: '4 horas', '1 día')
+    o variaciones de texto a los timeframes canónicos de CCXT/DB ('1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w').
+    """
+    if not tf or not isinstance(tf, str):
+        return '4h'
+    s = tf.strip().lower()
+    mapping = {
+        '1m': '1m', '1 minuto': '1m', '1 minutes': '1m', '1min': '1m',
+        '5m': '5m', '5 minutos': '5m', '5 minutes': '5m', '5min': '5m',
+        '15m': '15m', '15 minutos': '15m', '15 minutes': '15m', '15min': '15m',
+        '30m': '30m', '30 minutos': '30m', '30 minutes': '30m', '30min': '30m',
+        '1h': '1h', '1 hora': '1h', '1 hour': '1h', '1h': '1h',
+        '4h': '4h', '4 horas': '4h', '4 hours': '4h', '4h': '4h',
+        '1d': '1d', '1 día': '1d', '1 dia': '1d', '1 day': '1d', 'diario': '1d', 'daily': '1d',
+        '1w': '1w', '1 semana': '1w', '1 week': '1w', 'semanal': '1w', 'weekly': '1w'
+    }
+    if s in mapping:
+        return mapping[s]
+    import re
+    m = re.match(r'^(\d+)\s*([a-zñáéíóú]+)$', s)
+    if m:
+        num, unit = m.group(1), m.group(2)
+        if unit.startswith('m'): return f"{num}m"
+        if unit.startswith('h'): return f"{num}h"
+        if unit.startswith('d'): return f"{num}d"
+        if unit.startswith('w') or unit.startswith('s'): return f"{num}w"
+    return tf
+
 class MarketDataManager:
     def __init__(self, db_session: Session = None):
         self.exchange = get_binance_exchange({
@@ -53,6 +83,7 @@ class MarketDataManager:
         """
         Descarga datos OHLCV de Binance.
         """
+        timeframe = normalize_timeframe(timeframe)
         since = ensure_utc(since)
         since_ms = int(since.timestamp() * 1000) if since else None
         
@@ -237,6 +268,7 @@ class MarketDataManager:
         """
         Obtiene datos históricos desde la base de datos local.
         """
+        timeframe = normalize_timeframe(timeframe)
         start_naive = ensure_utc(start_date).replace(tzinfo=None)
         query = self.db.query(OHLCV).filter(
             OHLCV.symbol == symbol,
