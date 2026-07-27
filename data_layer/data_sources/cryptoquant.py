@@ -31,14 +31,28 @@ class CryptoQuantProvider(BaseOnChainProvider):
         endpoint_map = {
             "exchange_netflow": f"/btc/exchange-flows/netflow?exchange=all_exchange&window=day",
             "exchange_inflow": f"/btc/exchange-flows/inflow?exchange=all_exchange&window=day",
-            "exchange_outflow": f"/btc/exchange-flows/outflow?exchange=all_exchange&window=day"
+            "exchange_outflow": f"/btc/exchange-flows/outflow?exchange=all_exchange&window=day",
+            "exchange_reserve": f"/btc/exchange-flows/reserve?exchange=all_exchange&window=day",
+            "miner_reserve": f"/btc/miner-flows/reserve?window=day",
+            "miner_netflow": f"/btc/miner-flows/netflow?window=day",
+            "puell_multiple": f"/btc/market-data/puell-multiple?window=day",
+            "mvrv": f"/btc/market-data/mvrv?window=day",
+            "nvt_golden_cross": f"/btc/market-data/nvt-golden-cross?window=day",
+            "sopr": f"/btc/market-data/sopr?window=day",
+            "active_addresses": f"/btc/network-data/active-addresses?window=day",
+            "funding_rates": f"/btc/market-data/funding-rates?window=day",
+            "open_interest": f"/btc/market-data/open-interest?window=day",
+            "estimated_leverage_ratio": f"/btc/market-data/estimated-leverage-ratio?window=day",
+            "taker_buy_sell_ratio": f"/btc/market-data/taker-buy-sell-ratio?window=day",
+            "nupl": f"/btc/market-data/nupl?window=day",
+            "stock_to_flow": f"/btc/market-data/stock-to-flow?window=day"
         }
         
         # Por ahora CryptoQuant API v1 a menudo requiere especificar si es btc o eth
         # Usaremos BTC para el ejemplo si el activo es BTC
-        if asset != "btc":
-            print(f"La métrica {metric_name} en CryptoQuant está configurada en el MVP para BTC. Modificar para otros activos.")
-            return pd.DataFrame()
+        if asset not in ["btc", "eth"]:
+            asset = "btc" # Default to BTC for CryptoQuant metrics if symbol is GLOBAL or generic
+
 
         endpoint = endpoint_map.get(metric_name)
         if not endpoint:
@@ -95,4 +109,4 @@ class CryptoQuantProvider(BaseOnChainProvider):
 
         except Exception as e:
             print(f"Error fetching CryptoQuant data: {e}")
-            return pd.DataFrame()
+            raise Exception(f"CryptoQuant API Error: {e}")

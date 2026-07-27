@@ -26,3 +26,11 @@ logs/
 # Temporary Git files
 mingit/
 mingit.zip
+
+# Environment & local secrets
+.env
+
+# Scratch & Backup
+scratch/
+*.bak
+

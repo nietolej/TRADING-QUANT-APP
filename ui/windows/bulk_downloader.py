@@ -11,6 +11,7 @@ import time
 
 from data_layer.storage import SessionLocal
 from data_layer.market_data import MarketDataManager, get_binance_exchange
+from data_layer.data_engine import DataAggregator
 
 class DownloadWorker(QThread):
     progress = pyqtSignal(str)
@@ -26,6 +27,25 @@ class DownloadWorker(QThread):
         
     def run(self):
         db = SessionLocal()
+        
+        if self.source == "all":
+            aggregator = DataAggregator(db)
+            
+            def emit_prog(msg):
+                self.progress.emit(msg)
+                
+            try:
+                aggregator.sync_all_data(
+                    self.symbols, self.timeframe, self.start_date, self.end_date,
+                    progress_callback=emit_prog
+                )
+            except Exception as e:
+                self.progress.emit(f"ERROR downloading unified data: {e}")
+                
+            db.close()
+            self.finished_batch.emit()
+            return
+            
         mgr = MarketDataManager(db)
         
         for i, sym in enumerate(self.symbols):
@@ -63,7 +83,7 @@ class BulkDownloaderDialog(QDialog):
         src_layout = QHBoxLayout()
         src_layout.addWidget(QLabel("Data Source:"))
         self.source_combo = QComboBox()
-        self.source_combo.addItems(["Binance (Crypto)", "Yahoo Finance (Stocks/Forex/Crypto)"])
+        self.source_combo.addItems(["Binance (Crypto)", "Yahoo Finance (Stocks/Forex/Crypto)", "All Available Data (Market + On-Chain)"])
         self.source_combo.currentIndexChanged.connect(self.on_source_changed)
         src_layout.addWidget(self.source_combo)
         src_layout.addStretch()
@@ -150,7 +170,7 @@ class BulkDownloaderDialog(QDialog):
         layout.addWidget(self.btn_start)
         
     def on_source_changed(self):
-        if self.source_combo.currentIndex() == 0:
+        if self.source_combo.currentIndex() == 0 or self.source_combo.currentIndex() == 2:
             self.stacked_widget.setCurrentIndex(0)
         else:
             self.stacked_widget.setCurrentIndex(1)
@@ -189,6 +209,12 @@ class BulkDownloaderDialog(QDialog):
         
         if self.source_combo.currentIndex() == 0:
             # Binance
+            for i in range(self.list_widget.count()):
+                if self.list_widget.item(i).checkState() == Qt.CheckState.Checked:
+                    selected_symbols.append(self.list_widget.item(i).text())
+        elif self.source_combo.currentIndex() == 2:
+            # All Available Data
+            source_name = "all"
             for i in range(self.list_widget.count()):
                 if self.list_widget.item(i).checkState() == Qt.CheckState.Checked:
                     selected_symbols.append(self.list_widget.item(i).text())

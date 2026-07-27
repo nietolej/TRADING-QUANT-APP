@@ -5,7 +5,13 @@ from ml_engine.model_trainer import MLModelTrainer
 
 def render_ml_page():
     with ui.column().classes('w-full q-pa-md'):
-        ui.label('Machine Learning Studio').classes('text-2xl font-bold text-primary q-mb-md')
+        # Hero Header
+        with ui.card().classes('w-full bg-slate-900 text-white p-6 rounded-2xl shadow-xl mb-6'):
+            with ui.row().classes('items-center gap-4'):
+                ui.icon('psychology', size='3rem').classes('text-blue-400')
+                with ui.column().classes('gap-1'):
+                    ui.label('Machine Learning Studio').classes('text-3xl font-extrabold tracking-tight')
+                    ui.label('Entrenamiento de modelos predictivos y análisis').classes('text-slate-400 text-sm')
         
         state = {
             'symbol': 'BTC/USDT',
@@ -16,14 +22,14 @@ def render_ml_page():
         }
 
         with ui.row().classes('w-full gap-4'):
-            with ui.card().classes('flex-1 q-pa-md'):
-                ui.label('Dataset Configuration').classes('text-lg font-bold')
+            with ui.card().classes('flex-1 p-6 rounded-2xl shadow-md border border-slate-100 bg-white'):
+                ui.label('Dataset Configuration').classes('text-lg font-bold text-slate-800 border-b pb-2 mb-4 w-full')
                 ui.select(['BTC/USDT', 'ETH/USDT'], label='Symbol', value=state['symbol']).bind_value(state, 'symbol').classes('w-full mt-2')
                 ui.select(['15m', '1h', '4h', '1d'], label='Timeframe', value=state['timeframe']).bind_value(state, 'timeframe').classes('w-full mt-2')
                 ui.select(['Random Forest'], label='Algorithm', value=state['model_type']).bind_value(state, 'model_type').classes('w-full mt-2')
 
-            with ui.card().classes('flex-1 q-pa-md'):
-                ui.label('Training Status').classes('text-lg font-bold')
+            with ui.card().classes('flex-1 p-6 rounded-2xl shadow-md border border-slate-100 bg-white'):
+                ui.label('Training Status').classes('text-lg font-bold text-slate-800 border-b pb-2 mb-4 w-full')
                 status_label = ui.label(state['status']).classes('text-xl font-bold mt-4')
                 
                 metrics_container = ui.column().classes('w-full mt-4')
@@ -83,4 +89,4 @@ def render_ml_page():
                     trainer.save_model(path)
                     ui.notify(f"Model saved to {path}", type='positive')
 
-                ui.button('Start Training', on_click=run_training, color='primary').classes('w-full mt-6')
+                ui.button('Start Training', on_click=run_training, icon='play_arrow').props('rounded').classes('w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 mt-6 shadow-md transition-all')

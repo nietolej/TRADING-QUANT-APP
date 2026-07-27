@@ -10,18 +10,25 @@ STRATEGIES_DIR = os.path.join(BASE_DIR, 'config', 'strategies')
 
 def render_strategy_catalog(on_edit_strategy=None, on_select_strategy=None):
     with ui.column().classes('w-full q-pa-md'):
-        ui.label('Catálogo de Estrategias').classes('text-2xl font-bold text-primary q-mb-md')
+        # Hero Header
+        with ui.card().classes('w-full bg-slate-900 text-white p-6 rounded-2xl shadow-xl mb-6'):
+            with ui.row().classes('items-center gap-4'):
+                ui.icon('list_alt', size='3rem').classes('text-blue-400')
+                with ui.column().classes('gap-1'):
+                    ui.label('Estrategias Guardadas').classes('text-3xl font-extrabold tracking-tight')
+                    ui.label('Administra, edita o analiza tus configuraciones de trading').classes('text-slate-400 text-sm')
         
-        catalog_columns = [
-            {'name': 'name', 'label': 'Nombre', 'field': 'name', 'sortable': True},
-            {'name': 'direction', 'label': 'Dirección', 'field': 'direction', 'sortable': True},
-            {'name': 'tp', 'label': 'Take Profit', 'field': 'tp', 'sortable': True},
-            {'name': 'sl', 'label': 'Stop Loss', 'field': 'sl', 'sortable': True},
-            {'name': 'description', 'label': 'Descripción', 'field': 'description', 'sortable': True},
-            {'name': 'actions', 'label': 'Acciones', 'field': 'actions'},
-        ]
-        
-        catalog_table = ui.table(columns=catalog_columns, rows=[], row_key='name').classes('w-full')
+        with ui.card().classes('w-full bg-white p-6 rounded-2xl shadow-md border border-slate-100'):
+            catalog_columns = [
+                {'name': 'name', 'label': 'Nombre', 'field': 'name', 'sortable': True},
+                {'name': 'direction', 'label': 'Dirección', 'field': 'direction', 'sortable': True},
+                {'name': 'tp', 'label': 'Take Profit', 'field': 'tp', 'sortable': True},
+                {'name': 'sl', 'label': 'Stop Loss', 'field': 'sl', 'sortable': True},
+                {'name': 'description', 'label': 'Descripción', 'field': 'description', 'sortable': True},
+                {'name': 'actions', 'label': 'Acciones', 'field': 'actions'},
+            ]
+            
+            catalog_table = ui.table(columns=catalog_columns, rows=[], row_key='name').classes('w-full')
         
         catalog_table.add_slot('body-cell-actions', '''
             <q-td :props="props">

@@ -28,6 +28,11 @@ def calculate_metrics(trades_df: pd.DataFrame, initial_capital: float) -> dict:
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
     avg_trade_net_profit = net_profit / total_trades if total_trades > 0 else 0
     
+    # Calcular perdedoras consecutivas
+    is_loser = trades_df['pnl'] < 0
+    losers_consec = is_loser.groupby((~is_loser).cumsum()).sum()
+    max_consecutive_losers = int(losers_consec.max()) if not losers_consec.empty else 0
+    
     return {
         "total_trades": total_trades,
         "winning_trades": winning_trades,
@@ -37,7 +42,8 @@ def calculate_metrics(trades_df: pd.DataFrame, initial_capital: float) -> dict:
         "gross_loss": gross_loss,
         "percent_profitable": percent_profitable,
         "profit_factor": profit_factor,
-        "average_trade_net_profit": avg_trade_net_profit
+        "average_trade_net_profit": avg_trade_net_profit,
+        "max_consecutive_losers": max_consecutive_losers
     }
 
 def calculate_equity_curve_metrics(equity_curve: pd.Series) -> dict:

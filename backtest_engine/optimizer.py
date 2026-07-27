@@ -2,16 +2,19 @@
 optimizer.py — Motor de búsqueda en cuadrícula (Grid Search) para estrategias.
 
 Para cada combinación de parámetros generada por el grid, ejecuta un backtest
-completo y recopila métricas clave para comparación.
+completo y recopila métricas clave para comparación. Ahora acelerado con multiprocesamiento y VectorBT.
 """
 from __future__ import annotations
 
 import copy
 import itertools
 import math
+import os
+import concurrent.futures
 from typing import Any, Callable, Dict, Generator, List, Optional
 
 import pandas as pd
+import yaml
 
 from backtest_engine.backtester import Backtester
 from backtest_engine.metrics import calculate_equity_curve_metrics, calculate_metrics
@@ -73,7 +76,69 @@ def generate_param_grid(
 
 
 # ──────────────────────────────────────────────
-# Optimizer
+# Optimizer Worker
+# ──────────────────────────────────────────────
+
+def _optimizer_worker(params: Dict[str, Any], base_config: Dict[str, Any], df: pd.DataFrame, initial_capital: float) -> Dict[str, Any]:
+    """
+    Worker global puro (sin dependencias de closure) compatible con 
+    multiprocesamiento en Windows.
+    """
+    try:
+        config_copy = copy.deepcopy(base_config)
+        strategy = BaseStrategy(config_copy, custom_parameters=params)
+
+        bt = Backtester(strategy, initial_capital=initial_capital)
+        # Ya no apagamos vectorbt. El backtester.run() decidirá 
+        # automáticamente usar vbt para velocidad si no hay SL/TP complejos.
+        run_result = bt.run(df)
+
+        trades_df: Optional[pd.DataFrame] = run_result.get('trades')
+        equity_curve: Optional[pd.DataFrame] = run_result.get('equity_curve')
+
+        # Normalizar índice de la equity curve
+        if equity_curve is not None and not equity_curve.empty:
+            if 'timestamp' in equity_curve.columns:
+                equity_curve = equity_curve.set_index('timestamp')
+            equity_curve.index = pd.to_datetime(equity_curve.index)
+
+        if equity_curve is not None and not equity_curve.empty:
+            eq_metrics = calculate_equity_curve_metrics(equity_curve['equity'])
+            trade_metrics = (
+                calculate_metrics(trades_df, initial_capital)
+                if trades_df is not None and not trades_df.empty
+                else {'total_trades': 0}
+            )
+            final_equity = float(equity_curve['equity'].iloc[-1])
+        else:
+            eq_metrics = {'sharpe_ratio': -999.0, 'cagr': -999.0, 'max_drawdown_pct': 0.0}
+            trade_metrics = {'total_trades': 0}
+            final_equity = initial_capital
+
+        return {
+            'params': {k: (int(v) if float(v) == int(v) else float(v)) for k, v in params.items()},
+            'sharpe_ratio': round(float(eq_metrics.get('sharpe_ratio', -999)), 4),
+            'cagr': round(float(eq_metrics.get('cagr', -999)), 4),
+            'max_drawdown_pct': round(float(eq_metrics.get('max_drawdown_pct', 0)), 4),
+            'total_trades': int(trade_metrics.get('total_trades', 0)),
+            'final_equity': round(final_equity, 6),
+            'net_pnl': round(final_equity - initial_capital, 6),
+        }
+
+    except Exception as ex:
+        return {
+            'params': {k: (int(v) if float(v) == int(v) else float(v)) for k, v in params.items()},
+            'sharpe_ratio': -999.0,
+            'cagr': -999.0,
+            'max_drawdown_pct': 0.0,
+            'total_trades': 0,
+            'final_equity': initial_capital,
+            'net_pnl': 0.0,
+            'error': str(ex),
+        }
+
+# ──────────────────────────────────────────────
+# Optimizer Entry Point
 # ──────────────────────────────────────────────
 
 def run_grid_search(
@@ -85,88 +150,55 @@ def run_grid_search(
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Ejecuta Grid Search sincrónico (diseñado para usarse en run_in_executor).
+    Ejecuta Grid Search usando múltiples procesos de CPU y aceleración VBT.
 
     Retorna una lista de resultados ordenados de mejor a peor según
-    `optimize_metric`.  Cada elemento contiene:
-        - params           : dict de parámetros usados en esta iteración
-        - sharpe_ratio     : float
-        - cagr             : float  (porcentaje)
-        - max_drawdown_pct : float  (porcentaje, negativo)
-        - total_trades     : int
-        - final_equity     : float
-        - net_pnl          : float
+    `optimize_metric`.
     """
-    import yaml
-
     results: List[Dict[str, Any]] = []
     total = count_combinations(param_ranges)
     done = 0
 
-    # Cargamos el config YAML una sola vez para clonar rápido
+    # Cargamos el config YAML una sola vez
     with open(strategy_path, 'r', encoding='utf-8') as fh:
         base_config = yaml.safe_load(fh)
+        
+    param_grids = list(generate_param_grid(param_ranges))
+    
+    # Utilizar n_cores - 1 (para no congelar el sistema del usuario)
+    max_workers = max(1, (os.cpu_count() or 2) - 1)
 
-    for params in generate_param_grid(param_ranges):
-        try:
-            # Construimos la estrategia con los parámetros del combo actual
-            config_copy = copy.deepcopy(base_config)
-            strategy = BaseStrategy(config_copy, custom_parameters=params)
-
-            bt = Backtester(strategy, initial_capital=initial_capital)
-            bt.use_vectorbt = False
-            run_result = bt.run(df)
-
-            trades_df: Optional[pd.DataFrame] = run_result.get('trades')
-            equity_curve: Optional[pd.DataFrame] = run_result.get('equity_curve')
-
-            # Normalizar índice de la equity curve
-            if equity_curve is not None and not equity_curve.empty:
-                if 'timestamp' in equity_curve.columns:
-                    equity_curve = equity_curve.set_index('timestamp')
-                equity_curve.index = pd.to_datetime(equity_curve.index)
-
-            if equity_curve is not None and not equity_curve.empty:
-                eq_metrics = calculate_equity_curve_metrics(equity_curve['equity'])
-                trade_metrics = (
-                    calculate_metrics(trades_df, initial_capital)
-                    if trades_df is not None and not trades_df.empty
-                    else {'total_trades': 0}
-                )
-                final_equity = float(equity_curve['equity'].iloc[-1])
-            else:
-                eq_metrics = {'sharpe_ratio': -999.0, 'cagr': -999.0, 'max_drawdown_pct': 0.0}
-                trade_metrics = {'total_trades': 0}
-                final_equity = initial_capital
-
-            results.append({
-                'params': {k: (int(v) if float(v) == int(v) else float(v)) for k, v in params.items()},
-                'sharpe_ratio': round(float(eq_metrics.get('sharpe_ratio', -999)), 4),
-                'cagr': round(float(eq_metrics.get('cagr', -999)), 4),
-                'max_drawdown_pct': round(float(eq_metrics.get('max_drawdown_pct', 0)), 4),
-                'total_trades': int(trade_metrics.get('total_trades', 0)),
-                'final_equity': round(final_equity, 6),
-                'net_pnl': round(final_equity - initial_capital, 6),
-            })
-
-        except Exception as ex:
-            results.append({
-                'params': {k: (int(v) if float(v) == int(v) else float(v)) for k, v in params.items()},
-                'sharpe_ratio': -999.0,
-                'cagr': -999.0,
-                'max_drawdown_pct': 0.0,
-                'total_trades': 0,
-                'final_equity': initial_capital,
-                'net_pnl': 0.0,
-                'error': str(ex),
-            })
-
-        done += 1
-        if progress_callback:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Enviamos todas las tareas al pool
+        futures = {
+            executor.submit(_optimizer_worker, params, base_config, df, initial_capital): params
+            for params in param_grids
+        }
+        
+        # Procesamos a medida que van terminando para actualizar el progreso
+        for future in concurrent.futures.as_completed(futures):
             try:
-                progress_callback(done, total)
-            except Exception:
-                pass
+                res = future.result()
+                results.append(res)
+            except Exception as e:
+                params = futures[future]
+                results.append({
+                    'params': {k: (int(v) if float(v) == int(v) else float(v)) for k, v in params.items()},
+                    'sharpe_ratio': -999.0,
+                    'cagr': -999.0,
+                    'max_drawdown_pct': 0.0,
+                    'total_trades': 0,
+                    'final_equity': initial_capital,
+                    'net_pnl': 0.0,
+                    'error': f"Crash del ejecutor: {str(e)}",
+                })
+            
+            done += 1
+            if progress_callback:
+                try:
+                    progress_callback(done, total)
+                except Exception:
+                    pass
 
     # Ordenar: sin errores primero, luego por métrica descendente
     def _sort_key(r):

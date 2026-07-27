@@ -246,47 +246,55 @@ class Backtester:
                     
                     # Asumir entrada
                     entry_p = row['close'] * (1 + self.slippage_pct)
+                    
+                    # Ajustar qty si excede el capital disponible
+                    max_qty = capital / (entry_p * (1 + self.commission_pct))
+                    if qty > max_qty:
+                        qty = max_qty
+                        
                     cost = qty * entry_p
                     commission = cost * self.commission_pct
                     
-                    if cost + commission > capital:
-                        max_cost_allowed = capital / (1 + self.commission_pct)
-                        qty = max_cost_allowed / entry_p
-                        cost = qty * entry_p
-                        commission = cost * self.commission_pct
-                        
-                    if qty > 0.00001: # Tamaño mínimo de operación
-                        capital -= (cost + commission)
+                    # Usamos una tolerancia de redondeo pequeña (1e-6) por problemas de float
+                    if capital >= (cost + commission) - 1e-6 and qty > 1e-6:
                         position = qty
                         entry_price = entry_p
                         sl_price = sl
                         tp_price = tp
-                        current_trade = {'entry_time': timestamp}
+                        capital -= (cost + commission)
+                        
+                        current_trade = {
+                            'entry_time': timestamp,
+                            'side': 'long',
+                            'quantity': qty
+                        }
                         
                 elif row.get('entry_short', False):
                     sl, tp = self.strategy.risk_manager.compute_sl_tp(df, i, side="short")
                     qty = self.strategy.risk_manager.compute_position_size(capital, row['close'], sl)
                     
                     entry_p = row['close'] * (1 - self.slippage_pct)
+                    
+                    # En short requerimos margen equivalente a qty * precio + comisiones
+                    max_qty = capital / (entry_p * (1 + self.commission_pct))
+                    if qty > max_qty:
+                        qty = max_qty
+                        
                     revenue = qty * entry_p
                     commission = revenue * self.commission_pct
                     
-                    # En short vendemos y obtenemos revenue, pero retenemos capital como margen.
-                    # Asumiremos apalancamiento 1x: capital no aumenta hasta cerrar.
-                    # Mismo control de tamaño que en long
-                    if revenue + commission > capital:
-                        max_rev_allowed = capital / (1 + self.commission_pct)
-                        qty = max_rev_allowed / entry_p
-                        revenue = qty * entry_p
-                        commission = revenue * self.commission_pct
-                        
-                    if qty > 0.00001:
+                    if capital >= (revenue + commission) - 1e-6 and qty > 1e-6:
                         capital += revenue - commission
                         position = -qty
                         entry_price = entry_p
                         sl_price = sl
                         tp_price = tp
-                        current_trade = {'entry_time': timestamp}
+                        
+                        current_trade = {
+                            'entry_time': timestamp,
+                            'side': 'short',
+                            'quantity': qty
+                        }
 
         # Calcular Métricas
         trades_df = pd.DataFrame(trades)

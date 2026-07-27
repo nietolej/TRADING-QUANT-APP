@@ -75,20 +75,26 @@ class RiskManager:
 
     def compute_position_size(self, capital: float, entry_price: float, sl_price: float = None) -> float:
         """
-        Calcula el tamaño de la posición basado en el capital y el riesgo.
+        Calcula el tamaño de la posición basado en el capital y el modo de riesgo/sizing seleccionado.
         """
-        method = self.sizing_config.get("method", "fixed_fractional")
+        method = str(self.sizing_config.get("method", "compounding")).lower()
         
-        if method == "fixed_fractional" and sl_price is not None:
+        if method in ["compounding", "percent_equity", "full_capital"]:
+            pct = self.sizing_config.get("value", 100.0) / 100.0
+            return (capital * pct) / entry_price
+            
+        elif method == "fixed_fractional" and sl_price is not None:
             risk_pct = self.sizing_config.get("risk_per_trade_pct", 1.0) / 100.0
             risk_amount = capital * risk_pct
             price_risk = abs(entry_price - sl_price)
             if price_risk > 0:
-                quantity = risk_amount / price_risk
-                return quantity
+                return risk_amount / price_risk
                 
-        # Por defecto invertir todo el capital disponible
-        # Asume que 'capital' es la fracción que se desea invertir si es fijo
+        elif method == "fixed_amount":
+            amount = self.sizing_config.get("value", 1000.0)
+            return min(amount, capital) / entry_price
+            
+        # Por defecto invertir todo el capital disponible (Interés Compuesto 100%)
         return capital / entry_price
 
     def update_trailing_sl(self, current_sl: float, current_price: float, current_high: float, current_low: float, current_atr: float = None, side: str = "long") -> float:

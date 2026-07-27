@@ -1,0 +1,37 @@
+strategy_name: SMALONGTPSL
+description: Cruce de SMA long con Stop Loss y Take Profit estatico
+trade_direction: Long
+parameters:
+  SMA LENTA: 30
+  SMA RAPIDA: 16
+  STOP LOSS: 5.0
+  TAKE PROFIT: 50.0
+risk_management:
+  take_profit:
+    type: percentage
+    value: TAKE PROFIT
+  stop_loss:
+    type: percentage
+    value: STOP LOSS
+entry_conditions:
+  logic: AND
+  rules:
+  - name: rule_1784885331290
+    type: technical_indicator
+    indicator1: SMA
+    period1: SMA RAPIDA
+    operator: crosses_above
+    indicator2: SMA
+    period2: SMA LENTA
+    details: SMA(SMA RAPIDA) crosses_above SMA(SMA LENTA)
+exit_conditions:
+  logic: OR
+  rules:
+  - name: rule_1784885347778
+    type: technical_indicator
+    indicator1: SMA
+    period1: SMA RAPIDA
+    operator: crosses_below
+    indicator2: SMA
+    period2: SMA LENTA
+    details: SMA(SMA RAPIDA) crosses_below SMA(SMA LENTA)

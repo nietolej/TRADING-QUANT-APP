@@ -4,13 +4,15 @@ from sqlalchemy.orm import Session
 from .storage import OnChainMetric, SessionLocal
 from .data_sources.defillama import DefiLlamaProvider
 from .data_sources.cryptoquant import CryptoQuantProvider
+from .data_sources.coingecko import CoinGeckoProvider
 
 class OnChainDataManager:
     def __init__(self, db_session: Session = None):
         self.db = db_session or SessionLocal()
         self.providers = {
             'defillama': DefiLlamaProvider(),
-            'cryptoquant': CryptoQuantProvider()
+            'cryptoquant': CryptoQuantProvider(),
+            'coingecko': CoinGeckoProvider()
         }
         
     def update_historical_data(self, metric_name: str, symbol: str, start_date: datetime, provider_name: str):
@@ -31,7 +33,7 @@ class OnChainDataManager:
         
         if df.empty:
             print("No hay datos nuevos.")
-            return
+            return 0
             
         records = df.to_dict(orient='records')
         for rec in records:
@@ -52,6 +54,7 @@ class OnChainDataManager:
         
         self.db.commit()
         print(f"Descargados {len(df)} registros on-chain nuevos.")
+        return len(records)
         
     def get_data(self, metric_name: str, symbol: str, start_date: datetime, end_date: datetime = None) -> pd.DataFrame:
         query = self.db.query(OnChainMetric).filter(

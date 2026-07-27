@@ -23,28 +23,63 @@ class BaseStrategy:
         # Parameter substitution
         self.parameters = self.config.get("parameters", {})
         if custom_parameters:
-            self.parameters.update(custom_parameters)
+            cleaned_params = {}
+            for k, v in custom_parameters.items():
+                if isinstance(v, str):
+                    v_str = v.strip()
+                    try:
+                        if '.' in v_str:
+                            cleaned_params[k] = float(v_str)
+                        else:
+                            cleaned_params[k] = int(v_str)
+                    except ValueError:
+                        cleaned_params[k] = v
+                else:
+                    cleaned_params[k] = v
+            self.parameters.update(cleaned_params)
             
         if self.parameters:
             self._apply_parameters(self.config, self.parameters)
             
         self.risk_manager = RiskManager(self.config.get("risk_management", {}))
         
+    def _resolve_param_value(self, raw_val, params):
+        if not isinstance(raw_val, str):
+            return raw_val
+        val_str = raw_val.strip()
+        val_no_at = val_str[1:] if val_str.startswith('@') else val_str
+        
+        # 1. Exact matches
+        if raw_val in params:
+            return params[raw_val]
+        if val_str in params:
+            return params[val_str]
+        if val_no_at in params:
+            return params[val_no_at]
+
+        # 2. Case-insensitive & normalized matches
+        params_norm = {str(k).strip().lstrip('@').lower(): v for k, v in params.items()}
+        key_norm = val_no_at.lower()
+        if key_norm in params_norm:
+            return params_norm[key_norm]
+
+        return raw_val
+
     def _apply_parameters(self, config_dict, params):
         if isinstance(config_dict, dict):
-            for k, v in config_dict.items():
-                if isinstance(v, str) and v in params:
-                    config_dict[k] = params[v]
-                elif isinstance(v, str) and v.startswith("@") and v[1:] in params:
-                    config_dict[k] = params[v[1:]]
+            for k, v in list(config_dict.items()):
+                if isinstance(v, str):
+                    resolved = self._resolve_param_value(v, params)
+                    if resolved != v:
+                        config_dict[k] = resolved
                 elif isinstance(v, (dict, list)):
                     self._apply_parameters(v, params)
         elif isinstance(config_dict, list):
             for i, v in enumerate(config_dict):
-                if isinstance(v, str) and v in params:
-                    config_dict[i] = params[v]
-                elif isinstance(v, str) and v.startswith("@") and v[1:] in params:
-                    config_dict[i] = params[v[1:]]
+                if isinstance(v, str):
+                    resolved = self._resolve_param_value(v, params)
+                    if resolved != v:
+                        config_dict[i] = resolved
                 elif isinstance(v, (dict, list)):
                     self._apply_parameters(v, params)
         

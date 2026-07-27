@@ -12,10 +12,17 @@ _working_exchange_class = None
 
 def get_binance_exchange(config=None):
     global _working_exchange_class
+    import os
+    
     if config is None:
         config = {'enableRateLimit': True}
+        
+    # Public market data does not require API keys, and testnet keys break mainnet endpoints.
+    
     if _working_exchange_class is not None:
-        return _working_exchange_class(config)
+        exchange = _working_exchange_class(config)
+        return exchange
+        
     # Try global Binance first
     try:
         exchange = ccxt.binance(config)
@@ -33,7 +40,8 @@ def get_binance_exchange(config=None):
     except Exception as e:
         print(f"Failed to load Binance US: {e}")
     # Default fallback
-    return ccxt.binance(config)
+    exchange = ccxt.binance(config)
+    return exchange
 
 def ensure_utc(dt: datetime) -> datetime:
     if dt is None:
@@ -240,29 +248,43 @@ class MarketDataManager:
             time.sleep(self.exchange.rateLimit / 1000) # Respetar rate limits
             
     def _save_df_to_db(self, df):
-        records = df.to_dict(orient='records')
-        for rec in records:
-            # Para la comparación con la base de datos (SQLite), convertimos timestamp a naive
-            ts_naive = ensure_utc(rec['timestamp']).replace(tzinfo=None)
+        if df is None or df.empty:
+            return
             
-            exists = self.db.query(OHLCV).filter_by(
-                symbol=rec['symbol'], 
-                timeframe=rec['timeframe'], 
-                timestamp=ts_naive
-            ).first()
-            if not exists:
-                ohlcv_obj = OHLCV(
+        symbol = df['symbol'].iloc[0]
+        timeframe = df['timeframe'].iloc[0]
+        
+        # Batch timestamp conversion
+        records = df.to_dict(orient='records')
+        ts_map = {ensure_utc(rec['timestamp']).replace(tzinfo=None): rec for rec in records}
+        ts_list = list(ts_map.keys())
+        
+        # Single query to fetch all existing timestamps in this batch
+        existing_ts = set(
+            r[0] for r in self.db.query(OHLCV.timestamp).filter(
+                OHLCV.symbol == symbol,
+                OHLCV.timeframe == timeframe,
+                OHLCV.timestamp.in_(ts_list)
+            ).all()
+        )
+        
+        new_objects = []
+        for ts_naive, rec in ts_map.items():
+            if ts_naive not in existing_ts:
+                new_objects.append(OHLCV(
                     symbol=rec['symbol'],
                     timeframe=rec['timeframe'],
                     timestamp=ts_naive,
-                    open=rec['open'],
-                    high=rec['high'],
-                    low=rec['low'],
-                    close=rec['close'],
-                    volume=rec['volume']
-                )
-                self.db.add(ohlcv_obj)
-        self.db.commit()
+                    open=float(rec['open']),
+                    high=float(rec['high']),
+                    low=float(rec['low']),
+                    close=float(rec['close']),
+                    volume=float(rec['volume'])
+                ))
+                
+        if new_objects:
+            self.db.bulk_save_objects(new_objects)
+            self.db.commit()
             
     def get_data(self, symbol: str, timeframe: str, start_date: datetime, end_date: datetime = None) -> pd.DataFrame:
         """
