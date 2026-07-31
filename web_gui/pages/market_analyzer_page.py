@@ -1,9 +1,36 @@
-from nicegui import ui
+from nicegui import ui, run
 from data_layer.storage import SessionLocal, OHLCV, OnChainMetric
 from data_layer.market_data import MarketDataManager
 from sqlalchemy import func
 from datetime import datetime, timezone, timedelta
 import pandas as pd
+import logging
+import asyncio
+
+logger = logging.getLogger(__name__)
+
+FALLBACK_SYMBOLS = [
+    'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT',
+    'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT',
+    'BNB/BTC', 'ETH/BTC', 'LTC/BTC'
+]
+
+def _load_binance_symbols_sync() -> list:
+    """Carga los símbolos de Binance de forma síncrona (se llama en un hilo separado)."""
+    try:
+        from data_layer.market_data import get_binance_exchange
+        exc = get_binance_exchange()
+        if not hasattr(exc, 'markets') or not exc.markets:
+            exc.load_markets()
+        raw_symbols = list(exc.markets.keys()) if hasattr(exc, 'markets') and exc.markets else []
+        if raw_symbols:
+            usdt_pairs = sorted([s for s in raw_symbols if s.endswith('/USDT')])
+            other_pairs = sorted([s for s in raw_symbols if not s.endswith('/USDT')])
+            return usdt_pairs + other_pairs
+        return FALLBACK_SYMBOLS
+    except Exception as e:
+        logger.warning(f"No se pudieron cargar símbolos de Binance: {e}")
+        return FALLBACK_SYMBOLS
 
 def render_market_analyzer():
     with ui.column().classes('w-full q-pa-md'):
@@ -61,9 +88,9 @@ def render_market_analyzer():
 
         viewer_table = ui.table(columns=viewer_columns, rows=[], row_key='timestamp').classes('w-full mt-4')
 
-        # ----------------- Logic -----------------
-        def update_viewer_tfs(val):
-            if not val:
+        def update_viewer_tfs(e):
+            val = getattr(e, 'value', e)
+            if not val or not isinstance(val, str):
                 viewer_tf_select.options = []
                 viewer_tf_select.value = None
                 viewer_tf_select.update()
@@ -262,26 +289,30 @@ def render_market_analyzer():
                 ]
             }
             
-            # Fetch binance symbols for autocomplete
-            fallback_symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT', 'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT', 'BNB/BTC', 'ETH/BTC', 'LTC/BTC']
-            try:
-                from data_layer.market_data import get_binance_exchange
-                exc = get_binance_exchange()
-                if not hasattr(exc, 'markets') or not exc.markets:
-                    exc.load_markets()
-                raw_symbols = list(exc.markets.keys()) if hasattr(exc, 'markets') and exc.markets else []
-                if raw_symbols:
-                    # Filter and sort USDT pairs first, then others
-                    usdt_pairs = sorted([s for s in raw_symbols if s.endswith('/USDT')])
-                    other_pairs = sorted([s for s in raw_symbols if not s.endswith('/USDT')])
-                    binance_symbols = usdt_pairs + other_pairs
-                else:
-                    binance_symbols = fallback_symbols
-            except Exception as e:
-                print(f"Failed to load Binance symbols: {e}")
-                binance_symbols = fallback_symbols
-                
-            binance_select = ui.select(options=binance_symbols, label='Binance Symbols', multiple=True, with_input=True).classes('w-full mt-2')
+            # Símbolos de Binance: se cargan de forma LAZY cuando el usuario abre el diálogo
+            # para no bloquear el event loop de asyncio durante el startup.
+            binance_select = ui.select(options=FALLBACK_SYMBOLS, label='Binance Symbols (cargando...)', multiple=True, with_input=True).classes('w-full mt-2')
+            _binance_symbols_loaded = [False]
+
+            async def _lazy_load_binance_symbols():
+                """Carga los símbolos de Binance en background al abrir el diálogo."""
+                if _binance_symbols_loaded[0]:
+                    return
+                binance_select.label = 'Binance Symbols (cargando...)'
+                binance_select.update()
+                try:
+                    symbols = await run.io_bound(_load_binance_symbols_sync)
+                    binance_select.options = symbols
+                    binance_select.label = 'Binance Symbols'
+                    _binance_symbols_loaded[0] = True
+                    binance_select.update()
+                except Exception as e:
+                    logger.warning(f"Error cargando símbolos: {e}")
+                    binance_select.label = 'Binance Symbols (fallback)'
+                    binance_select.update()
+
+            download_dialog.on('show', lambda _: asyncio.ensure_future(_lazy_load_binance_symbols()))
+
             
             yahoo_input = ui.input(label='Yahoo Symbols (comma separated)', placeholder='AAPL, TSLA, BTC-USD').classes('w-full mt-2')
             yahoo_input.set_visibility(False)

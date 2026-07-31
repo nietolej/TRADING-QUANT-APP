@@ -16,9 +16,16 @@ from data_layer.market_data import MarketDataManager, normalize_timeframe
 from data_layer.storage import SessionLocal, OHLCV, BacktestRun
 from backtest_engine.metrics import calculate_metrics, calculate_equity_curve_metrics
 import yaml
+from web_gui.components.tradingview_chart import build_tradingview_plotly_figure
 
-def render_strategy_analyzer():
+
+def render_strategy_analyzer(on_back_to_builder=None):
     with ui.column().classes('w-full q-pa-md'):
+        with ui.row().classes('w-full justify-between items-center mb-4'):
+            ui.label('Análisis de Estrategia y Backtesting').classes('text-2xl font-bold text-slate-800')
+            if on_back_to_builder:
+                ui.button('Volver al Strategy Builder', on_click=on_back_to_builder, icon='arrow_back').classes('bg-slate-700 text-white hover:bg-slate-600 shadow-md rounded-lg')
+
         with ui.dialog() as catalog_dialog, ui.card().classes('w-[800px] max-w-4xl q-pa-md'):
             ui.label('Catálogo de Estrategias').classes('text-xl font-bold q-mb-md')
             catalog_columns = [
@@ -352,6 +359,381 @@ def render_strategy_analyzer():
             'pnl_base_str': '--',
         }
 
+        async def run_backtest(e=None):
+            import logging as _logging
+            _logging.info("run_backtest: started")
+
+            if not state['strategy_name']:
+                ui.notify("No hay estrategia seleccionada", type="warning")
+                return
+
+            # Obtain client from the button element directly (avoids slot context issues in background tasks)
+            client = btn_run.client
+
+            # Direct element updates – do NOT require a slot context
+            btn_run.set_text("⏳ Calculando simulación...")
+            btn_run.disable()
+
+            # ui.notify() creates a new element and DOES need a slot context
+            calc_notify = None
+            try:
+                with client:
+                    calc_notify = ui.notify(
+                        "⚡ Ejecutando simulación de backtest... Por favor espera",
+                        type="info", spinner=True, timeout=5.0
+                    )
+            except Exception as _ne:
+                _logging.warning(f"run_backtest: could not show calc_notify: {_ne}")
+            
+            try:
+                try:
+                    start_dt = datetime.strptime(str(state['start_date']).strip(), '%Y-%m-%d').replace(tzinfo=timezone.utc)
+                except Exception:
+                    start_dt = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+                try:
+                    end_dt = datetime.strptime(str(state['end_date']).strip(), '%Y-%m-%d').replace(hour=23, minute=59, tzinfo=timezone.utc)
+                except Exception:
+                    end_dt = datetime.now(timezone.utc)
+                
+                file_path = strategies[state['strategy_name']]
+                symbol = state['symbol']
+                timeframe = normalize_timeframe(state['timeframe'])
+
+                try:
+                    cap_val = float(state.get('capital', 1.0) or 1.0)
+                except (ValueError, TypeError):
+                    cap_val = 1.0
+                
+                # Para estimar capital inicial si se configuró en activo BASE
+                db_temp = SessionLocal()
+                mgr_temp = MarketDataManager(db_temp)
+                first_candle = mgr_temp.get_data(symbol, timeframe, start_dt, end_dt)
+                db_temp.close()
+                
+                start_price = first_candle.iloc[0]['open'] if not first_candle.empty else 1.0
+                
+                if state.get('capital_type', 'QUOTE') == 'BASE':
+                    initial_cap_quote = cap_val * start_price
+                else:
+                    initial_cap_quote = cap_val
+                
+                initial_cap_base = initial_cap_quote / start_price if start_price > 0 else 0
+                
+                comm_pct = float(state.get('commission_pct', 0.1) or 0.1)
+                slip_pct = float(state.get('slippage_pct', 0.05) or 0.05)
+                sizing_mode = state.get('sizing_mode', 'Interés Compuesto (100% Capital)')
+                
+                # Ejecutar descarga + simulación en hilo I/O secundario para NO congelar la UI
+                results = await run.io_bound(
+                    _sync_load_and_run,
+                    file_path,
+                    state.get('custom_parameters', {}),
+                    symbol,
+                    timeframe,
+                    start_dt,
+                    end_dt,
+                    initial_cap_quote,
+                    sizing_mode,
+                    comm_pct,
+                    slip_pct
+                )
+                
+                with client:
+                    if 'error' in results:
+                        ui.notify(results['error'], type="warning")
+                    else:
+                        df          = results.get('df', pd.DataFrame())
+                        trades_df   = results.get("trades")
+                        equity_curve = results.get("equity_curve")
+                        drawdown    = pd.Series(dtype=float)
+    
+                        if equity_curve is not None and not equity_curve.empty:
+                            if 'strategy_indicators' in results:
+                                # Desactivar medias previas
+                                for k in list(chart_config.keys()):
+                                    if k.startswith('sma_') or k.startswith('ema_'):
+                                        chart_config[k] = False
+                                # Activar dinámicamente las calculadas en la estrategia
+                                for ind, p in results['strategy_indicators']:
+                                    key = f"{ind}_{p}"
+                                    chart_config[key] = True
+                                
+                                try:
+                                    render_price_overlays.refresh()
+                                except Exception:
+                                    pass
+
+                            if 'timestamp' in equity_curve.columns:
+                                equity_curve = equity_curve.set_index('timestamp')
+                            equity_curve.index = pd.to_datetime(equity_curve.index)
+    
+                            try:
+                                trade_metrics = (
+                                    calculate_metrics(trades_df, initial_cap_quote)
+                                    if trades_df is not None and not trades_df.empty
+                                    else {'total_trades': 0}
+                                )
+                                eq_metrics = calculate_equity_curve_metrics(equity_curve['equity'])
+    
+                                def safe_num(v, default=0.0):
+                                    try:
+                                        f = float(v)
+                                        return default if (v is None or f != f or abs(f) == float('inf')) else f
+                                    except Exception:
+                                        return default
+    
+                                cagr_val      = safe_num(eq_metrics.get('cagr'))
+                                maxdd_val     = safe_num(eq_metrics.get('max_drawdown_pct'))
+                                sharpe_val    = safe_num(eq_metrics.get('sharpe_ratio'))
+                                pf_val        = safe_num(trade_metrics.get('profit_factor'))
+                                n_trades      = int(safe_num(trade_metrics.get('total_trades')))
+                                win_trades    = int(safe_num(trade_metrics.get('winning_trades')))
+                                lose_trades   = int(safe_num(trade_metrics.get('losing_trades')))
+                                win_rate      = safe_num(trade_metrics.get('percent_profitable'))
+                                max_cons_loss = int(safe_num(trade_metrics.get('max_consecutive_losers')))
+    
+                                state['last_computed_metrics'] = {
+                                    'cagr': cagr_val, 'max_drawdown_pct': maxdd_val,
+                                    'sharpe_ratio': sharpe_val, 'profit_factor': pf_val,
+                                    'total_trades': n_trades, 'winning_trades': win_trades,
+                                    'losing_trades': lose_trades, 'win_rate': win_rate,
+                                    'max_consecutive_losers': max_cons_loss,
+                                    'start_dt': str(start_dt)[:10], 'end_dt': str(end_dt)[:10]
+                                }
+    
+                                lbl_cagr.set_text(f"{cagr_val:.2f}%")
+                                lbl_maxdd.set_text(f"{maxdd_val:.2f}%")
+                                lbl_sharpe.set_text(f"{sharpe_val:.2f}")
+                                lbl_profit_factor.set_text(f"{pf_val:.2f}")
+                                lbl_total_trades.set_text(str(n_trades))
+                                lbl_win_trades.set_text(str(win_trades))
+                                lbl_lose_trades.set_text(str(lose_trades))
+                                lbl_win_rate.set_text(f"{win_rate:.2f}%")
+                                lbl_max_cons_losers.set_text(str(max_cons_loss))
+    
+                                lbl_cagr.classes(remove='text-green-600 text-red-600',
+                                                 add='text-green-600' if cagr_val >= 0 else 'text-red-600')
+                                lbl_maxdd.classes(remove='text-green-600 text-red-600', add='text-red-600')
+                                lbl_sharpe.classes(remove='text-green-600 text-red-600 text-blue-600',
+                                                   add='text-blue-600' if sharpe_val >= 0 else 'text-red-600')
+                                lbl_profit_factor.classes(
+                                    remove='text-green-600 text-yellow-600 text-red-600',
+                                    add='text-green-600' if pf_val >= 1.2 else 'text-yellow-600' if pf_val >= 1.0 else 'text-red-600'
+                                )
+                                lbl_win_rate.classes(remove='text-green-600 text-red-600',
+                                                     add='text-green-600' if win_rate > 50 else 'text-red-600')
+    
+                                roll_max = equity_curve['equity'].cummax()
+                                drawdown = (equity_curve['equity'] - roll_max) / roll_max * 100
+                                dates_eq  = equity_curve.index.strftime('%Y-%m-%d').tolist()
+                                eq_vals   = equity_curve['equity']
+                                close_aln = df['close'].reindex(eq_vals.index).ffill()
+                                eq_base   = eq_vals / close_aln
+    
+                                state['equity_dates']      = dates_eq
+                                state['equity_quote_data'] = eq_vals.round(6).tolist()
+                                state['equity_base_data']  = eq_base.round(6).tolist()
+    
+                                is_quote = (equity_toggle.value == 'QUOTE')
+                                chart.options['xAxis']['data'] = dates_eq
+                                chart.options['series'][0]['data'] = (
+                                    state['equity_quote_data'] if is_quote else state['equity_base_data']
+                                )
+                                base_a  = state['symbol'].split('/')[0] if '/' in state['symbol'] else 'BASE'
+                                quote_a = state['symbol'].split('/')[1] if '/' in state['symbol'] else 'QUOTE'
+                                chart.options['series'][0]['name'] = f"Equity ({quote_a if is_quote else base_a})"
+                                chart.update()
+    
+                                drawdown_chart.options['xAxis']['data'] = dates_eq
+                                drawdown_chart.options['series'][0]['data'] = drawdown.round(4).tolist()
+                                drawdown_chart.update()
+    
+                                price_chart_df = df
+                                state['last_df'] = df
+                                state['last_trades_df'] = trades_df
+                                render_tradingview_plotly()
+
+    
+                            except Exception as _me:
+                                import traceback as _tb
+                                ui.notify(f"Error métricas: {_me}\n{_tb.format_exc()[:400]}", type='negative', timeout=15000)
+    
+                        else:
+                            lbl_cagr.set_text("0.00%"); lbl_maxdd.set_text("0.00%")
+                            lbl_sharpe.set_text("0.00"); lbl_profit_factor.set_text("0.00")
+                            lbl_total_trades.set_text("0"); lbl_win_trades.set_text("0")
+                            lbl_lose_trades.set_text("0"); lbl_win_rate.set_text("0.00%")
+                            lbl_max_cons_losers.set_text("0")
+                            chart.options['xAxis']['data'] = df.index.strftime('%Y-%m-%d').tolist()
+                            chart.options['series'][0]['data'] = [round(initial_cap_quote, 6)] * len(df)
+                            chart.update()
+                            drawdown_chart.options['xAxis']['data'] = df.index.strftime('%Y-%m-%d').tolist()
+                            drawdown_chart.options['series'][0]['data'] = [0] * len(df)
+                            drawdown_chart.update()
+                            state['last_df'] = df
+                            state['last_trades_df'] = None
+                            render_tradingview_plotly()
+
+                            ui.notify("El backtest no generó curva de equity (sin señales o error).", type='warning')
+    
+                        # ── Trades table ──
+                        base_asset  = state['symbol'].split('/')[0] if '/' in state['symbol'] else 'BTC'
+                        quote_asset = state['symbol'].split('/')[1] if '/' in state['symbol'] else 'USDT'
+                        state['quote_asset'] = quote_asset
+                        state['base_asset']  = base_asset
+    
+                        columns = [
+                            {'name': 'result',       'label': 'W/L',                         'field': 'result',       'sortable': True, 'align': 'center'},
+                            {'name': 'entry_time',   'label': 'Fecha entrada (UTC)',          'field': 'entry_time',   'sortable': True, 'align': 'left'},
+                            {'name': 'exit_time',    'label': 'Fecha salida (UTC)',           'field': 'exit_time',    'sortable': True, 'align': 'left'},
+                            {'name': 'side',         'label': 'Lado',                        'field': 'side',         'sortable': True, 'align': 'center'},
+                            {'name': 'exit_reason',  'label': 'Razón de Salida',             'field': 'exit_reason',  'sortable': True, 'align': 'center'},
+                            {'name': 'entry_price',  'label': 'Precio entrada',              'field': 'entry_price',  'sortable': True, 'align': 'right'},
+                            {'name': 'exit_price',   'label': 'Precio salida',               'field': 'exit_price',   'sortable': True, 'align': 'right'},
+                            {'name': 'pnl_pct',      'label': '% Resultado',                 'field': 'pnl_pct',      'sortable': True, 'align': 'right'},
+                            {'name': 'pnl_quote',    'label': f'P&L ({quote_asset})',        'field': 'pnl_quote',    'sortable': True, 'align': 'right'},
+                            {'name': 'pnl_base',     'label': f'P&L ({base_asset})',         'field': 'pnl_base',     'sortable': True, 'align': 'right'},
+                            {'name': 'cum_pnl_quote','label': f'P&L acum. ({quote_asset})',  'field': 'cum_pnl_quote','sortable': True, 'align': 'right'},
+                            {'name': 'cum_pnl_base', 'label': f'P&L acum. ({base_asset})',   'field': 'cum_pnl_base', 'sortable': True, 'align': 'right'},
+                            {'name': 'balance_quote','label': f'Saldo ({quote_asset})',       'field': 'balance_quote','sortable': True, 'align': 'right'},
+                            {'name': 'balance_base', 'label': f'Saldo ({base_asset})',        'field': 'balance_base', 'sortable': True, 'align': 'right'},
+                            {'name': 'drawdown',     'label': 'Reducción máx. (%)',          'field': 'drawdown',     'sortable': True, 'align': 'right'},
+                        ]
+                        trades_table.columns = columns
+    
+                        def fmt_price(p):
+                            if p is None: return 'N/A'
+                            try:
+                                p = float(p)
+                                if abs(p) >= 1000: return f"{p:,.2f}"
+                                if abs(p) >= 1:    return f"{p:.4f}"
+                                if abs(p) >= 0.01: return f"{p:.6f}"
+                                return f"{p:.8f}"
+                            except Exception:
+                                return str(p)
+    
+                        def fmt_pnl(p):
+                            if p is None: return 'N/A'
+                            try:
+                                p = float(p)
+                                if abs(p) >= 1000: return f"{p:+,.2f}"
+                                if abs(p) >= 1:    return f"{p:+.4f}"
+                                if abs(p) >= 0.01: return f"{p:+.6f}"
+                                return f"{p:+.8f}"
+                            except Exception:
+                                return str(p)
+    
+                        trades_rows   = []
+                        cum_q         = 0.0
+                        cum_b         = 0.0
+                        balance_quote = initial_cap_quote
+                        balance_base  = initial_cap_base
+    
+                        if trades_df is not None and not trades_df.empty:
+                            for _, trow in trades_df.iterrows():
+                                pnl_quote   = float(trow.get('pnl', 0) or 0)
+                                entry_price = float(trow.get('entry_price', 1) or 1)
+                                exit_price  = float(trow.get('exit_price',  1) or 1)
+                                side        = str(trow.get('side', '')).upper()
+                                pnl_base    = pnl_quote / exit_price if exit_price > 0 else 0
+    
+                                if entry_price > 0:
+                                    if side == 'LONG':
+                                        pnl_pct = (exit_price - entry_price) / entry_price * 100
+                                    elif side == 'SHORT':
+                                        pnl_pct = (entry_price - exit_price) / entry_price * 100
+                                    else:
+                                        pnl_pct = 0.0
+                                else:
+                                    pnl_pct = 0.0
+    
+                                cum_q        += pnl_quote
+                                balance_quote = initial_cap_quote + cum_q
+                                balance_base  = balance_quote / exit_price if exit_price > 0 else 0
+                                cum_b         = balance_base - initial_cap_base
+    
+                                dd_val = 0.0
+                                try:
+                                    ts = pd.to_datetime(trow.get('exit_time'))
+                                    if len(drawdown) > 0:
+                                        idx = drawdown.index.get_indexer([ts], method='nearest')[0]
+                                        if idx >= 0:
+                                            dd_val = float(drawdown.iloc[idx])
+                                except Exception:
+                                    pass
+    
+                                trades_rows.append({
+                                    'result':       'W' if pnl_quote > 0 else 'L',
+                                    'entry_time':   str(trow.get('entry_time', ''))[:19],
+                                    'exit_time':    str(trow.get('exit_time',  ''))[:19],
+                                    'side':         side,
+                                    'entry_price':  fmt_price(entry_price),
+                                    'exit_price':   fmt_price(exit_price),
+                                    'pnl_pct':      float(pnl_pct),
+                                    'pnl_quote':    fmt_pnl(pnl_quote),
+                                    'pnl_base':     fmt_pnl(pnl_base),
+                                    'cum_pnl_quote':fmt_pnl(cum_q),
+                                    'cum_pnl_base': fmt_pnl(cum_b),
+                                    'balance_quote':fmt_price(balance_quote),
+                                    'balance_base': fmt_price(balance_base),
+                                    'drawdown':     f"{dd_val:.2f}%",
+                                    'exit_reason':  str(trow.get('exit_reason', ''))
+                                })
+    
+                        trades_table.rows = trades_rows
+                        trades_table.update()
+    
+                        # ── Summary labels ──
+                        lbl_hdr_init_q.set_text(f'Capital Inicial ({quote_asset})')
+                        lbl_hdr_init_b.set_text(f'Capital Inicial ({base_asset})')
+                        lbl_hdr_bal_q.set_text(f'Balance Final ({quote_asset})')
+                        lbl_hdr_bal_b.set_text(f'Balance Final ({base_asset})')
+                        lbl_hdr_pnl_q.set_text(f'P&L Total ({quote_asset})')
+                        lbl_hdr_pnl_b.set_text(f'P&L Total ({base_asset})')
+                        lbl_init_quote.set_text(fmt_price(initial_cap_quote))
+                        lbl_init_base.set_text(fmt_price(initial_cap_base))
+                        lbl_bal_quote.set_text(fmt_price(balance_quote))
+                        lbl_bal_base.set_text(fmt_price(balance_base))
+                        lbl_pnl_quote.set_text(fmt_pnl(cum_q))
+                        lbl_pnl_base.set_text(fmt_pnl(cum_b))
+    
+                        def _upd_color(lbl, positive):
+                            lbl.classes(remove='text-black text-green-600 text-red-600',
+                                        add='text-green-600' if positive else 'text-red-600')
+    
+                        _upd_color(lbl_bal_quote, balance_quote >= initial_cap_quote)
+                        _upd_color(lbl_bal_base,  balance_base  >= initial_cap_base)
+                        _upd_color(lbl_pnl_quote, cum_q >= 0)
+                        _upd_color(lbl_pnl_base,  cum_b >= 0)
+                        ui.notify("✅ Backtest completado exitosamente", type="positive", timeout=3.0)
+    
+            except Exception as e:
+                import traceback as _tb3
+                import logging as _log2
+                _full_err = _tb3.format_exc()
+                _log2.error(f"Backtest error:\n{_full_err}")
+                print(f"BACKTEST ERROR:\n{_full_err}", flush=True)
+                try:
+                    with client:
+                        ui.notify(f"Error: {type(e).__name__}: {e}", type="negative", timeout=20000)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    if calc_notify is not None:
+                        calc_notify.dismiss()
+                except Exception:
+                    pass
+                try:
+                    btn_run.enable()
+                    btn_run.set_text("EJECUTAR PRUEBA RETROSPECTIVA")
+                except Exception:
+                    pass
+
+ 
+
+
         # ── Fila 1: Estrategia + Par de activo + Timeframe ──
         with ui.row().classes('w-full gap-3 items-end mt-2'):
             with ui.column().classes('flex-1 gap-0'):
@@ -472,7 +854,8 @@ def render_strategy_analyzer():
         # ── Fila 3: Botones ──
         with ui.row().classes('w-full mt-4 gap-3 items-center'):
             btn_run = ui.button(
-                'EJECUTAR PRUEBA RETROSPECTIVA'
+                'EJECUTAR PRUEBA RETROSPECTIVA',
+                on_click=lambda e: asyncio.create_task(run_backtest(e))
             ).classes('bg-blue-700 hover:bg-blue-800 text-white font-bold flex-1 py-3')
             
             btn_portfolio = ui.button(
@@ -687,7 +1070,7 @@ def render_strategy_analyzer():
                         type='warning', timeout=5000
                     )
 
-                btn_run_opt.text = f'Calculando... (0/{total_combos})'
+                btn_run_opt.set_text(f'Calculando... (0/{total_combos})')
                 btn_run_opt.props('disabled')
                 opt_progress.value = 0
                 lbl_progress.set_text(f'0 / {total_combos} combinaciones probadas')
@@ -704,13 +1087,13 @@ def render_strategy_analyzer():
                     db.close()
                 except Exception as ex:
                     ui.notify(f'Error cargando datos: {ex}', type='negative')
-                    btn_run_opt.text = 'INICIAR OPTIMIZADOR'
+                    btn_run_opt.set_text('INICIAR OPTIMIZADOR')
                     btn_run_opt.props(remove='disabled')
                     return
 
                 if df_opt.empty:
                     ui.notify('No hay datos para el par/periodo seleccionado. Descarga primero los datos.', type='warning')
-                    btn_run_opt.text = 'INICIAR OPTIMIZADOR'
+                    btn_run_opt.set_text('INICIAR OPTIMIZADOR')
                     btn_run_opt.props(remove='disabled')
                     return
 
@@ -755,7 +1138,7 @@ def render_strategy_analyzer():
                 opt_result_table.update()
                 opt_progress.value = 1.0
                 lbl_progress.set_text(f'{len(results)} combinaciones completadas — ordenadas por {metric_key}')
-                btn_run_opt.text = 'INICIAR OPTIMIZADOR'
+                btn_run_opt.set_text('INICIAR OPTIMIZADOR')
                 btn_run_opt.props(remove='disabled')
                 ui.notify(f'Optimización completa: {len(results)} combinaciones', type='positive')
 
@@ -876,13 +1259,115 @@ def render_strategy_analyzer():
                 lbl_hdr_pnl_b = ui.label('Total de pérdidas y ganancias (BASE)').classes('text-sm text-gray-500')
                 lbl_pnl_base = ui.label('--').classes('text-2xl font-bold text-black')
 
-        ui.label('Price Chart').classes('text-lg font-bold mt-6')
-        price_chart = ui.echart({
-            'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'cross'}},
-            'xAxis': {'type': 'category', 'data': []},
-            'yAxis': {'scale': True},
-            'series': [{'name': 'Price', 'type': 'candlestick', 'data': []}],
-        }).classes('w-full h-96 border rounded-lg p-2 bg-white mt-2')
+        # ════════════════════════════════════════════════════════
+        # PANEL DE CONTROL DE GRÁFICO Y INDICADORES TRADINGVIEW / NT8
+        # ════════════════════════════════════════════════════════
+        chart_config = {
+            'sma_20': True,
+            'sma_50': False,
+            'sma_200': False,
+            'ema_9': True,
+            'ema_21': False,
+            'ema_50': False,
+            'bollinger': False,
+            'vwap': False,
+            'supertrend': False,
+            'rsi': False,
+            'macd': False,
+            'atr': False,
+            'show_trades': True,
+            'show_trade_lines': True,
+            'show_trade_labels': True,
+            'trade_filter': 'ALL'
+        }
+
+        with ui.card().classes('w-full bg-slate-900 text-white p-4 rounded-2xl shadow-xl mt-6 border border-slate-800'):
+            with ui.row().classes('w-full justify-between items-center mb-2'):
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('show_chart', size='1.8rem').classes('text-emerald-400')
+                    ui.label('Gráfico de Análisis Técnico & Backtest (TradingView / NT8)').classes('text-xl font-extrabold tracking-tight')
+                ui.badge('Plotly Pro Engine', color='slate-8').classes('px-3 py-1 text-xs')
+
+            # --- Funciones auxiliares para la UI de gráficos ---
+            def _set_cfg(k, v):
+                chart_config[k] = v
+                render_tradingview_plotly()
+
+            def _make_toggle(key, label):
+                return ui.checkbox(label, value=chart_config.get(key, False), on_change=lambda e, k=key: _set_cfg(k, e.value)).classes('text-slate-200 text-sm')
+
+            # --- Indicadores Activos (Siempre Visibles) ---
+            @ui.refreshable
+            def render_price_overlays():
+                with ui.row().classes('w-full gap-4 flex-wrap items-center bg-slate-800/80 p-3 rounded-xl mb-3'):
+                    ui.label('Indicadores Activos:').classes('text-xs font-bold text-slate-400 uppercase tracking-wider mr-2')
+                    # Renderear todos los que empiecen con sma_ o ema_
+                    for key, val in chart_config.items():
+                        if key.startswith('sma_') or key.startswith('ema_'):
+                            label_text = f"{key.split('_')[0].upper()} {key.split('_')[1]}"
+                            ui.checkbox(label_text, value=val, on_change=lambda e, k=key: _set_cfg(k, e.value)).classes('text-slate-200 text-sm font-semibold')
+                    
+                    # También los estáticos
+                    ui.checkbox('Bandas Bollinger', value=chart_config.get('bollinger', False), on_change=lambda e: _set_cfg('bollinger', e.value)).classes('text-slate-200 text-sm font-semibold')
+                    ui.checkbox('VWAP', value=chart_config.get('vwap', False), on_change=lambda e: _set_cfg('vwap', e.value)).classes('text-slate-200 text-sm font-semibold')
+                    ui.checkbox('SuperTrend', value=chart_config.get('supertrend', False), on_change=lambda e: _set_cfg('supertrend', e.value)).classes('text-slate-200 text-sm font-semibold')
+            
+            render_price_overlays()
+
+            # --- Panel de Otras Configuraciones (Osciladores y Filtros) ---
+            with ui.expansion('⚙️ Más Configuraciones (Osciladores & Filtros de Trades)', icon='tune').classes('w-full bg-slate-800/80 text-white rounded-xl mb-3'):
+                with ui.column().classes('w-full p-3 gap-3'):
+
+                    # Fila 2: Subgráficos Osciladores
+                    ui.label('Osciladores y Volumen (Subplots)').classes('text-xs font-bold text-slate-400 uppercase tracking-wider mt-1')
+                    with ui.row().classes('w-full gap-4 flex-wrap items-center bg-slate-900/50 p-2 rounded-lg'):
+                        _make_toggle('rsi', 'RSI (14)')
+                        _make_toggle('macd', 'MACD (12, 26, 9)')
+                        _make_toggle('atr', 'ATR (14)')
+
+                    # Fila 3: Configuración de Señales de Trades
+                    ui.label('Señales de Entrada / Salida de Backtest').classes('text-xs font-bold text-slate-400 uppercase tracking-wider mt-1')
+                    with ui.row().classes('w-full gap-4 flex-wrap items-center bg-slate-900/50 p-2 rounded-lg'):
+                        _make_toggle('show_trades', 'Mostrar Señales')
+                        _make_toggle('show_trade_lines', 'Líneas de Conexión')
+                        _make_toggle('show_trade_labels', 'Etiquetas PnL')
+                        
+                        ui.label('Filtro de Trades:').classes('text-xs text-slate-400 ml-2')
+                        trade_filter_select = ui.select(
+                            {'ALL': 'Todos los Trades', 'WINS': 'Solo Ganadores (W)', 'LOSSES': 'Solo Perdedores (L)', 'LONG': 'Solo Long', 'SHORT': 'Solo Short'},
+                            value=chart_config['trade_filter'],
+                            on_change=lambda e: _set_cfg('trade_filter', e.value)
+                        ).classes('w-44 bg-slate-800 text-white text-xs')
+
+            # Contenedor principal del gráfico Plotly
+            plotly_chart_container = ui.column().classes('w-full overflow-hidden rounded-xl border border-slate-700/60 bg-slate-950')
+
+        def render_tradingview_plotly(zoom_dates=None):
+            plotly_chart_container.clear()
+            df = state.get('last_df', pd.DataFrame())
+            trades_df = state.get('last_trades_df')
+            symbol = state.get('symbol', 'BTC/USDT')
+            timeframe = state.get('timeframe', '1d')
+
+            fig = build_tradingview_plotly_figure(
+                df=df,
+                trades_df=trades_df,
+                config=chart_config,
+                symbol=symbol,
+                timeframe=timeframe
+            )
+
+            if zoom_dates and len(zoom_dates) == 2:
+                fig.update_xaxes(range=zoom_dates)
+
+            with plotly_chart_container:
+                # Pasar scrollZoom: True para permitir alejar/acercar con la rueda del ratón
+                # y permitir estirar el gráfico
+                ui.plotly(fig).props('config="{scrollZoom: true, responsive: true, displayModeBar: true}"').classes('w-full h-[780px]')
+
+        # Renderizado inicial
+        render_tradingview_plotly()
+
 
         with ui.row().classes('w-full items-center justify-between mt-6'):
             ui.label('Equity Curve').classes('text-lg font-bold')
@@ -928,15 +1413,23 @@ def render_strategy_analyzer():
             }],
         }).classes('w-full h-64 border rounded-lg p-2 bg-white mt-2')
 
-        ui.label('Ejecuciones (Operaciones)').classes('text-lg font-bold mt-6')
+        ui.label('Ejecuciones (Operaciones)').classes('text-lg font-bold mt-6 mb-2')
         trades_columns = []
-        trades_table = ui.table(columns=trades_columns, rows=[], row_key='entry_time').classes('w-full')
+        with ui.card().classes('w-full overflow-x-auto p-2 bg-white rounded-xl shadow-sm border border-slate-200 mt-2'):
+            trades_table = ui.table(columns=trades_columns, rows=[], row_key='entry_time').classes('w-full min-w-[1100px]')
+        
         trades_table.add_slot('body-cell-result', '''
             <q-td :props="props">
-                <span :style="{ color: props.value === 'W' ? '#16a34a' : '#dc2626',
-                                fontWeight: 'bold', fontSize: '1rem' }">
-                    {{ props.value }}
-                </span>
+                <q-badge :color="props.value === 'W' ? 'positive' : 'negative'"
+                         :label="props.value === 'W' ? '✓ WIN' : '✗ LOSS'"
+                         class="px-2 py-1 text-xs font-bold text-white shadow-sm" />
+            </q-td>
+        ''')
+        trades_table.add_slot('body-cell-side', '''
+            <q-td :props="props">
+                <q-badge :color="props.value === 'LONG' ? 'blue-8' : 'purple-8'"
+                         :label="props.value"
+                         class="px-2 py-1 text-xs font-bold text-white shadow-sm" />
             </q-td>
         ''')
         trades_table.add_slot('body-cell-pnl_pct', '''
@@ -944,6 +1437,16 @@ def render_strategy_analyzer():
                 <span :style="{ color: props.value >= 0 ? '#16a34a' : '#dc2626', fontWeight: 'bold' }">
                     {{ props.value > 0 ? '+' : '' }}{{ props.value != null ? Number(props.value).toFixed(2) + '%' : '0.00%' }}
                 </span>
+            </q-td>
+        ''')
+        trades_table.add_slot('body-cell-exit_reason', '''
+            <q-td :props="props">
+                <q-badge
+                    :color="props.value === 'TP' ? 'positive' : props.value === 'SL' ? 'negative' : 'primary'"
+                    class="px-2.5 py-1 text-xs font-bold text-white shadow-sm"
+                >
+                    {{ props.value === 'TP' ? 'TP' : props.value === 'SL' ? 'SL' : props.value === 'Signal' || props.value === 'Señal' ? 'Señal' : props.value }}
+                </q-badge>
             </q-td>
         ''')
 
@@ -978,6 +1481,24 @@ def render_strategy_analyzer():
                 backtester = Backtester(strategy, initial_capital=initial_capital, commission_pct=comm_pct, slippage_pct=slip_pct)
                 results = backtester.run(df)
                 results['df'] = df
+                
+                # Extraer indicadores de la estrategia para graficarlos dinámicamente
+                strategy_indicators = []
+                for rule_type in ['entry_conditions', 'exit_conditions']:
+                    rules = strategy.config.get(rule_type, {}).get('rules', [])
+                    for rule in rules:
+                        if rule.get('type') == 'technical_indicator':
+                            for prefix in ['1', '2']:
+                                ind = rule.get(f'indicator{prefix}')
+                                per = rule.get(f'period{prefix}')
+                                if ind and per:
+                                    try:
+                                        period_val = strategy.config.get('parameters', {}).get(per, per)
+                                        strategy_indicators.append((ind.lower(), int(period_val)))
+                                    except ValueError:
+                                        pass
+                results['strategy_indicators'] = list(set(strategy_indicators))
+                
                 return results
             finally:
                 db.close()
@@ -1374,7 +1895,7 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                     ui.notify(f"La suma de los pesos del portafolio debe ser 100% (actualmente es {total_w:.1f}%)", type="warning")
 
                 btn_run_portfolio.disable()
-                btn_run_portfolio.text = "⏳ Calculando simulación de portafolio..."
+                btn_run_portfolio.set_text("⏳ Calculando simulación de portafolio...")
                 notify_p = ui.notify("⚡ Calculando simulación combinada del portafolio... Por favor espera", type="info", spinner=True, timeout=3.0)
 
                 try:
@@ -1587,7 +2108,18 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
 
                             port_trades_table.add_slot('body-cell-side', '''
                                 <q-td :props="props">
-                                    <q-badge :color="props.row.side === 'LONG' ? 'positive' : 'negative'" :label="props.row.side" />
+                                    <q-badge :color="props.row.side === 'LONG' ? 'blue-8' : 'purple-8'" :label="props.row.side" class="px-2 py-1 text-xs font-bold text-white shadow-sm" />
+                                </q-td>
+                            ''')
+
+                            port_trades_table.add_slot('body-cell-reason', '''
+                                <q-td :props="props">
+                                    <q-badge
+                                        :color="props.value === 'TP' ? 'positive' : props.value === 'SL' ? 'negative' : 'primary'"
+                                        class="px-2.5 py-1 text-xs font-bold text-white shadow-sm"
+                                    >
+                                        {{ props.value === 'TP' ? 'TP' : props.value === 'SL' ? 'SL' : props.value === 'Signal' || props.value === 'Señal' ? 'Señal' : props.value }}
+                                    </q-badge>
                                 </q-td>
                             ''')
 
@@ -1601,7 +2133,7 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                 finally:
                     with p_client:
                         btn_run_portfolio.enable()
-                        btn_run_portfolio.text = "⚡ EJECUTAR SIMULACIÓN DE PORTAFOLIO COMBINADO"
+                        btn_run_portfolio.set_text("⚡ EJECUTAR SIMULACIÓN DE PORTAFOLIO COMBINADO")
 
             btn_run_portfolio.on_click(run_portfolio_simulation)
 
@@ -1630,344 +2162,6 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                     portfolio_dialog.open()
 
             btn_portfolio.on_click(open_portfolio_modal)
-
-        async def run_backtest():
-            if not state['strategy_name']:
-                ui.notify("No hay estrategia seleccionada", type="warning")
-                return
-
-            client = ui.context.client
-            with client:
-                btn_run.text = "⏳ Calculando simulación..."
-                btn_run.disable()
-                calc_notify = ui.notify("⚡ Ejecutando simulación de backtest... Por favor espera", type="info", spinner=True, timeout=3.0)
-            
-            try:
-                try:
-                    start_dt = datetime.strptime(str(state['start_date']).strip(), '%Y-%m-%d').replace(tzinfo=timezone.utc)
-                except Exception:
-                    start_dt = datetime(2024, 1, 1, tzinfo=timezone.utc)
-
-                try:
-                    end_dt = datetime.strptime(str(state['end_date']).strip(), '%Y-%m-%d').replace(hour=23, minute=59, tzinfo=timezone.utc)
-                except Exception:
-                    end_dt = datetime.now(timezone.utc)
-                
-                file_path = strategies[state['strategy_name']]
-                symbol = state['symbol']
-                timeframe = normalize_timeframe(state['timeframe'])
-
-                try:
-                    cap_val = float(state.get('capital', 1.0) or 1.0)
-                except (ValueError, TypeError):
-                    cap_val = 1.0
-                
-                # Para estimar capital inicial si se configuró en activo BASE
-                db_temp = SessionLocal()
-                mgr_temp = MarketDataManager(db_temp)
-                first_candle = mgr_temp.get_data(symbol, timeframe, start_dt, end_dt)
-                db_temp.close()
-                
-                start_price = first_candle.iloc[0]['open'] if not first_candle.empty else 1.0
-                
-                if state.get('capital_type', 'QUOTE') == 'BASE':
-                    initial_cap_quote = cap_val * start_price
-                else:
-                    initial_cap_quote = cap_val
-                
-                initial_cap_base = initial_cap_quote / start_price if start_price > 0 else 0
-                
-                comm_pct = float(state.get('commission_pct', 0.1) or 0.1)
-                slip_pct = float(state.get('slippage_pct', 0.05) or 0.05)
-                sizing_mode = state.get('sizing_mode', 'Interés Compuesto (100% Capital)')
-                
-                # Ejecutar descarga + simulación en hilo I/O secundario para NO congelar la UI
-                results = await run.io_bound(
-                    _sync_load_and_run,
-                    file_path,
-                    state.get('custom_parameters', {}),
-                    symbol,
-                    timeframe,
-                    start_dt,
-                    end_dt,
-                    initial_cap_quote,
-                    sizing_mode,
-                    comm_pct,
-                    slip_pct
-                )
-                
-                with client:
-                    if 'error' in results:
-                        ui.notify(results['error'], type="warning")
-                    else:
-                        df          = results.get('df', pd.DataFrame())
-                        trades_df   = results.get("trades")
-                        equity_curve = results.get("equity_curve")
-                        drawdown    = pd.Series(dtype=float)
-
-                        if equity_curve is not None and not equity_curve.empty:
-                            if 'timestamp' in equity_curve.columns:
-                                equity_curve = equity_curve.set_index('timestamp')
-                            equity_curve.index = pd.to_datetime(equity_curve.index)
-
-                            try:
-                                trade_metrics = (
-                                    calculate_metrics(trades_df, initial_cap_quote)
-                                    if trades_df is not None and not trades_df.empty
-                                    else {'total_trades': 0}
-                                )
-                                eq_metrics = calculate_equity_curve_metrics(equity_curve['equity'])
-
-                                def safe_num(v, default=0.0):
-                                    try:
-                                        f = float(v)
-                                        return default if (v is None or f != f or abs(f) == float('inf')) else f
-                                    except Exception:
-                                        return default
-
-                                cagr_val      = safe_num(eq_metrics.get('cagr'))
-                                maxdd_val     = safe_num(eq_metrics.get('max_drawdown_pct'))
-                                sharpe_val    = safe_num(eq_metrics.get('sharpe_ratio'))
-                                pf_val        = safe_num(trade_metrics.get('profit_factor'))
-                                n_trades      = int(safe_num(trade_metrics.get('total_trades')))
-                                win_trades    = int(safe_num(trade_metrics.get('winning_trades')))
-                                lose_trades   = int(safe_num(trade_metrics.get('losing_trades')))
-                                win_rate      = safe_num(trade_metrics.get('percent_profitable'))
-                                max_cons_loss = int(safe_num(trade_metrics.get('max_consecutive_losers')))
-
-                                state['last_computed_metrics'] = {
-                                    'cagr': cagr_val, 'max_drawdown_pct': maxdd_val,
-                                    'sharpe_ratio': sharpe_val, 'profit_factor': pf_val,
-                                    'total_trades': n_trades, 'winning_trades': win_trades,
-                                    'losing_trades': lose_trades, 'win_rate': win_rate,
-                                    'max_consecutive_losers': max_cons_loss,
-                                    'start_dt': start_dt, 'end_dt': end_dt
-                                }
-
-                                lbl_cagr.set_text(f"{cagr_val:.2f}%")
-                                lbl_maxdd.set_text(f"{maxdd_val:.2f}%")
-                                lbl_sharpe.set_text(f"{sharpe_val:.2f}")
-                                lbl_profit_factor.set_text(f"{pf_val:.2f}")
-                                lbl_total_trades.set_text(str(n_trades))
-                                lbl_win_trades.set_text(str(win_trades))
-                                lbl_lose_trades.set_text(str(lose_trades))
-                                lbl_win_rate.set_text(f"{win_rate:.2f}%")
-                                lbl_max_cons_losers.set_text(str(max_cons_loss))
-
-                                lbl_cagr.classes(remove='text-green-600 text-red-600',
-                                                 add='text-green-600' if cagr_val >= 0 else 'text-red-600')
-                                lbl_maxdd.classes(remove='text-green-600 text-red-600', add='text-red-600')
-                                lbl_sharpe.classes(remove='text-green-600 text-red-600 text-blue-600',
-                                                   add='text-blue-600' if sharpe_val >= 0 else 'text-red-600')
-                                lbl_profit_factor.classes(
-                                    remove='text-green-600 text-yellow-600 text-red-600',
-                                    add='text-green-600' if pf_val >= 1.2 else 'text-yellow-600' if pf_val >= 1.0 else 'text-red-600'
-                                )
-                                lbl_win_rate.classes(remove='text-green-600 text-red-600',
-                                                     add='text-green-600' if win_rate > 50 else 'text-red-600')
-
-                                roll_max = equity_curve['equity'].cummax()
-                                drawdown = (equity_curve['equity'] - roll_max) / roll_max * 100
-                                dates_eq  = equity_curve.index.strftime('%Y-%m-%d').tolist()
-                                eq_vals   = equity_curve['equity']
-                                close_aln = df['close'].reindex(eq_vals.index).ffill()
-                                eq_base   = eq_vals / close_aln
-
-                                state['equity_dates']      = dates_eq
-                                state['equity_quote_data'] = eq_vals.round(6).tolist()
-                                state['equity_base_data']  = eq_base.round(6).tolist()
-
-                                is_quote = (equity_toggle.value == 'QUOTE')
-                                chart.options['xAxis']['data'] = dates_eq
-                                chart.options['series'][0]['data'] = (
-                                    state['equity_quote_data'] if is_quote else state['equity_base_data']
-                                )
-                                base_a  = state['symbol'].split('/')[0] if '/' in state['symbol'] else 'BASE'
-                                quote_a = state['symbol'].split('/')[1] if '/' in state['symbol'] else 'QUOTE'
-                                chart.options['series'][0]['name'] = f"Equity ({quote_a if is_quote else base_a})"
-                                chart.update()
-
-                                drawdown_chart.options['xAxis']['data'] = dates_eq
-                                drawdown_chart.options['series'][0]['data'] = drawdown.round(4).tolist()
-                                drawdown_chart.update()
-
-                                price_chart.options['xAxis']['data'] = df.index.strftime('%Y-%m-%d %H:%M').tolist()
-                                price_chart.options['series'][0]['data'] = df[['open', 'close', 'low', 'high']].values.tolist()
-                                price_chart.update()
-
-                            except Exception as _me:
-                                import traceback as _tb
-                                ui.notify(f"Error métricas: {_me}\n{_tb.format_exc()[:400]}", type='negative', timeout=15000)
-
-                        else:
-                            lbl_cagr.set_text("0.00%"); lbl_maxdd.set_text("0.00%")
-                            lbl_sharpe.set_text("0.00"); lbl_profit_factor.set_text("0.00")
-                            lbl_total_trades.set_text("0"); lbl_win_trades.set_text("0")
-                            lbl_lose_trades.set_text("0"); lbl_win_rate.set_text("0.00%")
-                            lbl_max_cons_losers.set_text("0")
-                            chart.options['xAxis']['data'] = df.index.strftime('%Y-%m-%d').tolist()
-                            chart.options['series'][0]['data'] = [round(initial_cap_quote, 6)] * len(df)
-                            chart.update()
-                            drawdown_chart.options['xAxis']['data'] = df.index.strftime('%Y-%m-%d').tolist()
-                            drawdown_chart.options['series'][0]['data'] = [0] * len(df)
-                            drawdown_chart.update()
-                            price_chart.options['xAxis']['data'] = df.index.strftime('%Y-%m-%d %H:%M').tolist()
-                            price_chart.options['series'][0]['data'] = df[['open', 'close', 'low', 'high']].values.tolist()
-                            price_chart.update()
-                            ui.notify("El backtest no generó curva de equity (sin señales o error).", type='warning')
-
-                        # ── Trades table ──
-                        base_asset  = state['symbol'].split('/')[0] if '/' in state['symbol'] else 'BTC'
-                        quote_asset = state['symbol'].split('/')[1] if '/' in state['symbol'] else 'USDT'
-                        state['quote_asset'] = quote_asset
-                        state['base_asset']  = base_asset
-
-                        columns = [
-                            {'name': 'result',       'label': 'W/L',                         'field': 'result',       'sortable': True},
-                            {'name': 'entry_time',   'label': 'Fecha entrada (UTC)',          'field': 'entry_time',   'sortable': True},
-                            {'name': 'exit_time',    'label': 'Fecha salida (UTC)',           'field': 'exit_time',    'sortable': True},
-                            {'name': 'side',         'label': 'Lado',                        'field': 'side',         'sortable': True},
-                            {'name': 'entry_price',  'label': 'Precio entrada',              'field': 'entry_price',  'sortable': True},
-                            {'name': 'exit_price',   'label': 'Precio salida',               'field': 'exit_price',   'sortable': True},
-                            {'name': 'pnl_pct',      'label': '% Resultado',                 'field': 'pnl_pct',      'sortable': True},
-                            {'name': 'pnl_quote',    'label': f'P&L ({quote_asset})',        'field': 'pnl_quote',    'sortable': True},
-                            {'name': 'pnl_base',     'label': f'P&L ({base_asset})',         'field': 'pnl_base',     'sortable': True},
-                            {'name': 'cum_pnl_quote','label': f'P&L acum. ({quote_asset})',  'field': 'cum_pnl_quote','sortable': True},
-                            {'name': 'cum_pnl_base', 'label': f'P&L acum. ({base_asset})',   'field': 'cum_pnl_base', 'sortable': True},
-                            {'name': 'balance_quote','label': f'Saldo ({quote_asset})',       'field': 'balance_quote','sortable': True},
-                            {'name': 'balance_base', 'label': f'Saldo ({base_asset})',        'field': 'balance_base', 'sortable': True},
-                            {'name': 'drawdown',     'label': 'Reducción máx. (%)',          'field': 'drawdown',     'sortable': True},
-                            {'name': 'exit_reason',  'label': 'Razón',                       'field': 'exit_reason',  'sortable': True},
-                        ]
-                        trades_table.columns = columns
-
-                        def fmt_price(p):
-                            if p is None: return 'N/A'
-                            try:
-                                p = float(p)
-                                if abs(p) >= 1000: return f"{p:,.2f}"
-                                if abs(p) >= 1:    return f"{p:.4f}"
-                                if abs(p) >= 0.01: return f"{p:.6f}"
-                                return f"{p:.8f}"
-                            except Exception:
-                                return str(p)
-
-                        def fmt_pnl(p):
-                            if p is None: return 'N/A'
-                            try:
-                                p = float(p)
-                                if abs(p) >= 1000: return f"{p:+,.2f}"
-                                if abs(p) >= 1:    return f"{p:+.4f}"
-                                if abs(p) >= 0.01: return f"{p:+.6f}"
-                                return f"{p:+.8f}"
-                            except Exception:
-                                return str(p)
-
-                        trades_rows   = []
-                        cum_q         = 0.0
-                        cum_b         = 0.0
-                        balance_quote = initial_cap_quote
-                        balance_base  = initial_cap_base
-
-                        if trades_df is not None and not trades_df.empty:
-                            for _, trow in trades_df.iterrows():
-                                pnl_quote   = float(trow.get('pnl', 0) or 0)
-                                entry_price = float(trow.get('entry_price', 1) or 1)
-                                exit_price  = float(trow.get('exit_price',  1) or 1)
-                                side        = str(trow.get('side', '')).upper()
-                                pnl_base    = pnl_quote / exit_price if exit_price > 0 else 0
-
-                                if entry_price > 0:
-                                    if side == 'LONG':
-                                        pnl_pct = (exit_price - entry_price) / entry_price * 100
-                                    elif side == 'SHORT':
-                                        pnl_pct = (entry_price - exit_price) / entry_price * 100
-                                    else:
-                                        pnl_pct = 0.0
-                                else:
-                                    pnl_pct = 0.0
-
-                                cum_q        += pnl_quote
-                                balance_quote = initial_cap_quote + cum_q
-                                balance_base  = balance_quote / exit_price if exit_price > 0 else 0
-                                cum_b         = balance_base - initial_cap_base
-
-                                dd_val = 0.0
-                                try:
-                                    ts = pd.to_datetime(trow.get('exit_time'))
-                                    if len(drawdown) > 0:
-                                        idx = drawdown.index.get_indexer([ts], method='nearest')[0]
-                                        if idx >= 0:
-                                            dd_val = float(drawdown.iloc[idx])
-                                except Exception:
-                                    pass
-
-                                trades_rows.append({
-                                    'result':       'W' if pnl_quote > 0 else 'L',
-                                    'entry_time':   str(trow.get('entry_time', ''))[:19],
-                                    'exit_time':    str(trow.get('exit_time',  ''))[:19],
-                                    'side':         side,
-                                    'entry_price':  fmt_price(entry_price),
-                                    'exit_price':   fmt_price(exit_price),
-                                    'pnl_pct':      float(pnl_pct),
-                                    'pnl_quote':    fmt_pnl(pnl_quote),
-                                    'pnl_base':     fmt_pnl(pnl_base),
-                                    'cum_pnl_quote':fmt_pnl(cum_q),
-                                    'cum_pnl_base': fmt_pnl(cum_b),
-                                    'balance_quote':fmt_price(balance_quote),
-                                    'balance_base': fmt_price(balance_base),
-                                    'drawdown':     f"{dd_val:.2f}%",
-                                    'exit_reason':  str(trow.get('exit_reason', ''))
-                                })
-
-                        trades_table.rows = trades_rows
-                        trades_table.update()
-
-                        # ── Summary labels ──
-                        lbl_hdr_init_q.set_text(f'Capital Inicial ({quote_asset})')
-                        lbl_hdr_init_b.set_text(f'Capital Inicial ({base_asset})')
-                        lbl_hdr_bal_q.set_text(f'Balance Final ({quote_asset})')
-                        lbl_hdr_bal_b.set_text(f'Balance Final ({base_asset})')
-                        lbl_hdr_pnl_q.set_text(f'P&L Total ({quote_asset})')
-                        lbl_hdr_pnl_b.set_text(f'P&L Total ({base_asset})')
-                        lbl_init_quote.set_text(fmt_price(initial_cap_quote))
-                        lbl_init_base.set_text(fmt_price(initial_cap_base))
-                        lbl_bal_quote.set_text(fmt_price(balance_quote))
-                        lbl_bal_base.set_text(fmt_price(balance_base))
-                        lbl_pnl_quote.set_text(fmt_pnl(cum_q))
-                        lbl_pnl_base.set_text(fmt_pnl(cum_b))
-
-                        def _upd_color(lbl, positive):
-                            lbl.classes(remove='text-black text-green-600 text-red-600',
-                                        add='text-green-600' if positive else 'text-red-600')
-
-                        _upd_color(lbl_bal_quote, balance_quote >= initial_cap_quote)
-                        _upd_color(lbl_bal_base,  balance_base  >= initial_cap_base)
-                        _upd_color(lbl_pnl_quote, cum_q >= 0)
-                        _upd_color(lbl_pnl_base,  cum_b >= 0)
-
-            except Exception as e:
-                import traceback as _tb3
-                import logging
-                _full_err = _tb3.format_exc()
-                logging.error(f"Backtest error:\n{_full_err}")
-                print(f"BACKTEST ERROR:\n{_full_err}")
-                with client:
-                    try:
-                        ui.notify(f"Error: {type(e).__name__}: {e}", type="negative", timeout=20000)
-                    except Exception:
-                        pass
-            finally:
-                with client:
-                    if 'calc_notify' in locals():
-                        try:
-                            calc_notify.dismiss()
-                        except Exception:
-                            pass
-                    btn_run.enable()
-                    btn_run.text = "EJECUTAR PRUEBA RETROSPECTIVA"
-
-    btn_run.on_click(run_backtest)
 
     def select_strategy(filename):
         if filename in strategies:

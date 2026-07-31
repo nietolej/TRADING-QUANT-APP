@@ -54,7 +54,9 @@ def create_gui(app):
                         render_strategy_catalog(on_edit_strategy=on_edit, on_select_strategy=on_analyze)
 
                     with ui.tab_panel(tab_analyzer):
-                        analyzer_state = render_strategy_analyzer()
+                        def on_back_to_builder():
+                            panels.value = tab_builder
+                        analyzer_state = render_strategy_analyzer(on_back_to_builder=on_back_to_builder)
 
                     with ui.tab_panel(tab_history):
                         def on_load_to_analyzer(row):

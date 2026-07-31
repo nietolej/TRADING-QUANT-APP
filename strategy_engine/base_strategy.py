@@ -41,6 +41,33 @@ class BaseStrategy:
         if self.parameters:
             self._apply_parameters(self.config, self.parameters)
             
+            # Sync SL and TP parameters into risk_management section if parameters specify SL/TP
+            rm = self.config.get("risk_management", {})
+            sl_param = self.parameters.get("SL") or self.parameters.get("stop_loss") or self.parameters.get("sl")
+            tp_param = self.parameters.get("TP") or self.parameters.get("take_profit") or self.parameters.get("tp")
+            
+            if sl_param is not None:
+                try:
+                    sl_val = float(sl_param)
+                    if sl_val > 0:
+                        rm_sl = rm.get("stop_loss", {})
+                        if rm_sl.get("type", "none") in ("none", "", None):
+                            rm["stop_loss"] = {"type": "percentage", "value": sl_val}
+                except (TypeError, ValueError):
+                    pass
+
+            if tp_param is not None:
+                try:
+                    tp_val = float(tp_param)
+                    if tp_val > 0:
+                        rm_tp = rm.get("take_profit", {})
+                        if rm_tp.get("type", "none") in ("none", "", None):
+                            rm["take_profit"] = {"type": "percentage", "value": tp_val}
+                except (TypeError, ValueError):
+                    pass
+
+            self.config["risk_management"] = rm
+
         self.risk_manager = RiskManager(self.config.get("risk_management", {}))
         
     def _resolve_param_value(self, raw_val, params):
