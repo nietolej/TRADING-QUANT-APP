@@ -14,77 +14,94 @@ def create_gui(app):
     
     @ui.page('/')
     def dashboard():
-        ui.colors(primary='#1e40af', secondary='#0f172a', accent='#f59e0b')
+        # Dark Quant Terminal Aesthetic
+        ui.dark_mode().enable()
+        ui.colors(primary='#06b6d4', secondary='#0f172a', accent='#f59e0b') # Cyan-500, Slate-900, Amber-500
         
-        # Header oscuro premium
-        with ui.header().classes('bg-slate-900 text-white justify-between items-center px-6 py-4 shadow-md border-b border-slate-800'):
+        # Header oscuro premium con glassmorphism
+        with ui.header().classes('bg-slate-900/80 backdrop-blur-md text-white justify-between items-center px-6 py-4 shadow-md border-b border-slate-700'):
             with ui.row().classes('items-center gap-3'):
-                ui.icon('rocket_launch', size='2rem').classes('text-blue-500')
-                ui.label('Trading Quant App').classes('text-2xl font-bold tracking-tight')
+                ui.icon('rocket_launch', size='2rem').classes('text-cyan-400')
+                ui.label('Trading Quant Terminal').classes('text-2xl font-bold tracking-tight')
             ui.button('Configuración', icon='settings').props('flat round text-color=white').classes('hover:bg-slate-800 transition-colors')
             
-        with ui.column().classes('w-full q-pa-sm'):
-            # Contenedor principal de pestañas flotantes
-            with ui.card().classes('w-full bg-white rounded-2xl shadow-lg p-3'):
+        # Contenedores de las páginas (mantienen estado al ocultarse en lugar de destruirse)
+        pages = {}
+        
+        def show_page(page_name):
+            for name, container in pages.items():
+                container.set_visibility(name == page_name)
+        
+        # Sidebar izquierdo
+        with ui.left_drawer(value=True).classes('bg-slate-900 text-slate-300 border-r border-slate-800 p-4 shadow-xl') as drawer:
+            ui.label('MENÚ PRINCIPAL').classes('text-xs font-bold text-slate-500 mb-4 tracking-widest')
+            
+            def menu_item(text, icon, page_id):
+                btn = ui.button(text, icon=icon, on_click=lambda: show_page(page_id))
+                btn.props('flat align="left"').classes('w-full text-slate-300 hover:text-white hover:bg-slate-800 transition-all justify-start py-3')
+                return btn
                 
-                with ui.tabs().classes('w-full text-slate-700 font-semibold mb-2 bg-slate-100 rounded-xl p-1 gap-2') as tabs:
-                    tab_builder = ui.tab('Strategy Builder', icon='build')
-                    tab_catalog = ui.tab('Estrategias Guardadas', icon='list')
-                    tab_analyzer = ui.tab('Strategy Analyzer', icon='analytics')
-                    tab_history = ui.tab('Historial de Backtests', icon='history')
-                    tab_market = ui.tab('Datos Almacenados', icon='storage')
-                    tab_ml = ui.tab('Machine Learning', icon='psychology')
-                    tab_live = ui.tab('Live Monitor', icon='play_circle')
-                    
-                with ui.tab_panels(tabs, value=tab_builder).classes('w-full bg-transparent p-0') as panels:
-                    with ui.tab_panel(tab_builder).classes('p-0 mt-4'):
-                        builder_state = render_strategy_builder()
-                        
-                    with ui.tab_panel(tab_catalog):
-                        def on_edit(row):
-                            if builder_state and 'load_strategy_data' in builder_state:
-                                builder_state['load_strategy_data'](row['name'])
-                            panels.value = tab_builder
+            menu_item('Strategy Builder', 'build', 'builder')
+            menu_item('Estrategias Guardadas', 'list', 'catalog')
+            menu_item('Strategy Analyzer', 'analytics', 'analyzer')
+            menu_item('Historial Backtests', 'history', 'history')
+            ui.separator().classes('my-4 bg-slate-700')
+            ui.label('HERRAMIENTAS AVANZADAS').classes('text-xs font-bold text-slate-500 mb-4 tracking-widest')
+            menu_item('Datos Almacenados', 'storage', 'market')
+            menu_item('Machine Learning', 'psychology', 'ml')
+            menu_item('Live Monitor', 'play_circle', 'live')
 
-                        def on_analyze(row):
-                            if analyzer_state and 'select_strategy' in analyzer_state:
-                                analyzer_state['select_strategy'](row.get('filename'))
-                            panels.value = tab_analyzer
+        # Contenedor principal
+        with ui.column().classes('w-full h-full p-4 bg-slate-950'):
+            
+            # --- Instanciar Páginas ---
+            with ui.column().classes('w-full h-full') as pages['builder']:
+                builder_state = render_strategy_builder()
+                
+            with ui.column().classes('w-full h-full') as pages['catalog']:
+                def on_edit(row):
+                    if builder_state and 'load_strategy_data' in builder_state:
+                        builder_state['load_strategy_data'](row['name'])
+                    show_page('builder')
 
-                        render_strategy_catalog(on_edit_strategy=on_edit, on_select_strategy=on_analyze)
+                def on_analyze(row):
+                    if analyzer_state and 'select_strategy' in analyzer_state:
+                        analyzer_state['select_strategy'](row.get('filename'))
+                    show_page('analyzer')
+                render_strategy_catalog(on_edit_strategy=on_edit, on_select_strategy=on_analyze)
 
-                    with ui.tab_panel(tab_analyzer):
-                        def on_back_to_builder():
-                            panels.value = tab_builder
-                        analyzer_state = render_strategy_analyzer(on_back_to_builder=on_back_to_builder)
+            with ui.column().classes('w-full h-full') as pages['analyzer']:
+                def on_back_to_builder():
+                    show_page('builder')
+                analyzer_state = render_strategy_analyzer(on_back_to_builder=on_back_to_builder)
 
-                    with ui.tab_panel(tab_history):
-                        def on_load_to_analyzer(row):
-                            if analyzer_state and 'load_from_history' in analyzer_state:
-                                analyzer_state['load_from_history'](row)
-                            panels.value = tab_analyzer
+            with ui.column().classes('w-full h-full') as pages['history']:
+                def on_load_to_analyzer(row):
+                    if analyzer_state and 'load_from_history' in analyzer_state:
+                        analyzer_state['load_from_history'](row)
+                    show_page('analyzer')
 
-                        def on_open_portfolio(row=None):
-                            if analyzer_state:
-                                if row and 'load_from_history' in analyzer_state:
-                                    analyzer_state['load_from_history'](row)
-                                if 'open_portfolio_modal' in analyzer_state:
-                                    analyzer_state['open_portfolio_modal']()
-                            panels.value = tab_analyzer
+                def on_open_portfolio(row=None):
+                    if analyzer_state:
+                        if row and 'load_from_history' in analyzer_state:
+                            analyzer_state['load_from_history'](row)
+                        if 'open_portfolio_modal' in analyzer_state:
+                            analyzer_state['open_portfolio_modal']()
+                    show_page('analyzer')
 
-                        render_backtest_history_page(
-                            on_load_in_analyzer=on_load_to_analyzer,
-                            on_open_portfolio=on_open_portfolio
-                        )
-                        
-                    with ui.tab_panel(tab_market):
-                        render_market_analyzer()
-                        
-                    with ui.tab_panel(tab_ml):
-                        render_ml_page()
+                render_backtest_history_page(on_load_in_analyzer=on_load_to_analyzer, on_open_portfolio=on_open_portfolio)
+                
+            with ui.column().classes('w-full h-full') as pages['market']:
+                render_market_analyzer()
+                
+            with ui.column().classes('w-full h-full') as pages['ml']:
+                render_ml_page()
 
-                    with ui.tab_panel(tab_live):
-                        render_live_monitor_page()
+            with ui.column().classes('w-full h-full') as pages['live']:
+                render_live_monitor_page()
+                
+        # Mostrar builder por defecto
+        show_page('builder')
 
     # Run NiceGUI over the existing FastAPI app
     ui.run_with(

@@ -18,7 +18,7 @@ def render_strategy_catalog(on_edit_strategy=None, on_select_strategy=None):
                     ui.label('Estrategias Guardadas').classes('text-3xl font-extrabold tracking-tight')
                     ui.label('Administra, edita o analiza tus configuraciones de trading').classes('text-slate-400 text-sm')
         
-        with ui.card().classes('w-full bg-white p-6 rounded-2xl shadow-md border border-slate-100'):
+        with ui.card().classes('w-full bg-slate-900/50 p-6 rounded-2xl shadow-xl border border-slate-700/50'):
             catalog_columns = [
                 {'name': 'name', 'label': 'Nombre', 'field': 'name', 'sortable': True},
                 {'name': 'direction', 'label': 'Dirección', 'field': 'direction', 'sortable': True},

@@ -179,10 +179,9 @@ def build_tradingview_plotly_figure(
     # Calcular indicadores sobre el DataFrame
     df_calc = calculate_indicators(df, config)
     
-    # Limitar a las últimas 3000 velas para evitar desconexiones de WebSocket (payload demasiado grande)
-    # y para evitar que el navegador del cliente se congele intentando renderizar demasiados puntos.
-    if len(df_calc) > 3000:
-        df_calc = df_calc.tail(3000)
+    # Limitar a las últimas 1000 velas para evitar desconexiones de WebSocket (payload demasiado grande)
+    if len(df_calc) > 1000:
+        df_calc = df_calc.tail(1000)
 
     # Formatear fechas para eje X
     if not isinstance(df_calc.index, pd.DatetimeIndex):
@@ -245,22 +244,17 @@ def build_tradingview_plotly_figure(
     )
 
     # ── 2. Overlays de Indicadores en el gráfico principal ──
-    colors_sma = {'SMA_20': '#3b82f6', 'SMA_50': '#8b5cf6', 'SMA_200': '#ec4899'}
-    colors_ema = {'EMA_9': '#f59e0b', 'EMA_21': '#10b981', 'EMA_50': '#06b6d4', 'EMA_200': '#6366f1'}
-
-    for col_name, color in colors_sma.items():
-        if col_name in df_calc.columns:
+    overlay_colors = ['#f59e0b', '#10b981', '#06b6d4', '#6366f1', '#3b82f6', '#8b5cf6', '#ec4899', '#f43f5e']
+    color_idx = 0
+    
+    for col_name in df_calc.columns:
+        if col_name.startswith('SMA_') or col_name.startswith('EMA_'):
+            color = overlay_colors[color_idx % len(overlay_colors)]
             fig.add_trace(
                 go.Scatter(x=x_dates, y=df_calc[col_name], mode='lines', name=col_name, line=dict(color=color, width=1.5)),
                 row=1, col=1
             )
-
-    for col_name, color in colors_ema.items():
-        if col_name in df_calc.columns:
-            fig.add_trace(
-                go.Scatter(x=x_dates, y=df_calc[col_name], mode='lines', name=col_name, line=dict(color=color, width=1.5)),
-                row=1, col=1
-            )
+            color_idx += 1
 
     # Bandas de Bollinger
     if 'BB_upper' in df_calc.columns and 'BB_lower' in df_calc.columns:
@@ -448,7 +442,7 @@ def build_tradingview_plotly_figure(
         margin=dict(l=50, r=50, t=40, b=40),
         height=760,
         hovermode="x unified",
-        dragmode="zoom",
+        dragmode="pan",
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -465,7 +459,8 @@ def build_tradingview_plotly_figure(
         gridcolor="#1e293b",
         zerolinecolor="#1e293b",
         fixedrange=False,
-        rangeslider=dict(visible=False),
+        side="top",
+        rangeslider=dict(visible=True, thickness=0.05),
         rangeselector=dict(
             buttons=list([
                 dict(count=1, label="1M", step="month", stepmode="backward"),
@@ -478,11 +473,11 @@ def build_tradingview_plotly_figure(
             font=dict(color="#ffffff", size=11),
             bgcolor="#1e293b",
             activecolor="#3b82f6",
-            x=0, y=1.02
+            x=0, y=1.12
         )
     )
 
     # Actualizar ejes Y de los subgráficos (permitir zoom en eje Y si se desea)
-    fig.update_yaxes(showgrid=True, gridcolor="#1e293b", zerolinecolor="#1e293b", fixedrange=False)
+    fig.update_yaxes(showgrid=True, gridcolor="#1e293b", zerolinecolor="#1e293b", fixedrange=False, side="right")
 
     return fig

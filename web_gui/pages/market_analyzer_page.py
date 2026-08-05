@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 import pandas as pd
 import logging
 import asyncio
+from web_gui.components.cards import glass_card
 
 logger = logging.getLogger(__name__)
 
@@ -33,18 +34,14 @@ def _load_binance_symbols_sync() -> list:
         return FALLBACK_SYMBOLS
 
 def render_market_analyzer():
-    with ui.column().classes('w-full q-pa-md'):
+    with ui.column().classes('w-full q-pa-md max-w-[1600px] mx-auto'):
         # Hero Header
-        with ui.card().classes('w-full bg-slate-900 text-white p-6 rounded-2xl shadow-xl mb-6'):
-            with ui.row().classes('items-center gap-4'):
-                ui.icon('storage', size='3rem').classes('text-blue-400')
-                with ui.column().classes('gap-1'):
-                    ui.label('Datos Almacenados').classes('text-3xl font-extrabold tracking-tight')
-                    ui.label('Catálogo de Mercado e Historial de Precios').classes('text-slate-400 text-sm')
+        with glass_card(title="Catálogo de Mercado e Historial de Precios", icon="storage"):
+            pass # Title is handled by glass_card
 
         # ----------------- Main Data Catalog Table -----------------
         columns = [
-            {'name': 'symbol', 'label': 'Par (Symbol)', 'field': 'symbol', 'sortable': True},
+            {'name': 'symbol', 'label': 'Par (Symbol)', 'field': 'symbol', 'sortable': True, 'classes': 'text-cyan-400 font-bold'},
             {'name': 'type', 'label': 'Tipo', 'field': 'type', 'sortable': True},
             {'name': 'metric', 'label': 'Temporalidad / Métrica', 'field': 'metric', 'sortable': True},
             {'name': 'source', 'label': 'Fuente', 'field': 'source', 'sortable': True},
@@ -52,41 +49,42 @@ def render_market_analyzer():
             {'name': 'end', 'label': 'Fecha Final (UTC)', 'field': 'end'},
         ]
         
-        table = ui.table(columns=columns, rows=[], row_key='name').classes('w-full')
+        # Table with dark mode styling
+        table = ui.table(columns=columns, rows=[], row_key='name').classes('w-full bg-slate-900 text-slate-200 border-none shadow-none mt-4')
+        # Tailwind classes on NiceGUI tables don't automatically style everything, but bg-slate-900 makes the background dark.
         
-        with ui.row().classes('w-full justify-between items-center q-mt-md'):
-            ui.button('Refresh Data', on_click=lambda: load_data(), icon='refresh').classes('bg-blue-500 text-white')
-            ui.button('Bulk Downloader', on_click=lambda: download_dialog.open()).classes('bg-green-500 text-white')
+        with ui.row().classes('w-full justify-between items-center q-mt-md gap-4'):
+            ui.button('Actualizar Datos', on_click=lambda: load_data(), icon='refresh').props('rounded').classes('bg-slate-700 hover:bg-slate-600 text-white')
+            ui.button('Bulk Downloader', on_click=lambda: download_dialog.open(), icon='download').props('rounded').classes('bg-cyan-600 hover:bg-cyan-500 text-white shadow-lg shadow-cyan-500/50')
 
         # ----------------- Data Viewer UI Elements -----------------
-        with ui.card().classes('w-full bg-white p-6 rounded-2xl shadow-md border border-slate-100 mt-6'):
-            ui.label('Query & View Historical Data').classes('text-xl font-bold text-slate-800 mb-4')
-            
-            with ui.row().classes('w-full gap-4 items-center'):
+        with glass_card(title="Query & View Historical Data", icon="search"):
+            with ui.row().classes('w-full gap-4 items-end mb-4'):
                 viewer_symbol_select = ui.select([], label='Symbol', value=None).classes('flex-1')
                 viewer_tf_select = ui.select([], label='Timeframe', value=None).classes('flex-1')
                 viewer_start_input = ui.input(label='Start (YYYY-MM-DD)', value=(datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')).classes('flex-1')
                 viewer_end_input = ui.input(label='End (YYYY-MM-DD)', value=datetime.now().strftime('%Y-%m-%d')).classes('flex-1')
-                ui.button('Load Data', on_click=lambda: load_viewer_data(), icon='search').props('rounded').classes('bg-blue-600 hover:bg-blue-500 text-white font-bold h-12 mt-2 px-6 shadow-md transition-all')
+                ui.button('Cargar Data', on_click=lambda: load_viewer_data(), icon='search').props('rounded').classes('bg-cyan-600 hover:bg-cyan-500 text-white font-bold h-12 shadow-xl transition-all shadow-cyan-500/20')
 
-        viewer_columns = [
-            {'name': 'timestamp', 'label': 'Timestamp', 'field': 'timestamp', 'sortable': True},
-            {'name': 'open', 'label': 'Open', 'field': 'open'},
-            {'name': 'high', 'label': 'High', 'field': 'high'},
-            {'name': 'low', 'label': 'Low', 'field': 'low'},
-            {'name': 'close', 'label': 'Close', 'field': 'close'},
-            {'name': 'volume', 'label': 'Volume', 'field': 'volume'},
-        ]
-        
-        ui.label('Price Chart').classes('text-lg font-bold mt-4')
-        viewer_chart = ui.echart({
-            'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'cross'}},
-            'xAxis': {'type': 'category', 'data': []},
-            'yAxis': {'scale': True},
-            'series': [{'name': 'Price', 'type': 'candlestick', 'data': []}],
-        }).classes('w-full h-96 border rounded-lg p-2 bg-white mt-2')
+            viewer_columns = [
+                {'name': 'timestamp', 'label': 'Timestamp', 'field': 'timestamp', 'sortable': True},
+                {'name': 'open', 'label': 'Open', 'field': 'open'},
+                {'name': 'high', 'label': 'High', 'field': 'high'},
+                {'name': 'low', 'label': 'Low', 'field': 'low'},
+                {'name': 'close', 'label': 'Close', 'field': 'close'},
+                {'name': 'volume', 'label': 'Volume', 'field': 'volume'},
+            ]
+            
+            ui.label('Price Chart').classes('text-lg font-bold text-slate-300 mt-4 tracking-wide')
+            viewer_chart = ui.echart({
+                'backgroundColor': 'transparent',
+                'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'cross'}},
+                'xAxis': {'type': 'category', 'data': []},
+                'yAxis': {'scale': True, 'splitLine': {'lineStyle': {'color': '#334155'}}}, # slate-700
+                'series': [{'name': 'Price', 'type': 'candlestick', 'data': [], 'itemStyle': {'color': '#10b981', 'color0': '#ef4444', 'borderColor': '#10b981', 'borderColor0': '#ef4444'}}],
+            }).classes('w-full h-96 border border-slate-700 rounded-lg p-2 bg-slate-900 mt-2')
 
-        viewer_table = ui.table(columns=viewer_columns, rows=[], row_key='timestamp').classes('w-full mt-4')
+            viewer_table = ui.table(columns=viewer_columns, rows=[], row_key='timestamp').classes('w-full mt-4 bg-slate-900 text-slate-200 border-none')
 
         def update_viewer_tfs(e):
             val = getattr(e, 'value', e)

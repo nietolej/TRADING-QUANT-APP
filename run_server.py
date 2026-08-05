@@ -102,28 +102,28 @@ def main():
     project_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(project_dir)
 
+    # Directorios de código fuente Python que uvicorn debe vigilar para hot-reload.
+    # Solo estos directorios disparan un reinicio. Archivos de datos (.db),
+    # configuraciones YAML, logs, etc. quedan fuera y NUNCA causan reload.
+    reload_dirs = ["api", "web_gui", "backtest_engine", "strategy_engine",
+                   "data_layer", "ml_engine", "execution_engine", "notifications"]
+
     # Ruta a uvicorn
     uvicorn_path = os.path.join(project_dir, "venv", "Scripts", "uvicorn.exe")
-    if os.path.isfile(uvicorn_path):
-        cmd = [
-            uvicorn_path,
-            "api.main:app",
-            "--reload",
-            "--port", str(PORT),
-            "--host", HOST,
-            "--ws-max-size", "104857600"
-        ]
-    else:
-        cmd = [
-            sys.executable,
-            "-m",
-            "uvicorn",
-            "api.main:app",
-            "--reload",
-            "--port", str(PORT),
-            "--host", HOST,
-            "--ws-max-size", "104857600"
-        ]
+    base_exe = [uvicorn_path] if os.path.isfile(uvicorn_path) else [sys.executable, "-m", "uvicorn"]
+
+    cmd = base_exe + [
+        "api.main:app",
+        "--reload",
+        "--port", str(PORT),
+        "--host", HOST,
+        "--ws-max-size", "104857600",
+    ]
+    # Añadir --reload-dir para cada directorio de código fuente
+    for rd in reload_dirs:
+        rd_path = os.path.join(project_dir, rd)
+        if os.path.isdir(rd_path):
+            cmd.extend(["--reload-dir", rd_path])
 
     # Verificar y liberar el puerto si está en uso (LISTENING)
     print(f"Verificando puerto {PORT}...")

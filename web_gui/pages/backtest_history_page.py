@@ -96,26 +96,26 @@ def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=Non
 
         # Tarjetas de resumen rápido del historial
         with ui.row().classes('w-full gap-4 mb-6'):
-            with ui.card().classes('flex-1 bg-white border border-slate-200 p-4 rounded-xl shadow-sm'):
+            with ui.card().classes('flex-1 bg-slate-900/50 border border-slate-700/50 p-4 rounded-xl shadow-lg'):
                 ui.label('Total de Backtests').classes('text-xs font-medium text-slate-500 uppercase tracking-wider')
-                lbl_total_runs = ui.label('0').classes('text-2xl font-black text-slate-800 mt-1')
+                lbl_total_runs = ui.label('0').classes('text-2xl font-black text-slate-200 mt-1')
 
-            with ui.card().classes('flex-1 bg-white border border-slate-200 p-4 rounded-xl shadow-sm'):
+            with ui.card().classes('flex-1 bg-slate-900/50 border border-slate-700/50 p-4 rounded-xl shadow-lg'):
                 ui.label('Mejor CAGR').classes('text-xs font-medium text-slate-500 uppercase tracking-wider')
                 lbl_best_cagr = ui.label('-- %').classes('text-2xl font-black text-emerald-600 mt-1')
 
-            with ui.card().classes('flex-1 bg-white border border-slate-200 p-4 rounded-xl shadow-sm'):
+            with ui.card().classes('flex-1 bg-slate-900/50 border border-slate-700/50 p-4 rounded-xl shadow-lg'):
                 ui.label('Mejor Profit Factor').classes('text-xs font-medium text-slate-500 uppercase tracking-wider')
                 lbl_best_pf = ui.label('--').classes('text-2xl font-black text-blue-600 mt-1')
 
-            with ui.card().classes('flex-1 bg-white border border-slate-200 p-4 rounded-xl shadow-sm'):
+            with ui.card().classes('flex-1 bg-slate-900/50 border border-slate-700/50 p-4 rounded-xl shadow-lg'):
                 ui.label('Promedio % Ganadoras').classes('text-xs font-medium text-slate-500 uppercase tracking-wider')
                 lbl_avg_wr = ui.label('-- %').classes('text-2xl font-black text-purple-600 mt-1')
 
         # Tabla del Historial
-        with ui.card().classes('w-full bg-white p-4 rounded-2xl shadow-md border border-slate-200 mb-8'):
+        with ui.card().classes('w-full bg-slate-900/50 p-4 rounded-2xl shadow-xl border border-slate-700/50 mb-8'):
             with ui.row().classes('w-full items-center justify-between mb-4'):
-                ui.label('Simulaciones Registradas').classes('text-lg font-bold text-slate-800')
+                ui.label('Simulaciones Registradas').classes('text-lg font-bold text-slate-200')
                 search_input = ui.input(placeholder='Buscar por estrategia o símbolo...').props('dense outlined clearable icon=search').classes('w-72')
 
             history_columns = [
@@ -161,8 +161,8 @@ def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=Non
                     ui.label('Asigna porcentajes de capital a múltiples estrategias del historial para evaluar el rendimiento consolidado.').classes('text-xs text-slate-300')
 
         # Configuración Global del Portafolio
-        with ui.card().classes('w-full p-4 mb-4 rounded-2xl border border-slate-200 shadow-md bg-white'):
-            ui.label('Configuración Global del Portafolio').classes('font-bold text-slate-800 mb-2')
+        with ui.card().classes('w-full p-4 mb-4 rounded-2xl border border-slate-700/50 shadow-xl bg-slate-900/50'):
+            ui.label('Configuración Global del Portafolio').classes('font-bold text-slate-200 mb-2')
             with ui.row().classes('w-full gap-4 items-center'):
                 port_capital_input = ui.number('Capital Total Inicial ($)', value=10000.0, step=500.0, min=10.0).classes('flex-1')
                 port_start_input = ui.input('Fecha Inicio', value='2024-01-01').classes('flex-1')
@@ -222,9 +222,9 @@ def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=Non
                     if 'custom_params' not in item or not item['custom_params']:
                         item['custom_params'] = get_strategy_default_params(item['strategy']).copy()
 
-                    with ui.card().classes('w-full p-4 rounded-xl border border-slate-200 shadow-xs bg-white mb-2'):
+                    with ui.card().classes('w-full p-4 rounded-xl border border-slate-700/50 shadow-xs bg-slate-900/50 mb-2'):
                         if saved_opts:
-                            with ui.row().classes('w-full mb-2 items-center gap-2 bg-slate-50 p-2 rounded-lg border border-slate-100'):
+                            with ui.row().classes('w-full mb-2 items-center gap-2 bg-slate-50 p-2 rounded-lg border border-slate-700/50'):
                                 ui.icon('cloud_download', size='1.2rem').classes('text-blue-600')
                                 saved_sel = ui.select(saved_opts, label='📥 Cargar Parámetros desde Backtest Guardado', value=item.get('saved_run_id')).classes('flex-1')
 
@@ -267,7 +267,7 @@ def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=Non
                                 saved_sel.on_value_change(make_saved_load_handler(i, saved_map))
 
                         with ui.row().classes('w-full gap-3 items-center mb-2'):
-                            ui.label(f"Estrategia #{i+1}").classes('font-bold text-slate-700 w-24')
+                            ui.label(f"Estrategia #{i+1}").classes('font-bold text-slate-300 w-24')
                             strat_sel = ui.select(list(strategies.keys()), label='Estrategia', value=item['strategy']).classes('flex-1')
                             sym_sel = ui.select(available_symbols, label='Símbolo', value=item['symbol']).classes('w-44')
                             tf_sel = ui.select(['1m', '5m', '15m', '1h', '4h', '1d'], label='TF', value=item['timeframe']).classes('w-28')
@@ -283,7 +283,7 @@ def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=Non
                             ui.button(icon='delete', on_click=lambda idx=i: remove_item(idx)).props('flat round color=negative')
 
                         # Expansion panel for Strategy Parameters
-                        with ui.expansion('⚙️ Parámetros de la Estrategia', icon='tune').classes('w-full bg-slate-50 border border-slate-200 rounded-lg p-2'):
+                        with ui.expansion('⚙️ Parámetros de la Estrategia', icon='tune').classes('w-full bg-slate-50 border border-slate-700/50 rounded-lg p-2'):
                             params_row = ui.row().classes('w-full gap-3 flex-wrap items-center')
                             with params_row:
                                 cur_params = item['custom_params']
@@ -407,34 +407,34 @@ def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=Non
 
                     port_results_container.clear()
                     with port_results_container:
-                        ui.label('Resultados del Portafolio Combinado').classes('text-xl font-black text-slate-800 mt-2 mb-3')
+                        ui.label('Resultados del Portafolio Combinado').classes('text-xl font-black text-slate-200 mt-2 mb-3')
                         
                         # 1. Metric Cards
                         with ui.row().classes('w-full gap-4 mb-4'):
-                            with ui.card().classes('flex-1 bg-white p-4 rounded-xl border border-slate-200 shadow-sm'):
+                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
                                 ui.label('CAGR del Portafolio').classes('text-xs text-slate-500 uppercase font-bold')
                                 ui.label(f"{res['cagr']:.2f}%").classes(f"text-2xl font-black {'text-emerald-600' if res['cagr'] >= 0 else 'text-red-600'}")
 
-                            with ui.card().classes('flex-1 bg-white p-4 rounded-xl border border-slate-200 shadow-sm'):
+                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
                                 ui.label('Max Drawdown Combinado').classes('text-xs text-slate-500 uppercase font-bold')
                                 ui.label(f"-{res['max_drawdown_pct']:.2f}%").classes('text-2xl font-black text-red-600')
 
-                            with ui.card().classes('flex-1 bg-white p-4 rounded-xl border border-slate-200 shadow-sm'):
+                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
                                 ui.label('Profit Factor (PF)').classes('text-xs text-slate-500 uppercase font-bold')
-                                ui.label(f"{res['profit_factor']:.2f}").classes(f"text-2xl font-black {'text-purple-600' if res['profit_factor'] >= 1 else 'text-slate-700'}")
+                                ui.label(f"{res['profit_factor']:.2f}").classes(f"text-2xl font-black {'text-purple-600' if res['profit_factor'] >= 1 else 'text-slate-300'}")
 
-                            with ui.card().classes('flex-1 bg-white p-4 rounded-xl border border-slate-200 shadow-sm'):
+                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
                                 ui.label('Trades Totales').classes('text-xs text-slate-500 uppercase font-bold')
                                 ui.label(f"{res['total_trades']}").classes('text-2xl font-black text-blue-600')
 
-                            with ui.card().classes('flex-1 bg-white p-4 rounded-xl border border-slate-200 shadow-sm'):
+                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
                                 ui.label('Ganadoras / Perdedoras').classes('text-xs text-slate-500 uppercase font-bold')
                                 with ui.row().classes('items-center gap-2 mt-1'):
                                     ui.label(f"🟢 {res['winning_trades']}").classes('text-lg font-bold text-emerald-600')
                                     ui.label(f"/ 🔴 {res['losing_trades']}").classes('text-lg font-bold text-red-600')
                                     ui.label(f"({res['win_rate']:.1f}%)").classes('text-xs font-semibold text-slate-500')
 
-                            with ui.card().classes('flex-1 bg-white p-4 rounded-xl border border-slate-200 shadow-sm'):
+                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
                                 ui.label('Capital Final Portafolio').classes('text-xs text-slate-500 uppercase font-bold')
                                 ui.label(f"${res['final_equity']:,.2f}").classes('text-2xl font-black text-slate-900')
 
@@ -463,8 +463,8 @@ def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=Non
                             'areaStyle': {'opacity': 0.15, 'color': '#059669'}
                         })
 
-                        with ui.card().classes('w-full bg-white p-4 rounded-xl border border-slate-200 shadow-sm mt-4'):
-                            ui.label('📈 Curvas de Capital Individuales y Total Combinado').classes('text-lg font-bold text-slate-800 mb-2')
+                        with ui.card().classes('w-full bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg mt-4'):
+                            ui.label('📈 Curvas de Capital Individuales y Total Combinado').classes('text-lg font-bold text-slate-200 mb-2')
                             port_chart_options = {
                                 'title': {'text': 'Comparativa de Equidad ($) por Estrategia vs Portafolio Total', 'left': 'center', 'textStyle': {'fontSize': 14}},
                                 'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'cross'}},
@@ -498,8 +498,8 @@ def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=Non
                             'areaStyle': {'opacity': 0.15, 'color': '#dc2626'}
                         })
 
-                        with ui.card().classes('w-full bg-white p-4 rounded-xl border border-slate-200 shadow-sm mt-4'):
-                            ui.label('📉 Caídas (Drawdown %) Individuales y Total Combinado').classes('text-lg font-bold text-slate-800 mb-2')
+                        with ui.card().classes('w-full bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg mt-4'):
+                            ui.label('📉 Caídas (Drawdown %) Individuales y Total Combinado').classes('text-lg font-bold text-slate-200 mb-2')
                             dd_chart_options = {
                                 'title': {'text': 'Drawdown Relativo (%) por Estrategia y Combinado', 'left': 'center', 'textStyle': {'fontSize': 14}},
                                 'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'cross'}},
@@ -511,7 +511,7 @@ def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=Non
                             ui.echart(dd_chart_options).classes('w-full h-72')
 
                         # 4. Tabla Desglosada por Estrategia
-                        ui.label('Desglose Individual de Rendimiento por Estrategia').classes('text-lg font-bold text-slate-800 mt-4')
+                        ui.label('Desglose Individual de Rendimiento por Estrategia').classes('text-lg font-bold text-slate-200 mt-4')
                         breakdown_cols = [
                             {'name': 'name', 'label': 'Estrategia / Par', 'field': 'name'},
                             {'name': 'weight_pct', 'label': 'Peso (%)', 'field': 'weight_pct'},
@@ -534,11 +534,11 @@ def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=Non
                                 'max_dd': f"{bd['max_dd']:.2f}%",
                                 'trades_count': bd['trades_count']
                             })
-                        ui.table(columns=breakdown_cols, rows=bd_rows).classes('w-full bg-white shadow-sm rounded-xl')
+                        ui.table(columns=breakdown_cols, rows=bd_rows).classes('w-full bg-slate-900/50 shadow-lg rounded-xl')
 
                         # 5. Tabla Sucesión Cronológica de Operaciones
                         with ui.row().classes('w-full items-center justify-between mt-6 mb-2'):
-                            ui.label('📜 Sucesión Cronológica de Operaciones (Portafolio Combinado)').classes('text-lg font-bold text-slate-800')
+                            ui.label('📜 Sucesión Cronológica de Operaciones (Portafolio Combinado)').classes('text-lg font-bold text-slate-200')
                             trade_search_input = ui.input(placeholder='Buscar operación o estrategia...').props('dense outlined clearable icon=search').classes('w-72')
 
                         trades_columns = [
@@ -558,7 +558,7 @@ def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=Non
                             rows=res.get('chronological_trades', []),
                             row_key='trade_id',
                             pagination={'rowsPerPage': 15}
-                        ).classes('w-full bg-white shadow-sm rounded-xl mb-6')
+                        ).classes('w-full bg-slate-900/50 shadow-lg rounded-xl mb-6')
 
                         port_trades_table.bind_filter(trade_search_input, 'value')
 

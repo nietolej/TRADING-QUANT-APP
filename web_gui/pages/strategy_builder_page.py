@@ -112,7 +112,7 @@ def render_strategy_builder():
                     rule_type = ui.select(['technical_indicator', 'onchain_threshold'], label='Tipo de Regla', value='technical_indicator').classes('w-full')
                     
                     # Technical indicator fields container
-                    tech_container = ui.column().classes('w-full bg-slate-50 p-4 rounded-xl border border-slate-200 gap-2')
+                    tech_container = ui.column().classes('w-full bg-slate-50 p-4 rounded-xl border border-slate-700/50 gap-2')
                     with tech_container:
                         ui.label('Parámetros del Indicador Técnico').classes('text-sm font-bold text-slate-600 mb-2')
                         with ui.row().classes('w-full gap-4'):
@@ -126,7 +126,7 @@ def render_strategy_builder():
                             p2_input = ui.select(['50'], label='Período / Valor (P 2)', value='50', new_value_mode='add-unique').classes('flex-1')
                         
                     # On-chain fields container
-                    onchain_container = ui.column().classes('w-full bg-slate-50 p-4 rounded-xl border border-slate-200 gap-2')
+                    onchain_container = ui.column().classes('w-full bg-slate-50 p-4 rounded-xl border border-slate-700/50 gap-2')
                     with onchain_container:
                         ui.label('Métricas On-Chain').classes('text-sm font-bold text-slate-600 mb-2')
                         metric_input = ui.input('Nombre de Métrica', value='active_addresses').classes('w-full')
@@ -203,9 +203,9 @@ def render_strategy_builder():
             rule_dialog.open()
             
         # Contenedor Principal (Sombra y redondeado)
-        with ui.card().classes('w-full bg-white rounded-2xl shadow-lg p-2'):
+        with ui.card().classes('w-full bg-slate-900/50 rounded-2xl shadow-lg p-2'):
             # 2. Pestañas estilo Wizard con Iconos
-            with ui.tabs().classes('w-full text-slate-700 font-semibold mb-4 bg-slate-100 rounded-xl p-1') as tabs:
+            with ui.tabs().classes('w-full text-slate-300 font-semibold mb-4 bg-slate-100 rounded-xl p-1') as tabs:
                 tab_general = ui.tab('General', icon='info')
                 tab_params = ui.tab('Parameters', icon='tune')
                 tab_rules = ui.tab('Rules', icon='rule')
@@ -216,8 +216,8 @@ def render_strategy_builder():
                 # PANEL GENERAL
                 with ui.tab_panel(tab_general):
                     with ui.column().classes('w-full max-w-3xl mx-auto gap-6 q-pa-md'):
-                        with ui.card().classes('w-full shadow-sm border border-slate-100 rounded-xl p-6'):
-                            ui.label('Información Básica').classes('text-lg font-bold text-slate-800 mb-2')
+                        with ui.card().classes('w-full shadow-lg border border-slate-700/50 rounded-xl p-6'):
+                            ui.label('Información Básica').classes('text-lg font-bold text-slate-200 mb-2')
                             ui.separator().classes('mb-4')
                             strat_name_input = ui.input('Nombre de la Estrategia', value=state['strategy_name'], autocomplete=strategy_names).bind_value(state, 'strategy_name').classes('w-full text-lg')
                             ui.input('Descripción Breve', value=state['description']).bind_value(state, 'description').classes('w-full mt-4')
@@ -225,7 +225,7 @@ def render_strategy_builder():
                 # PANEL PARAMETERS
                 with ui.tab_panel(tab_params):
                     with ui.column().classes('w-full max-w-4xl mx-auto gap-4 q-pa-md'):
-                        ui.label("Parámetros Dinámicos").classes('text-xl font-bold text-slate-800')
+                        ui.label("Parámetros Dinámicos").classes('text-xl font-bold text-slate-200')
                         ui.label("Define parámetros ajustables (ej. variables de optimización) que podrás usar en las reglas.").classes('text-sm text-slate-500 mb-2')
                         
                         params_list_container = ui.column().classes('w-full gap-3')
@@ -234,7 +234,7 @@ def render_strategy_builder():
                             params_list_container.clear()
                             with params_list_container:
                                 for idx, p in enumerate(state['parameters']):
-                                    with ui.card().classes('w-full flex-row items-center justify-between shadow-sm border border-slate-200 rounded-lg p-2 bg-slate-50'):
+                                    with ui.card().classes('w-full flex-row items-center justify-between shadow-lg border border-slate-700/50 rounded-lg p-2 bg-slate-50'):
                                         with ui.row().classes('items-center gap-4 flex-1'):
                                             def mk_name_handler(item=p):
                                                 def _on_chg(e): item['name'] = e.value or ''
@@ -261,13 +261,13 @@ def render_strategy_builder():
                             render_params()
                             
                         with ui.row().classes('w-full mt-4'):
-                            ui.button('Añadir Nuevo Parámetro', on_click=add_param, icon='add').classes('bg-slate-800 text-white rounded-full px-6 py-2 shadow-md hover:bg-slate-700 transition-all')
+                            ui.button('Añadir Nuevo Parámetro', on_click=add_param, icon='add').classes('bg-slate-800 text-white rounded-full px-6 py-2 shadow-xl hover:bg-slate-700 transition-all')
                         
                 # PANEL RISK MANAGEMENT
                 with ui.tab_panel(tab_risk):
                     with ui.column().classes('w-full max-w-3xl mx-auto gap-6 q-pa-md'):
-                        with ui.card().classes('w-full shadow-sm border border-slate-100 rounded-xl p-6'):
-                            ui.label("Gestión de Riesgo (Risk Management)").classes('text-lg font-bold text-slate-800 mb-2')
+                        with ui.card().classes('w-full shadow-lg border border-slate-700/50 rounded-xl p-6'):
+                            ui.label("Gestión de Riesgo (Risk Management)").classes('text-lg font-bold text-slate-200 mb-2')
                             ui.separator().classes('mb-4')
                             
                             with ui.row().classes('w-full gap-6 items-center'):
@@ -297,10 +297,10 @@ def render_strategy_builder():
                 with ui.tab_panel(tab_rules):
                     with ui.column().classes('w-full q-pa-md max-w-5xl mx-auto gap-6'):
                         # Dirección del Trade
-                        with ui.card().classes('w-full bg-slate-50 border border-slate-200 rounded-xl p-4 shadow-sm'):
+                        with ui.card().classes('w-full bg-slate-50 border border-slate-700/50 rounded-xl p-4 shadow-lg'):
                             with ui.row().classes('w-full items-center gap-4'):
                                 ui.icon('swap_vert', size='1.5rem').classes('text-slate-600')
-                                ui.label("Dirección Principal del Trade:").classes('font-bold text-slate-700')
+                                ui.label("Dirección Principal del Trade:").classes('font-bold text-slate-300')
                                 ui.select(['Long', 'Short'], value=state['direction']).bind_value(state, 'direction').classes('w-48')
 
                         columns = [
@@ -313,9 +313,9 @@ def render_strategy_builder():
                         with ui.column().classes('w-full'):
                             with ui.row().classes('w-full items-center justify-between mb-2'):
                                 ui.label("Condiciones de Entrada (AND)").classes('text-lg font-bold text-green-700')
-                                ui.button('Añadir Entrada', on_click=lambda: add_rule(state['entry_rules'], entry_table), icon='add').classes('bg-green-600 text-white rounded-lg px-4 shadow-sm hover:bg-green-500')
+                                ui.button('Añadir Entrada', on_click=lambda: add_rule(state['entry_rules'], entry_table), icon='add').classes('bg-green-600 text-white rounded-lg px-4 shadow-lg hover:bg-green-500')
                             
-                            entry_table = ui.table(columns=columns, rows=state['entry_rules'], row_key='name').classes('w-full rounded-lg shadow-sm border border-slate-200 bg-white')
+                            entry_table = ui.table(columns=columns, rows=state['entry_rules'], row_key='name').classes('w-full rounded-lg shadow-lg border border-slate-700/50 bg-slate-900/50')
                             entry_table.add_slot('body-cell-actions', '''
                                 <q-td :props="props">
                                     <q-btn flat dense round icon="delete" color="negative" @click="() => {
@@ -332,9 +332,9 @@ def render_strategy_builder():
                         with ui.column().classes('w-full'):
                             with ui.row().classes('w-full items-center justify-between mb-2'):
                                 ui.label("Condiciones de Salida (OR)").classes('text-lg font-bold text-red-700')
-                                ui.button('Añadir Salida', on_click=lambda: add_rule(state['exit_rules'], exit_table), icon='add').classes('bg-red-600 text-white rounded-lg px-4 shadow-sm hover:bg-red-500')
+                                ui.button('Añadir Salida', on_click=lambda: add_rule(state['exit_rules'], exit_table), icon='add').classes('bg-red-600 text-white rounded-lg px-4 shadow-lg hover:bg-red-500')
                             
-                            exit_table = ui.table(columns=columns, rows=state['exit_rules'], row_key='name').classes('w-full rounded-lg shadow-sm border border-slate-200 bg-white')
+                            exit_table = ui.table(columns=columns, rows=state['exit_rules'], row_key='name').classes('w-full rounded-lg shadow-lg border border-slate-700/50 bg-slate-900/50')
                             exit_table.add_slot('body-cell-actions', '''
                                 <q-td :props="props">
                                     <q-btn flat dense round icon="delete" color="negative" @click="() => {
@@ -362,7 +362,7 @@ def render_strategy_builder():
                         {'name': 'description', 'label': 'Descripción', 'field': 'description', 'sortable': True, 'align': 'left'},
                         {'name': 'actions', 'label': 'Acciones', 'field': 'actions', 'align': 'center'},
                     ]
-                    catalog_table = ui.table(columns=catalog_columns, rows=[], row_key='name').classes('w-full border border-slate-200 rounded-lg shadow-sm')
+                    catalog_table = ui.table(columns=catalog_columns, rows=[], row_key='name').classes('w-full border border-slate-700/50 rounded-lg shadow-lg')
                     
                     catalog_table.add_slot('body-cell-actions', '''
                         <q-td :props="props">

@@ -22,9 +22,9 @@ from web_gui.components.tradingview_chart import build_tradingview_plotly_figure
 def render_strategy_analyzer(on_back_to_builder=None):
     with ui.column().classes('w-full q-pa-md'):
         with ui.row().classes('w-full justify-between items-center mb-4'):
-            ui.label('Análisis de Estrategia y Backtesting').classes('text-2xl font-bold text-slate-800')
+            ui.label('Análisis de Estrategia y Backtesting').classes('text-2xl font-bold text-slate-200')
             if on_back_to_builder:
-                ui.button('Volver al Strategy Builder', on_click=on_back_to_builder, icon='arrow_back').classes('bg-slate-700 text-white hover:bg-slate-600 shadow-md rounded-lg')
+                ui.button('Volver al Strategy Builder', on_click=on_back_to_builder, icon='arrow_back').classes('bg-slate-700 text-white hover:bg-slate-600 shadow-xl rounded-lg')
 
         with ui.dialog() as catalog_dialog, ui.card().classes('w-[800px] max-w-4xl q-pa-md'):
             ui.label('Catálogo de Estrategias').classes('text-xl font-bold q-mb-md')
@@ -524,12 +524,24 @@ def render_strategy_analyzer(on_back_to_builder=None):
                                 lbl_win_rate.classes(remove='text-green-600 text-red-600',
                                                      add='text-green-600' if win_rate > 50 else 'text-red-600')
     
+                                import numpy as np
                                 roll_max = equity_curve['equity'].cummax()
-                                drawdown = (equity_curve['equity'] - roll_max) / roll_max * 100
-                                dates_eq  = equity_curve.index.strftime('%Y-%m-%d').tolist()
-                                eq_vals   = equity_curve['equity']
+                                drawdown = ((equity_curve['equity'] - roll_max) / roll_max * 100).replace([np.inf, -np.inf], np.nan).fillna(0)
+                                
+                                # Downsample to prevent browser freeze and WebSocket disconnects on large datasets
+                                MAX_POINTS = 1000
+                                if len(equity_curve) > MAX_POINTS:
+                                    step = len(equity_curve) // MAX_POINTS
+                                    dates_eq = equity_curve.index[::step].strftime('%Y-%m-%d %H:%M').tolist()
+                                    eq_vals = equity_curve['equity'].iloc[::step].replace([np.inf, -np.inf], np.nan).fillna(0)
+                                    drawdown_sampled = drawdown.iloc[::step]
+                                else:
+                                    dates_eq = equity_curve.index.strftime('%Y-%m-%d %H:%M').tolist()
+                                    eq_vals = equity_curve['equity'].replace([np.inf, -np.inf], np.nan).fillna(0)
+                                    drawdown_sampled = drawdown
+
                                 close_aln = df['close'].reindex(eq_vals.index).ffill()
-                                eq_base   = eq_vals / close_aln
+                                eq_base   = (eq_vals / close_aln).replace([np.inf, -np.inf], np.nan).fillna(0)
     
                                 state['equity_dates']      = dates_eq
                                 state['equity_quote_data'] = eq_vals.round(6).tolist()
@@ -546,13 +558,13 @@ def render_strategy_analyzer(on_back_to_builder=None):
                                 chart.update()
     
                                 drawdown_chart.options['xAxis']['data'] = dates_eq
-                                drawdown_chart.options['series'][0]['data'] = drawdown.round(4).tolist()
+                                drawdown_chart.options['series'][0]['data'] = drawdown_sampled.round(4).tolist()
                                 drawdown_chart.update()
     
                                 price_chart_df = df
                                 state['last_df'] = df
                                 state['last_trades_df'] = trades_df
-                                render_tradingview_plotly()
+                                await render_tradingview_plotly()
 
     
                             except Exception as _me:
@@ -565,15 +577,21 @@ def render_strategy_analyzer(on_back_to_builder=None):
                             lbl_total_trades.set_text("0"); lbl_win_trades.set_text("0")
                             lbl_lose_trades.set_text("0"); lbl_win_rate.set_text("0.00%")
                             lbl_max_cons_losers.set_text("0")
-                            chart.options['xAxis']['data'] = df.index.strftime('%Y-%m-%d').tolist()
-                            chart.options['series'][0]['data'] = [round(initial_cap_quote, 6)] * len(df)
+                            
+                            # Downsample empty chart
+                            MAX_POINTS = 1000
+                            df_sampled = df.iloc[::max(1, len(df)//MAX_POINTS)] if len(df) > MAX_POINTS else df
+                            dates_empty = df_sampled.index.strftime('%Y-%m-%d %H:%M').tolist()
+                            
+                            chart.options['xAxis']['data'] = dates_empty
+                            chart.options['series'][0]['data'] = [round(initial_cap_quote, 6)] * len(df_sampled)
                             chart.update()
-                            drawdown_chart.options['xAxis']['data'] = df.index.strftime('%Y-%m-%d').tolist()
-                            drawdown_chart.options['series'][0]['data'] = [0] * len(df)
+                            drawdown_chart.options['xAxis']['data'] = dates_empty
+                            drawdown_chart.options['series'][0]['data'] = [0] * len(df_sampled)
                             drawdown_chart.update()
                             state['last_df'] = df
                             state['last_trades_df'] = None
-                            render_tradingview_plotly()
+                            await render_tradingview_plotly()
 
                             ui.notify("El backtest no generó curva de equity (sin señales o error).", type='warning')
     
@@ -631,7 +649,11 @@ def render_strategy_analyzer(on_back_to_builder=None):
                         balance_base  = initial_cap_base
     
                         if trades_df is not None and not trades_df.empty:
-                            for _, trow in trades_df.iterrows():
+                            import asyncio
+                            trades_df_clean = trades_df.replace([np.inf, -np.inf], np.nan).fillna(0)
+                            for idx_counter, (_, trow) in enumerate(trades_df_clean.iterrows()):
+                                if idx_counter % 100 == 0:
+                                    await asyncio.sleep(0)
                                 pnl_quote   = float(trow.get('pnl', 0) or 0)
                                 entry_price = float(trow.get('entry_price', 1) or 1)
                                 exit_price  = float(trow.get('exit_price',  1) or 1)
@@ -681,7 +703,13 @@ def render_strategy_analyzer(on_back_to_builder=None):
                                     'exit_reason':  str(trow.get('exit_reason', ''))
                                 })
     
-                        trades_table.rows = trades_rows
+                        # Limit the trades table to the last 2000 trades to prevent browser freeze and disconnects
+                        if len(trades_rows) > 2000:
+                            trades_table.rows = trades_rows[-2000:]
+                            ui.notify(f"Mostrando los últimos 2000 trades (de {len(trades_rows)}).", type='info')
+                        else:
+                            trades_table.rows = trades_rows
+                            
                         trades_table.update()
     
                         # ── Summary labels ──
@@ -699,7 +727,7 @@ def render_strategy_analyzer(on_back_to_builder=None):
                         lbl_pnl_base.set_text(fmt_pnl(cum_b))
     
                         def _upd_color(lbl, positive):
-                            lbl.classes(remove='text-black text-green-600 text-red-600',
+                            lbl.classes(remove='text-white text-green-600 text-red-600',
                                         add='text-green-600' if positive else 'text-red-600')
     
                         _upd_color(lbl_bal_quote, balance_quote >= initial_cap_quote)
@@ -1242,22 +1270,22 @@ def render_strategy_analyzer(on_back_to_builder=None):
                 lbl_max_cons_losers = ui.label('--').classes('text-2xl font-bold text-orange-600')
             with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
                 lbl_hdr_init_q = ui.label('Capital Inicial (CITA)').classes('text-sm text-gray-500')
-                lbl_init_quote = ui.label('--').classes('text-2xl font-bold text-black')
+                lbl_init_quote = ui.label('--').classes('text-2xl font-bold text-white')
             with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
                 lbl_hdr_init_b = ui.label('Capital Inicial (BASE)').classes('text-sm text-gray-500')
-                lbl_init_base = ui.label('--').classes('text-2xl font-bold text-black')
+                lbl_init_base = ui.label('--').classes('text-2xl font-bold text-white')
             with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
                 lbl_hdr_bal_q = ui.label('Saldo final (CITA)').classes('text-sm text-gray-500')
-                lbl_bal_quote = ui.label('--').classes('text-2xl font-bold text-black')
+                lbl_bal_quote = ui.label('--').classes('text-2xl font-bold text-white')
             with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
                 lbl_hdr_bal_b = ui.label('Saldo final (BASE)').classes('text-sm text-gray-500')
-                lbl_bal_base = ui.label('--').classes('text-2xl font-bold text-black')
+                lbl_bal_base = ui.label('--').classes('text-2xl font-bold text-white')
             with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
                 lbl_hdr_pnl_q = ui.label('Total de pérdidas y ganancias (CITA)').classes('text-sm text-gray-500')
-                lbl_pnl_quote = ui.label('--').classes('text-2xl font-bold text-black')
+                lbl_pnl_quote = ui.label('--').classes('text-2xl font-bold text-white')
             with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
                 lbl_hdr_pnl_b = ui.label('Total de pérdidas y ganancias (BASE)').classes('text-sm text-gray-500')
-                lbl_pnl_base = ui.label('--').classes('text-2xl font-bold text-black')
+                lbl_pnl_base = ui.label('--').classes('text-2xl font-bold text-white')
 
         # ════════════════════════════════════════════════════════
         # PANEL DE CONTROL DE GRÁFICO Y INDICADORES TRADINGVIEW / NT8
@@ -1342,19 +1370,20 @@ def render_strategy_analyzer(on_back_to_builder=None):
             # Contenedor principal del gráfico Plotly
             plotly_chart_container = ui.column().classes('w-full overflow-hidden rounded-xl border border-slate-700/60 bg-slate-950')
 
-        def render_tradingview_plotly(zoom_dates=None):
+        async def render_tradingview_plotly(zoom_dates=None):
             plotly_chart_container.clear()
             df = state.get('last_df', pd.DataFrame())
             trades_df = state.get('last_trades_df')
             symbol = state.get('symbol', 'BTC/USDT')
             timeframe = state.get('timeframe', '1d')
 
-            fig = build_tradingview_plotly_figure(
-                df=df,
-                trades_df=trades_df,
-                config=chart_config,
-                symbol=symbol,
-                timeframe=timeframe
+            fig = await run.io_bound(
+                build_tradingview_plotly_figure,
+                df,
+                trades_df,
+                chart_config,
+                symbol,
+                timeframe
             )
 
             if zoom_dates and len(zoom_dates) == 2:
@@ -1365,8 +1394,9 @@ def render_strategy_analyzer(on_back_to_builder=None):
                 # y permitir estirar el gráfico
                 ui.plotly(fig).props('config="{scrollZoom: true, responsive: true, displayModeBar: true}"').classes('w-full h-[780px]')
 
-        # Renderizado inicial
-        render_tradingview_plotly()
+        # Renderizado inicial no bloqueante
+        import asyncio
+        ui.timer(0.1, lambda: asyncio.create_task(render_tradingview_plotly()), once=True)
 
 
         with ui.row().classes('w-full items-center justify-between mt-6'):
@@ -1378,7 +1408,7 @@ def render_strategy_analyzer(on_back_to_builder=None):
             'xAxis': {'type': 'category', 'data': []},
             'yAxis': {'type': 'value', 'scale': True},
             'series': [{'name': 'Equity', 'type': 'line', 'data': []}],
-        }).classes('w-full h-96 border rounded-lg p-2 bg-white mt-2')
+        }).classes('w-full h-96 border rounded-lg p-2 bg-slate-900/50 mt-2')
 
         def _on_equity_toggle_change(e):
             if not state.get('equity_dates'): return
@@ -1411,25 +1441,25 @@ def render_strategy_analyzer(on_back_to_builder=None):
                 'lineStyle': {'color': 'rgb(239, 68, 68)'},
                 'data': []
             }],
-        }).classes('w-full h-64 border rounded-lg p-2 bg-white mt-2')
+        }).classes('w-full h-64 border rounded-lg p-2 bg-slate-900/50 mt-2')
 
         ui.label('Ejecuciones (Operaciones)').classes('text-lg font-bold mt-6 mb-2')
         trades_columns = []
-        with ui.card().classes('w-full overflow-x-auto p-2 bg-white rounded-xl shadow-sm border border-slate-200 mt-2'):
+        with ui.card().classes('w-full overflow-x-auto p-2 bg-slate-900/50 rounded-xl shadow-lg border border-slate-700/50 mt-2'):
             trades_table = ui.table(columns=trades_columns, rows=[], row_key='entry_time').classes('w-full min-w-[1100px]')
         
         trades_table.add_slot('body-cell-result', '''
             <q-td :props="props">
                 <q-badge :color="props.value === 'W' ? 'positive' : 'negative'"
                          :label="props.value === 'W' ? '✓ WIN' : '✗ LOSS'"
-                         class="px-2 py-1 text-xs font-bold text-white shadow-sm" />
+                         class="px-2 py-1 text-xs font-bold text-white shadow-lg" />
             </q-td>
         ''')
         trades_table.add_slot('body-cell-side', '''
             <q-td :props="props">
                 <q-badge :color="props.value === 'LONG' ? 'blue-8' : 'purple-8'"
                          :label="props.value"
-                         class="px-2 py-1 text-xs font-bold text-white shadow-sm" />
+                         class="px-2 py-1 text-xs font-bold text-white shadow-lg" />
             </q-td>
         ''')
         trades_table.add_slot('body-cell-pnl_pct', '''
@@ -1443,7 +1473,7 @@ def render_strategy_analyzer(on_back_to_builder=None):
             <q-td :props="props">
                 <q-badge
                     :color="props.value === 'TP' ? 'positive' : props.value === 'SL' ? 'negative' : 'primary'"
-                    class="px-2.5 py-1 text-xs font-bold text-white shadow-sm"
+                    class="px-2.5 py-1 text-xs font-bold text-white shadow-lg"
                 >
                     {{ props.value === 'TP' ? 'TP' : props.value === 'SL' ? 'SL' : props.value === 'Signal' || props.value === 'Señal' ? 'Señal' : props.value }}
                 </q-badge>
@@ -1709,8 +1739,8 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                 ui.button(icon='close', on_click=portfolio_dialog.close).props('flat round text-color=white')
 
             # Global inputs for Portfolio
-            with ui.card().classes('w-full p-4 mb-4 rounded-xl border border-slate-200 shadow-sm'):
-                ui.label('Configuración Global del Portafolio').classes('font-bold text-slate-800 mb-2')
+            with ui.card().classes('w-full p-4 mb-4 rounded-xl border border-slate-700/50 shadow-lg'):
+                ui.label('Configuración Global del Portafolio').classes('font-bold text-slate-200 mb-2')
                 with ui.row().classes('w-full gap-4 items-center'):
                     port_capital_input = ui.number('Capital Total Inicial ($)', value=10000.0, step=500.0, min=10.0).classes('flex-1')
                     port_start_input = ui.input('Fecha Inicio', value='2024-01-01').classes('flex-1')
@@ -1767,9 +1797,9 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                         if 'custom_params' not in item or not item['custom_params']:
                             item['custom_params'] = get_strategy_default_params(item['strategy']).copy()
 
-                        with ui.card().classes('w-full p-4 rounded-xl border border-slate-200 shadow-xs bg-white mb-2'):
+                        with ui.card().classes('w-full p-4 rounded-xl border border-slate-700/50 shadow-xs bg-slate-900/50 mb-2'):
                             if saved_opts:
-                                with ui.row().classes('w-full mb-2 items-center gap-2 bg-slate-50 p-2 rounded-lg border border-slate-100'):
+                                with ui.row().classes('w-full mb-2 items-center gap-2 bg-slate-50 p-2 rounded-lg border border-slate-700/50'):
                                     ui.icon('cloud_download', size='1.2rem').classes('text-blue-600')
                                     saved_sel = ui.select(saved_opts, label='📥 Cargar Parámetros desde Backtest Guardado', value=item.get('saved_run_id')).classes('flex-1')
 
@@ -1800,7 +1830,7 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                                     saved_sel.on_value_change(make_saved_load_handler(i, saved_map))
 
                             with ui.row().classes('w-full gap-3 items-center mb-2'):
-                                ui.label(f"Estrategia #{i+1}").classes('font-bold text-slate-700 w-24')
+                                ui.label(f"Estrategia #{i+1}").classes('font-bold text-slate-300 w-24')
                                 strat_sel = ui.select(list(strategies.keys()), label='Estrategia', value=item['strategy']).classes('flex-1')
                                 sym_sel = ui.select(available_symbols, label='Símbolo', value=item['symbol']).classes('w-44')
                                 tf_sel = ui.select(['1m', '5m', '15m', '1h', '4h', '1d'], label='TF', value=item['timeframe']).classes('w-28')
@@ -1816,7 +1846,7 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                                 ui.button(icon='delete', on_click=lambda idx=i: remove_item(idx)).props('flat round color=negative')
 
                             # Expansion panel for Strategy Parameters
-                            with ui.expansion('⚙️ Parámetros de la Estrategia', icon='tune').classes('w-full bg-slate-50 border border-slate-200 rounded-lg p-2'):
+                            with ui.expansion('⚙️ Parámetros de la Estrategia', icon='tune').classes('w-full bg-slate-50 border border-slate-700/50 rounded-lg p-2'):
                                 params_row = ui.row().classes('w-full gap-3 flex-wrap items-center')
                                 with params_row:
                                     cur_params = item['custom_params']
@@ -1935,30 +1965,30 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                         with port_results_container:
                             # 1. Summary Cards
                             with ui.row().classes('w-full gap-4 flex-wrap'):
-                                with ui.card().classes('flex-1 bg-white p-4 rounded-xl border border-slate-200 shadow-sm'):
+                                with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
                                     ui.label('CAGR del Portafolio').classes('text-xs text-slate-500 uppercase font-bold')
                                     ui.label(f"{res['cagr']:.2f}%").classes('text-2xl font-black text-emerald-600')
 
-                                with ui.card().classes('flex-1 bg-white p-4 rounded-xl border border-slate-200 shadow-sm'):
+                                with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
                                     ui.label('Max Drawdown Combinado').classes('text-xs text-slate-500 uppercase font-bold')
                                     ui.label(f"{res['max_drawdown_pct']:.2f}%").classes('text-2xl font-black text-red-600')
 
-                                with ui.card().classes('flex-1 bg-white p-4 rounded-xl border border-slate-200 shadow-sm'):
+                                with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
                                     ui.label('Profit Factor (PF)').classes('text-xs text-slate-500 uppercase font-bold')
                                     ui.label(f"{res['profit_factor']:.2f}").classes('text-2xl font-black text-purple-600')
 
-                                with ui.card().classes('flex-1 bg-white p-4 rounded-xl border border-slate-200 shadow-sm'):
+                                with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
                                     ui.label('Trades Totales').classes('text-xs text-slate-500 uppercase font-bold')
                                     ui.label(f"{res['total_trades']}").classes('text-2xl font-black text-blue-600')
 
-                                with ui.card().classes('flex-1 bg-white p-4 rounded-xl border border-slate-200 shadow-sm'):
+                                with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
                                     ui.label('Ganadoras / Perdedoras').classes('text-xs text-slate-500 uppercase font-bold')
                                     with ui.row().classes('items-center gap-2 mt-1'):
                                         ui.label(f"🟢 {res['winning_trades']}").classes('text-lg font-bold text-emerald-600')
                                         ui.label(f"/ 🔴 {res['losing_trades']}").classes('text-lg font-bold text-red-600')
                                         ui.label(f"({res['win_rate']:.1f}%)").classes('text-xs font-semibold text-slate-500')
 
-                                with ui.card().classes('flex-1 bg-white p-4 rounded-xl border border-slate-200 shadow-sm'):
+                                with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
                                     ui.label('Capital Final Portafolio').classes('text-xs text-slate-500 uppercase font-bold')
                                     ui.label(f"${res['final_equity']:,.2f}").classes('text-2xl font-black text-slate-900')
 
@@ -1989,8 +2019,8 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                                 'areaStyle': {'opacity': 0.15, 'color': '#059669'}
                             })
 
-                            with ui.card().classes('w-full bg-white p-4 rounded-xl border border-slate-200 shadow-sm mt-4'):
-                                ui.label('📈 Curvas de Capital Individuales y Total Combinado').classes('text-lg font-bold text-slate-800 mb-2')
+                            with ui.card().classes('w-full bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg mt-4'):
+                                ui.label('📈 Curvas de Capital Individuales y Total Combinado').classes('text-lg font-bold text-slate-200 mb-2')
                                 port_chart_options = {
                                     'title': {'text': 'Comparativa de Equidad ($) por Estrategia vs Portafolio Total', 'left': 'center', 'textStyle': {'fontSize': 14}},
                                     'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'cross'}},
@@ -2026,8 +2056,8 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                                 'areaStyle': {'opacity': 0.15, 'color': '#dc2626'}
                             })
 
-                            with ui.card().classes('w-full bg-white p-4 rounded-xl border border-slate-200 shadow-sm mt-4'):
-                                ui.label('📉 Caídas (Drawdown %) Individuales y Total Combinado').classes('text-lg font-bold text-slate-800 mb-2')
+                            with ui.card().classes('w-full bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg mt-4'):
+                                ui.label('📉 Caídas (Drawdown %) Individuales y Total Combinado').classes('text-lg font-bold text-slate-200 mb-2')
                                 dd_chart_options = {
                                     'title': {'text': 'Drawdown Relativo (%) por Estrategia y Combinado', 'left': 'center', 'textStyle': {'fontSize': 14}},
                                     'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'cross'}},
@@ -2039,7 +2069,7 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                                 ui.echart(dd_chart_options).classes('w-full h-72')
 
                             # 4. Tabla Desglosada por Estrategia
-                            ui.label('Desglose Individual de Rendimiento por Estrategia').classes('text-lg font-bold text-slate-800 mt-4')
+                            ui.label('Desglose Individual de Rendimiento por Estrategia').classes('text-lg font-bold text-slate-200 mt-4')
                             breakdown_cols = [
                                 {'name': 'name', 'label': 'Estrategia / Par', 'field': 'name'},
                                 {'name': 'weight_pct', 'label': 'Peso (%)', 'field': 'weight_pct'},
@@ -2062,11 +2092,11 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                                     'max_dd': f"{bd['max_dd']:.2f}%",
                                     'trades_count': bd['trades_count']
                                 })
-                            ui.table(columns=breakdown_cols, rows=bd_rows).classes('w-full bg-white shadow-sm rounded-xl')
+                            ui.table(columns=breakdown_cols, rows=bd_rows).classes('w-full bg-slate-900/50 shadow-lg rounded-xl')
 
                             # 5. Tabla Sucesión Cronológica de Operaciones
                             with ui.row().classes('w-full items-center justify-between mt-6 mb-2'):
-                                ui.label('📜 Sucesión Cronológica de Operaciones (Portafolio Combinado)').classes('text-lg font-bold text-slate-800')
+                                ui.label('📜 Sucesión Cronológica de Operaciones (Portafolio Combinado)').classes('text-lg font-bold text-slate-200')
                                 trade_search_input = ui.input(placeholder='Buscar operación o estrategia...').props('dense outlined clearable icon=search').classes('w-72')
 
                             trades_columns = [
@@ -2086,7 +2116,7 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                                 rows=res.get('chronological_trades', []),
                                 row_key='trade_id',
                                 pagination={'rowsPerPage': 15}
-                            ).classes('w-full bg-white shadow-sm rounded-xl mb-6')
+                            ).classes('w-full bg-slate-900/50 shadow-lg rounded-xl mb-6')
 
                             port_trades_table.bind_filter(trade_search_input, 'value')
 
@@ -2108,7 +2138,7 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
 
                             port_trades_table.add_slot('body-cell-side', '''
                                 <q-td :props="props">
-                                    <q-badge :color="props.row.side === 'LONG' ? 'blue-8' : 'purple-8'" :label="props.row.side" class="px-2 py-1 text-xs font-bold text-white shadow-sm" />
+                                    <q-badge :color="props.row.side === 'LONG' ? 'blue-8' : 'purple-8'" :label="props.row.side" class="px-2 py-1 text-xs font-bold text-white shadow-lg" />
                                 </q-td>
                             ''')
 
@@ -2116,7 +2146,7 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                                 <q-td :props="props">
                                     <q-badge
                                         :color="props.value === 'TP' ? 'positive' : props.value === 'SL' ? 'negative' : 'primary'"
-                                        class="px-2.5 py-1 text-xs font-bold text-white shadow-sm"
+                                        class="px-2.5 py-1 text-xs font-bold text-white shadow-lg"
                                     >
                                         {{ props.value === 'TP' ? 'TP' : props.value === 'SL' ? 'SL' : props.value === 'Signal' || props.value === 'Señal' ? 'Señal' : props.value }}
                                     </q-badge>
