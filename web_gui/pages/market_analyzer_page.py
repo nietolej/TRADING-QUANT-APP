@@ -289,7 +289,7 @@ def render_market_analyzer():
             
             # Símbolos de Binance: se cargan de forma LAZY cuando el usuario abre el diálogo
             # para no bloquear el event loop de asyncio durante el startup.
-            binance_select = ui.select(options=FALLBACK_SYMBOLS, label='Binance Symbols (cargando...)', multiple=True, with_input=True).classes('w-full mt-2')
+            binance_select = ui.select(options=FALLBACK_SYMBOLS, label='Binance Symbols (cargando...)', multiple=True, with_input=True).classes('w-full mt-2').props('use-chips clearable')
             _binance_symbols_loaded = [False]
 
             async def _lazy_load_binance_symbols():
@@ -315,7 +315,7 @@ def render_market_analyzer():
             yahoo_input = ui.input(label='Yahoo Symbols (comma separated)', placeholder='AAPL, TSLA, BTC-USD').classes('w-full mt-2')
             yahoo_input.set_visibility(False)
             
-            onchain_select = ui.select(options=[], label='On-Chain Metrics', multiple=True).classes('w-full mt-2')
+            onchain_select = ui.select(options=[], label='On-Chain Metrics', multiple=True).classes('w-full mt-2').props('use-chips clearable')
             onchain_select.set_visibility(False)
             
             tf_combo = ui.select(['1m', '5m', '15m', '1h', '4h', '1d'], label='Timeframe (Only for Market Data)', value='4h').classes('w-full mt-2')

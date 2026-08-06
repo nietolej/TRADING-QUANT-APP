@@ -2,17 +2,17 @@ strategy_name: EMA LONG
 description: EMA LONG
 trade_direction: Long
 parameters:
-  FAST: 15
-  LOW: 30
-  SL: 5.0
-  TP: 50.0
+  FAST: 1
+  LOW: 35
+  SL: 1.0
+  TP: 90.0
 risk_management:
   take_profit:
-    type: none
-    value: 0.0
+    type: percentage
+    value: TP
   stop_loss:
-    type: none
-    value: 0.0
+    type: percentage
+    value: SL
 entry_conditions:
   logic: AND
   rules:

@@ -949,7 +949,14 @@ def render_strategy_analyzer(on_back_to_builder=None):
                 {'name': 'sharpe',  'label': 'Sharpe',   'field': 'sharpe',  'sortable': True},
                 {'name': 'cagr',    'label': 'CAGR%',    'field': 'cagr',    'sortable': True},
                 {'name': 'maxdd',   'label': 'Max DD%',  'field': 'maxdd',   'sortable': True},
+                {'name': 'profit_factor', 'label': 'Profit Factor', 'field': 'profit_factor', 'sortable': True},
                 {'name': 'trades',  'label': 'Trades',   'field': 'trades',  'sortable': True},
+                {'name': 'wins', 'label': 'Ganadoras', 'field': 'wins', 'sortable': True},
+                {'name': 'losses', 'label': 'Perdedoras', 'field': 'losses', 'sortable': True},
+                {'name': 'win_rate', 'label': '% Ganadoras', 'field': 'win_rate', 'sortable': True},
+                {'name': 'cons_losses', 'label': 'Perdedoras consec.', 'field': 'cons_losses', 'sortable': True},
+                {'name': 'init_cap', 'label': 'Cap. Inicial', 'field': 'init_cap', 'sortable': True},
+                {'name': 'final_eq', 'label': 'Balance Final', 'field': 'final_eq', 'sortable': True},
                 {'name': 'pnl',     'label': 'PnL Neto', 'field': 'pnl',     'sortable': True},
             ]
             opt_result_table = ui.table(
@@ -1158,7 +1165,14 @@ def render_strategy_analyzer(on_back_to_builder=None):
                         'sharpe': r['sharpe_ratio'],
                         'cagr': r['cagr'],
                         'maxdd': f"{r['max_drawdown_pct']:.2f}%",
+                        'profit_factor': r.get('profit_factor', 0),
                         'trades': r['total_trades'],
+                        'wins': r.get('winning_trades', 0),
+                        'losses': r.get('losing_trades', 0),
+                        'win_rate': f"{r.get('percent_profitable', 0):.2f}%",
+                        'cons_losses': r.get('max_consecutive_losers', 0),
+                        'init_cap': r.get('initial_capital', 0),
+                        'final_eq': r.get('final_equity', 0),
                         'pnl': r['net_pnl'],
                     })
 
@@ -1724,474 +1738,474 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
     finally:
         db.close()
 
-        # ════════════════════════════════════════════════════════
-        # DIALOG DEL SIMULADOR DE PORTAFOLIO Y COMBINACIÓN
-        # ════════════════════════════════════════════════════════
-        with ui.dialog().props('maximized') as portfolio_dialog, \
-             ui.card().classes('w-full h-full q-pa-md overflow-auto bg-slate-50'):
+    # ════════════════════════════════════════════════════════
+    # DIALOG DEL SIMULADOR DE PORTAFOLIO Y COMBINACIÓN
+    # ════════════════════════════════════════════════════════
+    with ui.dialog().props('maximized') as portfolio_dialog, \
+         ui.card().classes('w-full h-full q-pa-md overflow-auto bg-slate-50'):
 
-            with ui.row().classes('w-full justify-between items-center mb-4 bg-slate-900 text-white p-4 rounded-xl shadow'):
-                with ui.row().classes('items-center gap-3'):
-                    ui.icon('pie_chart', size='2.5rem').classes('text-emerald-400')
-                    with ui.column().classes('gap-0'):
-                        ui.label('Simulador de Portafolio & Combinación de Estrategias').classes('text-2xl font-bold')
-                        ui.label('Asigna porcentajes de tu capital a múltiples estrategias para evaluar el rendimiento consolidado.').classes('text-xs text-slate-300')
-                ui.button(icon='close', on_click=portfolio_dialog.close).props('flat round text-color=white')
+        with ui.row().classes('w-full justify-between items-center mb-4 bg-slate-900 text-white p-4 rounded-xl shadow'):
+            with ui.row().classes('items-center gap-3'):
+                ui.icon('pie_chart', size='2.5rem').classes('text-emerald-400')
+                with ui.column().classes('gap-0'):
+                    ui.label('Simulador de Portafolio & Combinación de Estrategias').classes('text-2xl font-bold')
+                    ui.label('Asigna porcentajes de tu capital a múltiples estrategias para evaluar el rendimiento consolidado.').classes('text-xs text-slate-300')
+            ui.button(icon='close', on_click=portfolio_dialog.close).props('flat round text-color=white')
 
-            # Global inputs for Portfolio
-            with ui.card().classes('w-full p-4 mb-4 rounded-xl border border-slate-700/50 shadow-lg'):
-                ui.label('Configuración Global del Portafolio').classes('font-bold text-slate-200 mb-2')
-                with ui.row().classes('w-full gap-4 items-center'):
-                    port_capital_input = ui.number('Capital Total Inicial ($)', value=10000.0, step=500.0, min=10.0).classes('flex-1')
-                    port_start_input = ui.input('Fecha Inicio', value='2024-01-01').classes('flex-1')
-                    port_end_input = ui.input('Fecha Fin', value=datetime.now().strftime('%Y-%m-%d')).classes('flex-1')
-                    port_comm_input = ui.number('Comisión (%)', value=0.1, step=0.01).classes('w-32')
-                    port_slip_input = ui.number('Slippage (%)', value=0.05, step=0.01).classes('w-32')
+        # Global inputs for Portfolio
+        with ui.card().classes('w-full p-4 mb-4 rounded-xl border border-slate-700/50 shadow-lg'):
+            ui.label('Configuración Global del Portafolio').classes('font-bold text-slate-200 mb-2')
+            with ui.row().classes('w-full gap-4 items-center'):
+                port_capital_input = ui.number('Capital Total Inicial ($)', value=10000.0, step=500.0, min=10.0).classes('flex-1')
+                port_start_input = ui.input('Fecha Inicio', value='2024-01-01').classes('flex-1')
+                port_end_input = ui.input('Fecha Fin', value=datetime.now().strftime('%Y-%m-%d')).classes('flex-1')
+                port_comm_input = ui.number('Comisión (%)', value=0.1, step=0.01).classes('w-32')
+                port_slip_input = ui.number('Slippage (%)', value=0.05, step=0.01).classes('w-32')
 
-            # Table/List of Portfolio Items
-            portfolio_state = {
-                'items': [
-                    {'strategy': list(strategies.keys())[0] if strategies else '', 'symbol': available_symbols[0], 'timeframe': '1d', 'weight_pct': 50.0},
-                    {'strategy': list(strategies.keys())[0] if strategies else '', 'symbol': available_symbols[min(1, len(available_symbols)-1)], 'timeframe': '4h', 'weight_pct': 50.0}
-                ]
-            }
+        # Table/List of Portfolio Items
+        portfolio_state = {
+            'items': [
+                {'strategy': list(strategies.keys())[0] if strategies else '', 'symbol': available_symbols[0], 'timeframe': '1d', 'weight_pct': 50.0},
+                {'strategy': list(strategies.keys())[0] if strategies else '', 'symbol': available_symbols[min(1, len(available_symbols)-1)], 'timeframe': '4h', 'weight_pct': 50.0}
+            ]
+        }
 
-            port_items_container = ui.column().classes('w-full gap-3 mb-4')
+        port_items_container = ui.column().classes('w-full gap-3 mb-4')
 
-            def get_strategy_default_params(strat_name):
-                file_path = strategies.get(strat_name)
-                if not file_path or not os.path.exists(file_path):
-                    return {}
-                try:
-                    import yaml
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        cfg = yaml.safe_load(f)
-                    return cfg.get('parameters', {}) or {}
-                except Exception:
-                    return {}
+        def get_strategy_default_params(strat_name):
+            file_path = strategies.get(strat_name)
+            if not file_path or not os.path.exists(file_path):
+                return {}
+            try:
+                import yaml
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    cfg = yaml.safe_load(f)
+                return cfg.get('parameters', {}) or {}
+            except Exception:
+                return {}
 
-            def fetch_saved_runs():
-                db = SessionLocal()
-                try:
-                    runs = db.query(BacktestRun).order_by(BacktestRun.created_at.desc()).all()
-                    opts = {}
-                    runs_map = {}
-                    for r in runs:
-                        dt_s = r.created_at.strftime('%Y-%m-%d %H:%M') if r.created_at else ''
-                        cagr_s = f"CAGR: {r.cagr:.1f}%" if r.cagr is not None else ""
-                        lbl = f"[#{r.run_id}] {r.strategy_name} ({r.symbol} {r.timeframe}) {cagr_s} | {dt_s}"
-                        opts[r.run_id] = lbl
-                        runs_map[r.run_id] = r
-                    return opts, runs_map
-                except Exception:
-                    return {}, {}
-                finally:
-                    db.close()
+        def fetch_saved_runs():
+            db = SessionLocal()
+            try:
+                runs = db.query(BacktestRun).order_by(BacktestRun.created_at.desc()).all()
+                opts = {}
+                runs_map = {}
+                for r in runs:
+                    dt_s = r.created_at.strftime('%Y-%m-%d %H:%M') if r.created_at else ''
+                    cagr_s = f"CAGR: {r.cagr:.1f}%" if r.cagr is not None else ""
+                    lbl = f"[#{r.run_id}] {r.strategy_name} ({r.symbol} {r.timeframe}) {cagr_s} | {dt_s}"
+                    opts[r.run_id] = lbl
+                    runs_map[r.run_id] = r
+                return opts, runs_map
+            except Exception:
+                return {}, {}
+            finally:
+                db.close()
 
-            def refresh_portfolio_items_ui():
-                port_items_container.clear()
-                saved_opts, saved_map = fetch_saved_runs()
+        def refresh_portfolio_items_ui():
+            port_items_container.clear()
+            saved_opts, saved_map = fetch_saved_runs()
 
-                with port_items_container:
-                    for i, item in enumerate(portfolio_state['items']):
-                        if 'custom_params' not in item or not item['custom_params']:
-                            item['custom_params'] = get_strategy_default_params(item['strategy']).copy()
+            with port_items_container:
+                for i, item in enumerate(portfolio_state['items']):
+                    if 'custom_params' not in item or not item['custom_params']:
+                        item['custom_params'] = get_strategy_default_params(item['strategy']).copy()
 
-                        with ui.card().classes('w-full p-4 rounded-xl border border-slate-700/50 shadow-xs bg-slate-900/50 mb-2'):
-                            if saved_opts:
-                                with ui.row().classes('w-full mb-2 items-center gap-2 bg-slate-50 p-2 rounded-lg border border-slate-700/50'):
-                                    ui.icon('cloud_download', size='1.2rem').classes('text-blue-600')
-                                    saved_sel = ui.select(saved_opts, label='📥 Cargar Parámetros desde Backtest Guardado', value=item.get('saved_run_id')).classes('flex-1')
+                    with ui.card().classes('w-full p-4 rounded-xl border border-slate-700/50 shadow-xs bg-slate-900/50 mb-2'):
+                        if saved_opts:
+                            with ui.row().classes('w-full mb-2 items-center gap-2 bg-slate-50 p-2 rounded-lg border border-slate-700/50'):
+                                ui.icon('cloud_download', size='1.2rem').classes('text-blue-600')
+                                saved_sel = ui.select(saved_opts, label='📥 Cargar Parámetros desde Backtest Guardado', value=item.get('saved_run_id')).classes('flex-1')
 
-                                    def make_saved_load_handler(idx=i, s_map=saved_map):
-                                        def on_saved_change(e):
-                                            run_id = e.value
-                                            if run_id and run_id in s_map:
-                                                run_obj = s_map[run_id]
-                                                portfolio_state['items'][idx]['saved_run_id'] = run_id
-                                                if run_obj.strategy_name in strategies:
-                                                    portfolio_state['items'][idx]['strategy'] = run_obj.strategy_name
-                                                if run_obj.symbol:
-                                                    portfolio_state['items'][idx]['symbol'] = run_obj.symbol
-                                                if run_obj.timeframe:
-                                                    portfolio_state['items'][idx]['timeframe'] = run_obj.timeframe
+                                def make_saved_load_handler(idx=i, s_map=saved_map):
+                                    def on_saved_change(e):
+                                        run_id = e.value
+                                        if run_id and run_id in s_map:
+                                            run_obj = s_map[run_id]
+                                            portfolio_state['items'][idx]['saved_run_id'] = run_id
+                                            if run_obj.strategy_name in strategies:
+                                                portfolio_state['items'][idx]['strategy'] = run_obj.strategy_name
+                                            if run_obj.symbol:
+                                                portfolio_state['items'][idx]['symbol'] = run_obj.symbol
+                                            if run_obj.timeframe:
+                                                portfolio_state['items'][idx]['timeframe'] = run_obj.timeframe
                                                 
-                                                if run_obj.config_snapshot:
-                                                    try:
-                                                        cfg = json.loads(run_obj.config_snapshot)
-                                                        if 'custom_parameters' in cfg:
-                                                            portfolio_state['items'][idx]['custom_params'] = cfg['custom_parameters'].copy()
-                                                    except Exception:
-                                                        pass
-                                                refresh_portfolio_items_ui()
-                                                ui.notify(f"✅ Estrategia #{idx+1} cargada desde Historial #{run_id}", type="positive")
-                                        return on_saved_change
+                                            if run_obj.config_snapshot:
+                                                try:
+                                                    cfg = json.loads(run_obj.config_snapshot)
+                                                    if 'custom_parameters' in cfg:
+                                                        portfolio_state['items'][idx]['custom_params'] = cfg['custom_parameters'].copy()
+                                                except Exception:
+                                                    pass
+                                            refresh_portfolio_items_ui()
+                                            ui.notify(f"✅ Estrategia #{idx+1} cargada desde Historial #{run_id}", type="positive")
+                                    return on_saved_change
 
-                                    saved_sel.on_value_change(make_saved_load_handler(i, saved_map))
+                                saved_sel.on_value_change(make_saved_load_handler(i, saved_map))
 
-                            with ui.row().classes('w-full gap-3 items-center mb-2'):
-                                ui.label(f"Estrategia #{i+1}").classes('font-bold text-slate-300 w-24')
-                                strat_sel = ui.select(list(strategies.keys()), label='Estrategia', value=item['strategy']).classes('flex-1')
-                                sym_sel = ui.select(available_symbols, label='Símbolo', value=item['symbol']).classes('w-44')
-                                tf_sel = ui.select(['1m', '5m', '15m', '1h', '4h', '1d'], label='TF', value=item['timeframe']).classes('w-28')
-                                weight_num = ui.number('Peso (%)', value=item['weight_pct'], min=0.0, max=100.0, step=5.0).classes('w-28')
+                        with ui.row().classes('w-full gap-3 items-center mb-2'):
+                            ui.label(f"Estrategia #{i+1}").classes('font-bold text-slate-300 w-24')
+                            strat_sel = ui.select(list(strategies.keys()), label='Estrategia', value=item['strategy']).classes('flex-1')
+                            sym_sel = ui.select(available_symbols, label='Símbolo', value=item['symbol']).classes('w-44')
+                            tf_sel = ui.select(['1m', '5m', '15m', '1h', '4h', '1d'], label='TF', value=item['timeframe']).classes('w-28')
+                            weight_num = ui.number('Peso (%)', value=item['weight_pct'], min=0.0, max=100.0, step=5.0).classes('w-28')
 
-                                def remove_item(idx_to_remove=i):
-                                    if len(portfolio_state['items']) <= 1:
-                                        ui.notify("Debe existir al menos 1 estrategia en el portafolio", type="warning")
-                                        return
-                                    portfolio_state['items'].pop(idx_to_remove)
-                                    refresh_portfolio_items_ui()
+                            def remove_item(idx_to_remove=i):
+                                if len(portfolio_state['items']) <= 1:
+                                    ui.notify("Debe existir al menos 1 estrategia en el portafolio", type="warning")
+                                    return
+                                portfolio_state['items'].pop(idx_to_remove)
+                                refresh_portfolio_items_ui()
 
-                                ui.button(icon='delete', on_click=lambda idx=i: remove_item(idx)).props('flat round color=negative')
+                            ui.button(icon='delete', on_click=lambda idx=i: remove_item(idx)).props('flat round color=negative')
 
-                            # Expansion panel for Strategy Parameters
-                            with ui.expansion('⚙️ Parámetros de la Estrategia', icon='tune').classes('w-full bg-slate-50 border border-slate-700/50 rounded-lg p-2'):
-                                params_row = ui.row().classes('w-full gap-3 flex-wrap items-center')
-                                with params_row:
-                                    cur_params = item['custom_params']
-                                    if not cur_params:
-                                        ui.label('No hay parámetros configurables para esta estrategia.').classes('text-xs text-slate-400 italic')
-                                    else:
-                                        for p_key, p_val in cur_params.items():
-                                            if isinstance(p_val, (int, float)):
-                                                p_num = ui.number(f"{p_key}", value=p_val).classes('w-32')
-                                                def make_change_handler(idx=i, pk=p_key):
-                                                    def on_p_change(e):
-                                                        portfolio_state['items'][idx]['custom_params'][pk] = float(e.value or 0.0)
-                                                    return on_p_change
-                                                p_num.on_value_change(make_change_handler(i, p_key))
-                                            else:
-                                                p_inp = ui.input(f"{p_key}", value=str(p_val)).classes('w-32')
-                                                def make_change_str_handler(idx=i, pk=p_key):
-                                                    def on_p_str_change(e):
-                                                        portfolio_state['items'][idx]['custom_params'][pk] = e.value
-                                                    return on_p_str_change
-                                                p_inp.on_value_change(make_change_str_handler(i, p_key))
+                        # Expansion panel for Strategy Parameters
+                        with ui.expansion('⚙️ Parámetros de la Estrategia', icon='tune').classes('w-full bg-slate-50 border border-slate-700/50 rounded-lg p-2'):
+                            params_row = ui.row().classes('w-full gap-3 flex-wrap items-center')
+                            with params_row:
+                                cur_params = item['custom_params']
+                                if not cur_params:
+                                    ui.label('No hay parámetros configurables para esta estrategia.').classes('text-xs text-slate-400 italic')
+                                else:
+                                    for p_key, p_val in cur_params.items():
+                                        if isinstance(p_val, (int, float)):
+                                            p_num = ui.number(f"{p_key}", value=p_val).classes('w-32')
+                                            def make_change_handler(idx=i, pk=p_key):
+                                                def on_p_change(e):
+                                                    portfolio_state['items'][idx]['custom_params'][pk] = float(e.value or 0.0)
+                                                return on_p_change
+                                            p_num.on_value_change(make_change_handler(i, p_key))
+                                        else:
+                                            p_inp = ui.input(f"{p_key}", value=str(p_val)).classes('w-32')
+                                            def make_change_str_handler(idx=i, pk=p_key):
+                                                def on_p_str_change(e):
+                                                    portfolio_state['items'][idx]['custom_params'][pk] = e.value
+                                                return on_p_str_change
+                                            p_inp.on_value_change(make_change_str_handler(i, p_key))
 
-                            def update_item_val(val_idx=i, s_sel=strat_sel, sym_s=sym_sel, t_s=tf_sel, w_n=weight_num):
-                                old_strat = portfolio_state['items'][val_idx]['strategy']
-                                new_strat = s_sel.value
-                                portfolio_state['items'][val_idx]['strategy'] = new_strat
-                                portfolio_state['items'][val_idx]['symbol'] = sym_s.value
-                                portfolio_state['items'][val_idx]['timeframe'] = t_s.value
-                                portfolio_state['items'][val_idx]['weight_pct'] = float(w_n.value or 0.0)
+                        def update_item_val(val_idx=i, s_sel=strat_sel, sym_s=sym_sel, t_s=tf_sel, w_n=weight_num):
+                            old_strat = portfolio_state['items'][val_idx]['strategy']
+                            new_strat = s_sel.value
+                            portfolio_state['items'][val_idx]['strategy'] = new_strat
+                            portfolio_state['items'][val_idx]['symbol'] = sym_s.value
+                            portfolio_state['items'][val_idx]['timeframe'] = t_s.value
+                            portfolio_state['items'][val_idx]['weight_pct'] = float(w_n.value or 0.0)
 
-                                if old_strat != new_strat:
-                                    portfolio_state['items'][val_idx]['custom_params'] = get_strategy_default_params(new_strat).copy()
-                                    refresh_portfolio_items_ui()
+                            if old_strat != new_strat:
+                                portfolio_state['items'][val_idx]['custom_params'] = get_strategy_default_params(new_strat).copy()
+                                refresh_portfolio_items_ui()
 
-                            strat_sel.on_value_change(lambda e, idx=i: update_item_val(idx))
-                            sym_sel.on_value_change(lambda e, idx=i: update_item_val(idx))
-                            tf_sel.on_value_change(lambda e, idx=i: update_item_val(idx))
-                            weight_num.on_value_change(lambda e, idx=i: update_item_val(idx))
+                        strat_sel.on_value_change(lambda e, idx=i: update_item_val(idx))
+                        sym_sel.on_value_change(lambda e, idx=i: update_item_val(idx))
+                        tf_sel.on_value_change(lambda e, idx=i: update_item_val(idx))
+                        weight_num.on_value_change(lambda e, idx=i: update_item_val(idx))
 
-            refresh_portfolio_items_ui()
+        refresh_portfolio_items_ui()
 
-            with ui.row().classes('w-full gap-3 mb-6 items-center'):
-                def add_portfolio_item():
-                    default_strat = list(strategies.keys())[0] if strategies else ''
-                    portfolio_state['items'].append({
-                        'strategy': default_strat,
-                        'symbol': available_symbols[0],
-                        'timeframe': '1d',
-                        'weight_pct': 0.0,
-                        'custom_params': get_strategy_default_params(default_strat).copy()
-                    })
-                    refresh_portfolio_items_ui()
+        with ui.row().classes('w-full gap-3 mb-6 items-center'):
+            def add_portfolio_item():
+                default_strat = list(strategies.keys())[0] if strategies else ''
+                portfolio_state['items'].append({
+                    'strategy': default_strat,
+                    'symbol': available_symbols[0],
+                    'timeframe': '1d',
+                    'weight_pct': 0.0,
+                    'custom_params': get_strategy_default_params(default_strat).copy()
+                })
+                refresh_portfolio_items_ui()
 
-                def rebalance_equal_weights():
-                    n = len(portfolio_state['items'])
-                    if n > 0:
-                        eq_w = round(100.0 / n, 2)
-                        for item in portfolio_state['items']:
-                            item['weight_pct'] = eq_w
-                        refresh_portfolio_items_ui()
-                        ui.notify(f"Pesos distribuidos equitativamente ({eq_w}% por estrategia)", type="info")
-
-                ui.button('➕ Agregar Estrategia al Portafolio', on_click=add_portfolio_item).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-xl')
-                ui.button('⚖️ Distribuir Capital Equitativamente', on_click=rebalance_equal_weights).classes('bg-slate-700 hover:bg-slate-800 text-white font-bold py-2 px-4 rounded-xl')
-
-            # Action Button
-            btn_run_portfolio = ui.button('⚡ EJECUTAR SIMULACIÓN DE PORTAFOLIO COMBINADO').classes('w-full bg-emerald-700 hover:bg-emerald-800 text-white font-extrabold py-4 text-lg rounded-xl shadow-lg')
-
-            # Results Section
-            port_results_container = ui.column().classes('w-full mt-6 gap-4')
-
-            async def run_portfolio_simulation():
-                p_client = ui.context.client
-                total_w = sum(float(item['weight_pct']) for item in portfolio_state['items'])
-                if abs(total_w - 100.0) > 1.0:
-                    ui.notify(f"La suma de los pesos del portafolio debe ser 100% (actualmente es {total_w:.1f}%)", type="warning")
-
-                btn_run_portfolio.disable()
-                btn_run_portfolio.set_text("⏳ Calculando simulación de portafolio...")
-                notify_p = ui.notify("⚡ Calculando simulación combinada del portafolio... Por favor espera", type="info", spinner=True, timeout=3.0)
-
-                try:
-                    p_start = datetime.strptime(port_start_input.value, '%Y-%m-%d').replace(tzinfo=timezone.utc)
-                    p_end = datetime.strptime(port_end_input.value, '%Y-%m-%d').replace(hour=23, minute=59, tzinfo=timezone.utc)
-                    tot_cap = float(port_capital_input.value or 10000.0)
-                    c_pct = float(port_comm_input.value or 0.1)
-                    s_pct = float(port_slip_input.value or 0.05)
-
-                    items_for_sync = []
+            def rebalance_equal_weights():
+                n = len(portfolio_state['items'])
+                if n > 0:
+                    eq_w = round(100.0 / n, 2)
                     for item in portfolio_state['items']:
-                        s_name = item['strategy']
-                        items_for_sync.append({
-                            'strategy_path': strategies.get(s_name, s_name),
-                            'symbol': item['symbol'],
-                            'timeframe': normalize_timeframe(item['timeframe']),
-                            'weight_pct': float(item['weight_pct']),
-                            'custom_params': item.get('custom_params', {})
+                        item['weight_pct'] = eq_w
+                    refresh_portfolio_items_ui()
+                    ui.notify(f"Pesos distribuidos equitativamente ({eq_w}% por estrategia)", type="info")
+
+            ui.button('➕ Agregar Estrategia al Portafolio', on_click=add_portfolio_item).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-xl')
+            ui.button('⚖️ Distribuir Capital Equitativamente', on_click=rebalance_equal_weights).classes('bg-slate-700 hover:bg-slate-800 text-white font-bold py-2 px-4 rounded-xl')
+
+        # Action Button
+        btn_run_portfolio = ui.button('⚡ EJECUTAR SIMULACIÓN DE PORTAFOLIO COMBINADO').classes('w-full bg-emerald-700 hover:bg-emerald-800 text-white font-extrabold py-4 text-lg rounded-xl shadow-lg')
+
+        # Results Section
+        port_results_container = ui.column().classes('w-full mt-6 gap-4')
+
+        async def run_portfolio_simulation():
+            p_client = ui.context.client
+            total_w = sum(float(item['weight_pct']) for item in portfolio_state['items'])
+            if abs(total_w - 100.0) > 1.0:
+                ui.notify(f"La suma de los pesos del portafolio debe ser 100% (actualmente es {total_w:.1f}%)", type="warning")
+
+            btn_run_portfolio.disable()
+            btn_run_portfolio.set_text("⏳ Calculando simulación de portafolio...")
+            notify_p = ui.notify("⚡ Calculando simulación combinada del portafolio... Por favor espera", type="info", spinner=True, timeout=3.0)
+
+            try:
+                p_start = datetime.strptime(port_start_input.value, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+                p_end = datetime.strptime(port_end_input.value, '%Y-%m-%d').replace(hour=23, minute=59, tzinfo=timezone.utc)
+                tot_cap = float(port_capital_input.value or 10000.0)
+                c_pct = float(port_comm_input.value or 0.1)
+                s_pct = float(port_slip_input.value or 0.05)
+
+                items_for_sync = []
+                for item in portfolio_state['items']:
+                    s_name = item['strategy']
+                    items_for_sync.append({
+                        'strategy_path': strategies.get(s_name, s_name),
+                        'symbol': item['symbol'],
+                        'timeframe': normalize_timeframe(item['timeframe']),
+                        'weight_pct': float(item['weight_pct']),
+                        'custom_params': item.get('custom_params', {})
+                    })
+
+                res = await run.io_bound(
+                    _sync_run_portfolio_backtest,
+                    items_for_sync,
+                    tot_cap,
+                    p_start,
+                    p_end,
+                    c_pct,
+                    s_pct
+                )
+
+                with p_client:
+                    if 'error' in res:
+                        ui.notify(res['error'], type="warning")
+                        return
+
+                    port_results_container.clear()
+                    with port_results_container:
+                        # 1. Summary Cards
+                        with ui.row().classes('w-full gap-4 flex-wrap'):
+                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
+                                ui.label('CAGR del Portafolio').classes('text-xs text-slate-500 uppercase font-bold')
+                                ui.label(f"{res['cagr']:.2f}%").classes('text-2xl font-black text-emerald-600')
+
+                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
+                                ui.label('Max Drawdown Combinado').classes('text-xs text-slate-500 uppercase font-bold')
+                                ui.label(f"{res['max_drawdown_pct']:.2f}%").classes('text-2xl font-black text-red-600')
+
+                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
+                                ui.label('Profit Factor (PF)').classes('text-xs text-slate-500 uppercase font-bold')
+                                ui.label(f"{res['profit_factor']:.2f}").classes('text-2xl font-black text-purple-600')
+
+                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
+                                ui.label('Trades Totales').classes('text-xs text-slate-500 uppercase font-bold')
+                                ui.label(f"{res['total_trades']}").classes('text-2xl font-black text-blue-600')
+
+                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
+                                ui.label('Ganadoras / Perdedoras').classes('text-xs text-slate-500 uppercase font-bold')
+                                with ui.row().classes('items-center gap-2 mt-1'):
+                                    ui.label(f"🟢 {res['winning_trades']}").classes('text-lg font-bold text-emerald-600')
+                                    ui.label(f"/ 🔴 {res['losing_trades']}").classes('text-lg font-bold text-red-600')
+                                    ui.label(f"({res['win_rate']:.1f}%)").classes('text-xs font-semibold text-slate-500')
+
+                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
+                                ui.label('Capital Final Portafolio').classes('text-xs text-slate-500 uppercase font-bold')
+                                ui.label(f"${res['final_equity']:,.2f}").classes('text-2xl font-black text-slate-900')
+
+                        # 2. Curva de Capital Combinada Chart
+                        palette_colors = ['#2563eb', '#9333ea', '#d97706', '#0891b2', '#e11d48', '#65a30d', '#0284c7']
+                            
+                        equity_series_list = []
+                        # Estrategias individuales
+                        for idx, (k, v) in enumerate(res['individual_equity'].items()):
+                            col_c = palette_colors[idx % len(palette_colors)]
+                            equity_series_list.append({
+                                'name': k,
+                                'type': 'line',
+                                'data': v,
+                                'smooth': True,
+                                'z': 3,
+                                'lineStyle': {'width': 2, 'type': 'solid', 'color': col_c},
+                                'showSymbol': False
+                            })
+                        # Total Portafolio Combinado (Resaltado en Verde Esmeralda Grueso)
+                        equity_series_list.append({
+                            'name': '★ PORTAFOLIO TOTAL COMBINADO',
+                            'type': 'line',
+                            'data': res['portfolio_equity'],
+                            'smooth': True,
+                            'z': 10,
+                            'lineStyle': {'width': 4, 'color': '#059669'},
+                            'areaStyle': {'opacity': 0.15, 'color': '#059669'}
                         })
 
-                    res = await run.io_bound(
-                        _sync_run_portfolio_backtest,
-                        items_for_sync,
-                        tot_cap,
-                        p_start,
-                        p_end,
-                        c_pct,
-                        s_pct
-                    )
+                        with ui.card().classes('w-full bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg mt-4'):
+                            ui.label('📈 Curvas de Capital Individuales y Total Combinado').classes('text-lg font-bold text-slate-200 mb-2')
+                            port_chart_options = {
+                                'title': {'text': 'Comparativa de Equidad ($) por Estrategia vs Portafolio Total', 'left': 'center', 'textStyle': {'fontSize': 14}},
+                                'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'cross'}},
+                                'legend': {'data': [s['name'] for s in equity_series_list], 'bottom': 0},
+                                'xAxis': {'type': 'category', 'data': res['dates']},
+                                'yAxis': {'type': 'value', 'scale': True},
+                                'series': equity_series_list
+                            }
+                            ui.echart(port_chart_options).classes('w-full h-80')
 
-                    with p_client:
-                        if 'error' in res:
-                            ui.notify(res['error'], type="warning")
-                            return
-
-                        port_results_container.clear()
-                        with port_results_container:
-                            # 1. Summary Cards
-                            with ui.row().classes('w-full gap-4 flex-wrap'):
-                                with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
-                                    ui.label('CAGR del Portafolio').classes('text-xs text-slate-500 uppercase font-bold')
-                                    ui.label(f"{res['cagr']:.2f}%").classes('text-2xl font-black text-emerald-600')
-
-                                with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
-                                    ui.label('Max Drawdown Combinado').classes('text-xs text-slate-500 uppercase font-bold')
-                                    ui.label(f"{res['max_drawdown_pct']:.2f}%").classes('text-2xl font-black text-red-600')
-
-                                with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
-                                    ui.label('Profit Factor (PF)').classes('text-xs text-slate-500 uppercase font-bold')
-                                    ui.label(f"{res['profit_factor']:.2f}").classes('text-2xl font-black text-purple-600')
-
-                                with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
-                                    ui.label('Trades Totales').classes('text-xs text-slate-500 uppercase font-bold')
-                                    ui.label(f"{res['total_trades']}").classes('text-2xl font-black text-blue-600')
-
-                                with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
-                                    ui.label('Ganadoras / Perdedoras').classes('text-xs text-slate-500 uppercase font-bold')
-                                    with ui.row().classes('items-center gap-2 mt-1'):
-                                        ui.label(f"🟢 {res['winning_trades']}").classes('text-lg font-bold text-emerald-600')
-                                        ui.label(f"/ 🔴 {res['losing_trades']}").classes('text-lg font-bold text-red-600')
-                                        ui.label(f"({res['win_rate']:.1f}%)").classes('text-xs font-semibold text-slate-500')
-
-                                with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
-                                    ui.label('Capital Final Portafolio').classes('text-xs text-slate-500 uppercase font-bold')
-                                    ui.label(f"${res['final_equity']:,.2f}").classes('text-2xl font-black text-slate-900')
-
-                            # 2. Curva de Capital Combinada Chart
-                            palette_colors = ['#2563eb', '#9333ea', '#d97706', '#0891b2', '#e11d48', '#65a30d', '#0284c7']
-                            
-                            equity_series_list = []
-                            # Estrategias individuales
-                            for idx, (k, v) in enumerate(res['individual_equity'].items()):
-                                col_c = palette_colors[idx % len(palette_colors)]
-                                equity_series_list.append({
-                                    'name': k,
-                                    'type': 'line',
-                                    'data': v,
-                                    'smooth': True,
-                                    'z': 3,
-                                    'lineStyle': {'width': 2, 'type': 'solid', 'color': col_c},
-                                    'showSymbol': False
-                                })
-                            # Total Portafolio Combinado (Resaltado en Verde Esmeralda Grueso)
-                            equity_series_list.append({
-                                'name': '★ PORTAFOLIO TOTAL COMBINADO',
-                                'type': 'line',
-                                'data': res['portfolio_equity'],
-                                'smooth': True,
-                                'z': 10,
-                                'lineStyle': {'width': 4, 'color': '#059669'},
-                                'areaStyle': {'opacity': 0.15, 'color': '#059669'}
-                            })
-
-                            with ui.card().classes('w-full bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg mt-4'):
-                                ui.label('📈 Curvas de Capital Individuales y Total Combinado').classes('text-lg font-bold text-slate-200 mb-2')
-                                port_chart_options = {
-                                    'title': {'text': 'Comparativa de Equidad ($) por Estrategia vs Portafolio Total', 'left': 'center', 'textStyle': {'fontSize': 14}},
-                                    'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'cross'}},
-                                    'legend': {'data': [s['name'] for s in equity_series_list], 'bottom': 0},
-                                    'xAxis': {'type': 'category', 'data': res['dates']},
-                                    'yAxis': {'type': 'value', 'scale': True},
-                                    'series': equity_series_list
-                                }
-                                ui.echart(port_chart_options).classes('w-full h-80')
-
-                            # 3. Drawdown Real Combinado Chart
-                            dd_series_list = []
-                            # Drawdowns individuales
-                            for idx, (k, v) in enumerate(res.get('individual_drawdowns', {}).items()):
-                                col_c = palette_colors[idx % len(palette_colors)]
-                                dd_series_list.append({
-                                    'name': f"DD {k}",
-                                    'type': 'line',
-                                    'data': v,
-                                    'smooth': True,
-                                    'z': 3,
-                                    'lineStyle': {'width': 1.5, 'type': 'dashed', 'color': col_c},
-                                    'showSymbol': False
-                                })
-                            # Drawdown Total (Resaltado en Rojo Grueso)
+                        # 3. Drawdown Real Combinado Chart
+                        dd_series_list = []
+                        # Drawdowns individuales
+                        for idx, (k, v) in enumerate(res.get('individual_drawdowns', {}).items()):
+                            col_c = palette_colors[idx % len(palette_colors)]
                             dd_series_list.append({
-                                'name': '★ DRAWDOWN TOTAL COMBINADO (%)',
+                                'name': f"DD {k}",
                                 'type': 'line',
-                                'data': res['drawdown_series'],
+                                'data': v,
                                 'smooth': True,
-                                'z': 10,
-                                'lineStyle': {'width': 3.5, 'color': '#dc2626'},
-                                'areaStyle': {'opacity': 0.15, 'color': '#dc2626'}
+                                'z': 3,
+                                'lineStyle': {'width': 1.5, 'type': 'dashed', 'color': col_c},
+                                'showSymbol': False
                             })
+                        # Drawdown Total (Resaltado en Rojo Grueso)
+                        dd_series_list.append({
+                            'name': '★ DRAWDOWN TOTAL COMBINADO (%)',
+                            'type': 'line',
+                            'data': res['drawdown_series'],
+                            'smooth': True,
+                            'z': 10,
+                            'lineStyle': {'width': 3.5, 'color': '#dc2626'},
+                            'areaStyle': {'opacity': 0.15, 'color': '#dc2626'}
+                        })
 
-                            with ui.card().classes('w-full bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg mt-4'):
-                                ui.label('📉 Caídas (Drawdown %) Individuales y Total Combinado').classes('text-lg font-bold text-slate-200 mb-2')
-                                dd_chart_options = {
-                                    'title': {'text': 'Drawdown Relativo (%) por Estrategia y Combinado', 'left': 'center', 'textStyle': {'fontSize': 14}},
-                                    'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'cross'}},
-                                    'legend': {'data': [s['name'] for s in dd_series_list], 'bottom': 0},
-                                    'xAxis': {'type': 'category', 'data': res['dates']},
-                                    'yAxis': {'type': 'value', 'max': 0, 'scale': True, 'axisLabel': {'formatter': '{value}%'}},
-                                    'series': dd_series_list
-                                }
-                                ui.echart(dd_chart_options).classes('w-full h-72')
+                        with ui.card().classes('w-full bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg mt-4'):
+                            ui.label('📉 Caídas (Drawdown %) Individuales y Total Combinado').classes('text-lg font-bold text-slate-200 mb-2')
+                            dd_chart_options = {
+                                'title': {'text': 'Drawdown Relativo (%) por Estrategia y Combinado', 'left': 'center', 'textStyle': {'fontSize': 14}},
+                                'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'cross'}},
+                                'legend': {'data': [s['name'] for s in dd_series_list], 'bottom': 0},
+                                'xAxis': {'type': 'category', 'data': res['dates']},
+                                'yAxis': {'type': 'value', 'max': 0, 'scale': True, 'axisLabel': {'formatter': '{value}%'}},
+                                'series': dd_series_list
+                            }
+                            ui.echart(dd_chart_options).classes('w-full h-72')
 
-                            # 4. Tabla Desglosada por Estrategia
-                            ui.label('Desglose Individual de Rendimiento por Estrategia').classes('text-lg font-bold text-slate-200 mt-4')
-                            breakdown_cols = [
-                                {'name': 'name', 'label': 'Estrategia / Par', 'field': 'name'},
-                                {'name': 'weight_pct', 'label': 'Peso (%)', 'field': 'weight_pct'},
-                                {'name': 'allocated_cap', 'label': 'Capital Inicial ($)', 'field': 'allocated_cap'},
-                                {'name': 'final_cap', 'label': 'Capital Final ($)', 'field': 'final_cap'},
-                                {'name': 'pnl_pct', 'label': 'Retorno (%)', 'field': 'pnl_pct'},
-                                {'name': 'cagr', 'label': 'CAGR (%)', 'field': 'cagr'},
-                                {'name': 'max_dd', 'label': 'Max DD (%)', 'field': 'max_dd'},
-                                {'name': 'trades_count', 'label': 'Trades', 'field': 'trades_count'},
-                            ]
-                            bd_rows = []
-                            for bd in res['strategy_breakdown']:
-                                bd_rows.append({
-                                    'name': bd['name'],
-                                    'weight_pct': f"{bd['weight_pct']:.1f}%",
-                                    'allocated_cap': f"${bd['allocated_cap']:,.2f}",
-                                    'final_cap': f"${bd['final_cap']:,.2f}",
-                                    'pnl_pct': f"{bd['pnl_pct']:.2f}%",
-                                    'cagr': f"{bd['cagr']:.2f}%",
-                                    'max_dd': f"{bd['max_dd']:.2f}%",
-                                    'trades_count': bd['trades_count']
-                                })
-                            ui.table(columns=breakdown_cols, rows=bd_rows).classes('w-full bg-slate-900/50 shadow-lg rounded-xl')
+                        # 4. Tabla Desglosada por Estrategia
+                        ui.label('Desglose Individual de Rendimiento por Estrategia').classes('text-lg font-bold text-slate-200 mt-4')
+                        breakdown_cols = [
+                            {'name': 'name', 'label': 'Estrategia / Par', 'field': 'name'},
+                            {'name': 'weight_pct', 'label': 'Peso (%)', 'field': 'weight_pct'},
+                            {'name': 'allocated_cap', 'label': 'Capital Inicial ($)', 'field': 'allocated_cap'},
+                            {'name': 'final_cap', 'label': 'Capital Final ($)', 'field': 'final_cap'},
+                            {'name': 'pnl_pct', 'label': 'Retorno (%)', 'field': 'pnl_pct'},
+                            {'name': 'cagr', 'label': 'CAGR (%)', 'field': 'cagr'},
+                            {'name': 'max_dd', 'label': 'Max DD (%)', 'field': 'max_dd'},
+                            {'name': 'trades_count', 'label': 'Trades', 'field': 'trades_count'},
+                        ]
+                        bd_rows = []
+                        for bd in res['strategy_breakdown']:
+                            bd_rows.append({
+                                'name': bd['name'],
+                                'weight_pct': f"{bd['weight_pct']:.1f}%",
+                                'allocated_cap': f"${bd['allocated_cap']:,.2f}",
+                                'final_cap': f"${bd['final_cap']:,.2f}",
+                                'pnl_pct': f"{bd['pnl_pct']:.2f}%",
+                                'cagr': f"{bd['cagr']:.2f}%",
+                                'max_dd': f"{bd['max_dd']:.2f}%",
+                                'trades_count': bd['trades_count']
+                            })
+                        ui.table(columns=breakdown_cols, rows=bd_rows).classes('w-full bg-slate-900/50 shadow-lg rounded-xl')
 
-                            # 5. Tabla Sucesión Cronológica de Operaciones
-                            with ui.row().classes('w-full items-center justify-between mt-6 mb-2'):
-                                ui.label('📜 Sucesión Cronológica de Operaciones (Portafolio Combinado)').classes('text-lg font-bold text-slate-200')
-                                trade_search_input = ui.input(placeholder='Buscar operación o estrategia...').props('dense outlined clearable icon=search').classes('w-72')
+                        # 5. Tabla Sucesión Cronológica de Operaciones
+                        with ui.row().classes('w-full items-center justify-between mt-6 mb-2'):
+                            ui.label('📜 Sucesión Cronológica de Operaciones (Portafolio Combinado)').classes('text-lg font-bold text-slate-200')
+                            trade_search_input = ui.input(placeholder='Buscar operación o estrategia...').props('dense outlined clearable icon=search').classes('w-72')
 
-                            trades_columns = [
-                                {'name': 'entry_time', 'label': 'Fecha Entrada', 'field': 'entry_time', 'sortable': True},
-                                {'name': 'exit_time', 'label': 'Fecha Salida', 'field': 'exit_time', 'sortable': True},
-                                {'name': 'strategy', 'label': 'Estrategia / Par', 'field': 'strategy', 'sortable': True},
-                                {'name': 'side', 'label': 'Tipo', 'field': 'side', 'sortable': True},
-                                {'name': 'entry_price', 'label': 'Precio Entrada', 'field': 'entry_price'},
-                                {'name': 'exit_price', 'label': 'Precio Salida', 'field': 'exit_price'},
-                                {'name': 'pnl_str', 'label': 'PnL ($)', 'field': 'pnl_str', 'sortable': True},
-                                {'name': 'pnl_pct_str', 'label': 'Retorno (%)', 'field': 'pnl_pct_str', 'sortable': True},
-                                {'name': 'reason', 'label': 'Motivo Cierre', 'field': 'reason'},
-                            ]
+                        trades_columns = [
+                            {'name': 'entry_time', 'label': 'Fecha Entrada', 'field': 'entry_time', 'sortable': True},
+                            {'name': 'exit_time', 'label': 'Fecha Salida', 'field': 'exit_time', 'sortable': True},
+                            {'name': 'strategy', 'label': 'Estrategia / Par', 'field': 'strategy', 'sortable': True},
+                            {'name': 'side', 'label': 'Tipo', 'field': 'side', 'sortable': True},
+                            {'name': 'entry_price', 'label': 'Precio Entrada', 'field': 'entry_price'},
+                            {'name': 'exit_price', 'label': 'Precio Salida', 'field': 'exit_price'},
+                            {'name': 'pnl_str', 'label': 'PnL ($)', 'field': 'pnl_str', 'sortable': True},
+                            {'name': 'pnl_pct_str', 'label': 'Retorno (%)', 'field': 'pnl_pct_str', 'sortable': True},
+                            {'name': 'reason', 'label': 'Motivo Cierre', 'field': 'reason'},
+                        ]
 
-                            port_trades_table = ui.table(
-                                columns=trades_columns,
-                                rows=res.get('chronological_trades', []),
-                                row_key='trade_id',
-                                pagination={'rowsPerPage': 15}
-                            ).classes('w-full bg-slate-900/50 shadow-lg rounded-xl mb-6')
+                        port_trades_table = ui.table(
+                            columns=trades_columns,
+                            rows=res.get('chronological_trades', []),
+                            row_key='trade_id',
+                            pagination={'rowsPerPage': 15}
+                        ).classes('w-full bg-slate-900/50 shadow-lg rounded-xl mb-6')
 
-                            port_trades_table.bind_filter(trade_search_input, 'value')
+                        port_trades_table.bind_filter(trade_search_input, 'value')
 
-                            port_trades_table.add_slot('body-cell-pnl_str', '''
-                                <q-td :props="props">
-                                    <span :class="props.row.pnl_raw >= 0 ? 'text-emerald-600 font-bold' : 'text-red-600 font-bold'">
-                                        {{ props.row.pnl_str }}
-                                    </span>
-                                </q-td>
-                            ''')
+                        port_trades_table.add_slot('body-cell-pnl_str', '''
+                            <q-td :props="props">
+                                <span :class="props.row.pnl_raw >= 0 ? 'text-emerald-600 font-bold' : 'text-red-600 font-bold'">
+                                    {{ props.row.pnl_str }}
+                                </span>
+                            </q-td>
+                        ''')
 
-                            port_trades_table.add_slot('body-cell-pnl_pct_str', '''
-                                <q-td :props="props">
-                                    <span :class="props.row.pnl_pct_raw >= 0 ? 'text-emerald-600 font-bold' : 'text-red-600 font-bold'">
-                                        {{ props.row.pnl_pct_str }}
-                                    </span>
-                                </q-td>
-                            ''')
+                        port_trades_table.add_slot('body-cell-pnl_pct_str', '''
+                            <q-td :props="props">
+                                <span :class="props.row.pnl_pct_raw >= 0 ? 'text-emerald-600 font-bold' : 'text-red-600 font-bold'">
+                                    {{ props.row.pnl_pct_str }}
+                                </span>
+                            </q-td>
+                        ''')
 
-                            port_trades_table.add_slot('body-cell-side', '''
-                                <q-td :props="props">
-                                    <q-badge :color="props.row.side === 'LONG' ? 'blue-8' : 'purple-8'" :label="props.row.side" class="px-2 py-1 text-xs font-bold text-white shadow-lg" />
-                                </q-td>
-                            ''')
+                        port_trades_table.add_slot('body-cell-side', '''
+                            <q-td :props="props">
+                                <q-badge :color="props.row.side === 'LONG' ? 'blue-8' : 'purple-8'" :label="props.row.side" class="px-2 py-1 text-xs font-bold text-white shadow-lg" />
+                            </q-td>
+                        ''')
 
-                            port_trades_table.add_slot('body-cell-reason', '''
-                                <q-td :props="props">
-                                    <q-badge
-                                        :color="props.value === 'TP' ? 'positive' : props.value === 'SL' ? 'negative' : 'primary'"
-                                        class="px-2.5 py-1 text-xs font-bold text-white shadow-lg"
-                                    >
-                                        {{ props.value === 'TP' ? 'TP' : props.value === 'SL' ? 'SL' : props.value === 'Signal' || props.value === 'Señal' ? 'Señal' : props.value }}
-                                    </q-badge>
-                                </q-td>
-                            ''')
+                        port_trades_table.add_slot('body-cell-reason', '''
+                            <q-td :props="props">
+                                <q-badge
+                                    :color="props.value === 'TP' ? 'positive' : props.value === 'SL' ? 'negative' : 'primary'"
+                                    class="px-2.5 py-1 text-xs font-bold text-white shadow-lg"
+                                >
+                                    {{ props.value === 'TP' ? 'TP' : props.value === 'SL' ? 'SL' : props.value === 'Signal' || props.value === 'Señal' ? 'Señal' : props.value }}
+                                </q-badge>
+                            </q-td>
+                        ''')
 
-                        ui.notify("✅ Simulación de portafolio combinada completada exitosamente", type="positive")
+                    ui.notify("✅ Simulación de portafolio combinada completada exitosamente", type="positive")
 
-                except Exception as p_ex:
-                    import traceback
-                    print("PORTFOLIO SIM ERROR:\n", traceback.format_exc())
-                    with p_client:
-                        ui.notify(f"Error en simulación de portafolio: {p_ex}", type="negative")
-                finally:
-                    with p_client:
-                        btn_run_portfolio.enable()
-                        btn_run_portfolio.set_text("⚡ EJECUTAR SIMULACIÓN DE PORTAFOLIO COMBINADO")
+            except Exception as p_ex:
+                import traceback
+                print("PORTFOLIO SIM ERROR:\n", traceback.format_exc())
+                with p_client:
+                    ui.notify(f"Error en simulación de portafolio: {p_ex}", type="negative")
+            finally:
+                with p_client:
+                    btn_run_portfolio.enable()
+                    btn_run_portfolio.set_text("⚡ EJECUTAR SIMULACIÓN DE PORTAFOLIO COMBINADO")
 
-            btn_run_portfolio.on_click(run_portfolio_simulation)
+        btn_run_portfolio.on_click(run_portfolio_simulation)
 
-            def open_portfolio_modal():
-                with ui.context.client:
-                    if state.get('start_date'):
-                        port_start_input.value = state['start_date']
-                    if state.get('end_date'):
-                        port_end_input.value = state['end_date']
-                    if state.get('commission_pct') is not None:
-                        port_comm_input.value = float(state['commission_pct'])
-                    if state.get('slippage_pct') is not None:
-                        port_slip_input.value = float(state['slippage_pct'])
+        def open_portfolio_modal():
+            with ui.context.client:
+                if state.get('start_date'):
+                    port_start_input.value = state['start_date']
+                if state.get('end_date'):
+                    port_end_input.value = state['end_date']
+                if state.get('commission_pct') is not None:
+                    port_comm_input.value = float(state['commission_pct'])
+                if state.get('slippage_pct') is not None:
+                    port_slip_input.value = float(state['slippage_pct'])
 
-                    if portfolio_state['items']:
-                        if state.get('strategy_name'):
-                            portfolio_state['items'][0]['strategy'] = state['strategy_name']
-                        if state.get('symbol'):
-                            portfolio_state['items'][0]['symbol'] = state['symbol']
-                        if state.get('timeframe'):
-                            portfolio_state['items'][0]['timeframe'] = state['timeframe']
-                        if state.get('custom_parameters'):
-                            portfolio_state['items'][0]['custom_params'] = state['custom_parameters'].copy()
+                if portfolio_state['items']:
+                    if state.get('strategy_name'):
+                        portfolio_state['items'][0]['strategy'] = state['strategy_name']
+                    if state.get('symbol'):
+                        portfolio_state['items'][0]['symbol'] = state['symbol']
+                    if state.get('timeframe'):
+                        portfolio_state['items'][0]['timeframe'] = state['timeframe']
+                    if state.get('custom_parameters'):
+                        portfolio_state['items'][0]['custom_params'] = state['custom_parameters'].copy()
 
-                    refresh_portfolio_items_ui()
-                    portfolio_dialog.open()
+                refresh_portfolio_items_ui()
+                portfolio_dialog.open()
 
-            btn_portfolio.on_click(open_portfolio_modal)
+        btn_portfolio.on_click(open_portfolio_modal)
 
     def select_strategy(filename):
         if filename in strategies:
