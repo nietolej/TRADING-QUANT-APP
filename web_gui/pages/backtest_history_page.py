@@ -165,7 +165,7 @@ def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=Non
             ui.label('Configuración Global del Portafolio').classes('font-bold text-slate-200 mb-2')
             with ui.row().classes('w-full gap-4 items-center'):
                 port_capital_input = ui.number('Capital Total Inicial ($)', value=10000.0, step=500.0, min=10.0).classes('flex-1')
-                port_start_input = ui.input('Fecha Inicio', value='2024-01-01').classes('flex-1')
+                port_start_input = ui.input('Fecha Inicio', value='2020-01-01').classes('flex-1')
                 port_end_input = ui.input('Fecha Fin', value=datetime.now().strftime('%Y-%m-%d')).classes('flex-1')
                 port_comm_input = ui.number('Comisión (%)', value=0.1, step=0.01).classes('w-32')
                 port_slip_input = ui.number('Slippage (%)', value=0.05, step=0.01).classes('w-32')

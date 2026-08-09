@@ -33,7 +33,10 @@ def render_strategy_builder():
             'sl_value': '2.0',
             'parameters': [],
             'entry_rules': [],
-            'exit_rules': []
+            'exit_rules': [],
+            'ec_enabled': False,
+            'ec_start_dd': '30.0',
+            'ec_stop_dd': '0.0'
         }
         
         strategy_files = glob.glob(os.path.join(STRATEGIES_DIR, '*.yaml'))
@@ -67,6 +70,9 @@ def render_strategy_builder():
             sl_parsed = _parse_val_local(state['sl_value'])
             sl_config = {"type": "percentage", "value": sl_parsed} if sl_parsed else {"type": "none", "value": 0.0}
 
+            ec_start_parsed = state['ec_start_dd'] if not str(state['ec_start_dd']).replace('.', '', 1).isdigit() else _parse_val_local(state['ec_start_dd'])
+            ec_stop_parsed = state['ec_stop_dd'] if not str(state['ec_stop_dd']).replace('.', '', 1).isdigit() else _parse_val_local(state['ec_stop_dd'])
+
             config = {
                 "strategy_name": state['strategy_name'],
                 "description": state['description'],
@@ -83,6 +89,11 @@ def render_strategy_builder():
                 "exit_conditions": {
                     "logic": "OR",
                     "rules": state['exit_rules']
+                },
+                "equity_curve_management": {
+                    "enabled": state['ec_enabled'],
+                    "start_trading_at_dd_pct": ec_start_parsed,
+                    "stop_trading_at_dd_pct": ec_stop_parsed
                 }
             }
             
@@ -112,7 +123,7 @@ def render_strategy_builder():
                     rule_type = ui.select(['technical_indicator', 'onchain_threshold'], label='Tipo de Regla', value='technical_indicator').classes('w-full')
                     
                     # Technical indicator fields container
-                    tech_container = ui.column().classes('w-full bg-slate-50 p-4 rounded-xl border border-slate-700/50 gap-2')
+                    tech_container = ui.column().classes('w-full bg-slate-800/50 p-4 rounded-xl border border-slate-700/50 gap-2')
                     with tech_container:
                         ui.label('Parámetros del Indicador Técnico').classes('text-sm font-bold text-slate-600 mb-2')
                         with ui.row().classes('w-full gap-4'):
@@ -126,7 +137,7 @@ def render_strategy_builder():
                             p2_input = ui.select(['50'], label='Período / Valor (P 2)', value='50', new_value_mode='add-unique').classes('flex-1')
                         
                     # On-chain fields container
-                    onchain_container = ui.column().classes('w-full bg-slate-50 p-4 rounded-xl border border-slate-700/50 gap-2')
+                    onchain_container = ui.column().classes('w-full bg-slate-800/50 p-4 rounded-xl border border-slate-700/50 gap-2')
                     with onchain_container:
                         ui.label('Métricas On-Chain').classes('text-sm font-bold text-slate-600 mb-2')
                         metric_input = ui.input('Nombre de Métrica', value='active_addresses').classes('w-full')
@@ -205,11 +216,12 @@ def render_strategy_builder():
         # Contenedor Principal (Sombra y redondeado)
         with ui.card().classes('w-full bg-slate-900/50 rounded-2xl shadow-lg p-2'):
             # 2. Pestañas estilo Wizard con Iconos
-            with ui.tabs().classes('w-full text-slate-300 font-semibold mb-4 bg-slate-100 rounded-xl p-1') as tabs:
+            with ui.tabs().classes('w-full text-slate-300 font-semibold mb-4 bg-slate-800 rounded-xl p-1') as tabs:
                 tab_general = ui.tab('General', icon='info')
                 tab_params = ui.tab('Parameters', icon='tune')
                 tab_rules = ui.tab('Rules', icon='rule')
                 tab_risk = ui.tab('Risk Management', icon='security')
+                tab_equity = ui.tab('Equity Curve', icon='trending_down')
     
             with ui.tab_panels(tabs, value=tab_general).classes('w-full bg-transparent'):
                 
@@ -234,7 +246,7 @@ def render_strategy_builder():
                             params_list_container.clear()
                             with params_list_container:
                                 for idx, p in enumerate(state['parameters']):
-                                    with ui.card().classes('w-full flex-row items-center justify-between shadow-lg border border-slate-700/50 rounded-lg p-2 bg-slate-50'):
+                                    with ui.card().classes('w-full flex-row items-center justify-between shadow-lg border border-slate-700/50 rounded-lg p-2 bg-slate-800/50'):
                                         with ui.row().classes('items-center gap-4 flex-1'):
                                             def mk_name_handler(item=p):
                                                 def _on_chg(e): item['name'] = e.value or ''
@@ -288,16 +300,47 @@ def render_strategy_builder():
                     sl_opts = opts.copy()
                     if state['sl_value'] not in sl_opts: sl_opts.append(state['sl_value'])
                     sl_risk_input.options = sl_opts
+
+                    ec_start_opts = opts.copy()
+                    if state['ec_start_dd'] not in ec_start_opts: ec_start_opts.append(state['ec_start_dd'])
+                    try:
+                        ec_start.options = ec_start_opts
+                    except: pass
+
+                    ec_stop_opts = opts.copy()
+                    if state['ec_stop_dd'] not in ec_stop_opts: ec_stop_opts.append(state['ec_stop_dd'])
+                    try:
+                        ec_stop.options = ec_stop_opts
+                    except: pass
+                    
                     tp_risk_input.update()
                     sl_risk_input.update()
+                    try:
+                        ec_start.update()
+                        ec_stop.update()
+                    except: pass
 
                 render_params()
+
+                # PANEL EQUITY CURVE
+                with ui.tab_panel(tab_equity):
+                    with ui.column().classes('w-full max-w-3xl mx-auto gap-6 q-pa-md'):
+                        with ui.card().classes('w-full shadow-lg border border-slate-700/50 rounded-xl p-6 bg-slate-900/50'):
+                            ui.label('Trading por Curva de Capital (Equity Curve)').classes('text-xl font-bold text-slate-200 mb-2')
+                            ui.label('Activa operaciones reales solo cuando el Drawdown de la estrategia supere cierto umbral, deteniéndose al recuperarse.').classes('text-sm text-slate-400 mb-4')
+                            ui.separator().classes('mb-4')
+                            
+                            ec_switch = ui.switch('Habilitar Equity Curve Trading', value=state['ec_enabled']).bind_value(state, 'ec_enabled').classes('text-md font-semibold text-blue-400 mb-4')
+                            
+                            with ui.row().classes('w-full gap-4'):
+                                ec_start = ui.select([state['ec_start_dd']], label='Empezar a operar si DD (%) >= (Valor o Param)', value=state['ec_start_dd'], new_value_mode='add-unique').bind_value(state, 'ec_start_dd').classes('flex-1').props('outlined dark bg-color="transparent"')
+                                ec_stop = ui.select([state['ec_stop_dd']], label='Dejar de operar si DD (%) <= (Valor o Param)', value=state['ec_stop_dd'], new_value_mode='add-unique').bind_value(state, 'ec_stop_dd').classes('flex-1').props('outlined dark bg-color="transparent"')
      
                 # PANEL RULES
                 with ui.tab_panel(tab_rules):
                     with ui.column().classes('w-full q-pa-md max-w-5xl mx-auto gap-6'):
                         # Dirección del Trade
-                        with ui.card().classes('w-full bg-slate-50 border border-slate-700/50 rounded-xl p-4 shadow-lg'):
+                        with ui.card().classes('w-full bg-slate-800/50 border border-slate-700/50 rounded-xl p-4 shadow-lg'):
                             with ui.row().classes('w-full items-center gap-4'):
                                 ui.icon('swap_vert', size='1.5rem').classes('text-slate-600')
                                 ui.label("Dirección Principal del Trade:").classes('font-bold text-slate-300')
@@ -318,13 +361,14 @@ def render_strategy_builder():
                             entry_table = ui.table(columns=columns, rows=state['entry_rules'], row_key='name').classes('w-full rounded-lg shadow-lg border border-slate-700/50 bg-slate-900/50')
                             entry_table.add_slot('body-cell-actions', '''
                                 <q-td :props="props">
-                                    <q-btn flat dense round icon="delete" color="negative" @click="() => {
-                                        const idx = props.rowIndex;
-                                        $parent.$emit('delete_entry', idx);
-                                    }" />
+                                    <q-btn flat dense round icon="delete" color="negative" @click="() => $parent.$emit('delete_entry', props.row.name)" />
                                 </q-td>
                             ''')
-                            entry_table.on('delete_entry', lambda e: (state['entry_rules'].pop(e.args), entry_table.update()))
+                            def del_entry(e):
+                                state['entry_rules'] = [r for r in state['entry_rules'] if r.get('name') != e.args]
+                                entry_table.rows = state['entry_rules']
+                                entry_table.update()
+                            entry_table.on('delete_entry', del_entry)
 
                         ui.separator().classes('my-4')
                         
@@ -337,13 +381,14 @@ def render_strategy_builder():
                             exit_table = ui.table(columns=columns, rows=state['exit_rules'], row_key='name').classes('w-full rounded-lg shadow-lg border border-slate-700/50 bg-slate-900/50')
                             exit_table.add_slot('body-cell-actions', '''
                                 <q-td :props="props">
-                                    <q-btn flat dense round icon="delete" color="negative" @click="() => {
-                                        const idx = props.rowIndex;
-                                        $parent.$emit('delete_exit', idx);
-                                    }" />
+                                    <q-btn flat dense round icon="delete" color="negative" @click="() => $parent.$emit('delete_exit', props.row.name)" />
                                 </q-td>
                             ''')
-                            exit_table.on('delete_exit', lambda e: (state['exit_rules'].pop(e.args), exit_table.update()))
+                            def del_exit(e):
+                                state['exit_rules'] = [r for r in state['exit_rules'] if r.get('name') != e.args]
+                                exit_table.rows = state['exit_rules']
+                                exit_table.update()
+                            exit_table.on('delete_exit', del_exit)
 
         # Modal Catálogo
         with ui.dialog() as catalog_dialog:
@@ -423,7 +468,12 @@ def render_strategy_builder():
                                     state['entry_rules'] = data.get('entry_conditions', {}).get('rules', [])
                                     state['exit_rules'] = data.get('exit_conditions', {}).get('rules', [])
                                     
-                                    params_dict = data.get('parameters', {})
+                                    ec_config = data.get('equity_curve_management') or {}
+                                    state['ec_enabled'] = ec_config.get('enabled', False)
+                                    state['ec_start_dd'] = str(ec_config.get('start_trading_at_dd_pct', '30.0'))
+                                    state['ec_stop_dd'] = str(ec_config.get('stop_trading_at_dd_pct', '0.0'))
+                                    
+                                    params_dict = data.get('parameters') or {}
                                     def _guess_type(val):
                                         if isinstance(val, bool): return 'Lógico'
                                         if isinstance(val, int): return 'Entero'
@@ -436,6 +486,14 @@ def render_strategy_builder():
                                     exit_table.rows = state['exit_rules']
                                     exit_table.update()
                                     strat_name_input.update()
+                                    try:
+                                        ec_switch.update()
+                                        ec_start.update()
+                                        ec_stop.update()
+                                        tp_risk_input.update()
+                                        sl_risk_input.update()
+                                    except:
+                                        pass
                                     
                                     ui.notify(f"Estrategia '{strategy_name}' cargada", type='info')
                         except Exception as ex:

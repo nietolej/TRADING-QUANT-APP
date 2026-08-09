@@ -8,6 +8,8 @@ import logging
 import asyncio
 from web_gui.components.cards import glass_card
 
+from data_layer.export_utils import export_df_to_ninjatrader8
+
 logger = logging.getLogger(__name__)
 
 FALLBACK_SYMBOLS = [
@@ -59,12 +61,13 @@ def render_market_analyzer():
 
         # ----------------- Data Viewer UI Elements -----------------
         with glass_card(title="Query & View Historical Data", icon="search"):
-            with ui.row().classes('w-full gap-4 items-end mb-4'):
-                viewer_symbol_select = ui.select([], label='Symbol', value=None).classes('flex-1')
-                viewer_tf_select = ui.select([], label='Timeframe', value=None).classes('flex-1')
-                viewer_start_input = ui.input(label='Start (YYYY-MM-DD)', value=(datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')).classes('flex-1')
-                viewer_end_input = ui.input(label='End (YYYY-MM-DD)', value=datetime.now().strftime('%Y-%m-%d')).classes('flex-1')
-                ui.button('Cargar Data', on_click=lambda: load_viewer_data(), icon='search').props('rounded').classes('bg-cyan-600 hover:bg-cyan-500 text-white font-bold h-12 shadow-xl transition-all shadow-cyan-500/20')
+            with ui.row().classes('w-full gap-4 items-end mb-4 flex-wrap'):
+                viewer_symbol_select = ui.select([], label='Symbol', value=None).classes('flex-1 min-w-[180px]')
+                viewer_tf_select = ui.select([], label='Timeframe', value=None).classes('flex-1 min-w-[120px]')
+                viewer_start_input = ui.input(label='Start (YYYY-MM-DD)', value=(datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')).classes('flex-1 min-w-[150px]')
+                viewer_end_input = ui.input(label='End (YYYY-MM-DD)', value=datetime.now().strftime('%Y-%m-%d')).classes('flex-1 min-w-[150px]')
+                ui.button('Cargar Data', on_click=lambda: load_viewer_data(), icon='search').props('rounded').classes('bg-cyan-600 hover:bg-cyan-500 text-white font-bold h-12 shadow-xl transition-all shadow-cyan-500/20 px-6')
+                ui.button('Exportar NinjaTrader 8', on_click=lambda: open_nt8_dialog(), icon='file_download').props('rounded').classes('bg-emerald-600 hover:bg-emerald-500 text-white font-bold h-12 shadow-xl transition-all shadow-emerald-500/20 px-6')
 
             viewer_columns = [
                 {'name': 'timestamp', 'label': 'Timestamp', 'field': 'timestamp', 'sortable': True},
@@ -427,6 +430,94 @@ def render_market_analyzer():
             
             ui.button('Start Download', on_click=run_download).classes('w-full mt-4 bg-green-600 text-white font-bold')
             ui.button('Close', on_click=download_dialog.close).classes('w-full mt-2')
+
+        # ----------------- Dialog for NinjaTrader 8 Export -----------------
+        with ui.dialog() as nt8_dialog, ui.card().classes('w-[650px] max-w-3xl q-pa-md bg-slate-900 text-white border border-slate-700 rounded-xl shadow-2xl'):
+            ui.label('Exportar Datos para NinjaTrader 8 (.txt)').classes('text-xl font-bold text-cyan-400 mb-1')
+            ui.label('Genera un archivo de datos históricos listo para importar en NinjaTrader 8 (Tools ➔ Historical Data ➔ Import).').classes('text-xs text-slate-400 mb-4')
+
+            ui.label('Modo de Marca de Tiempo (Timestamps)').classes('text-xs font-bold text-slate-300 uppercase tracking-wider mt-2')
+            nt8_ts_mode = ui.radio(
+                {
+                    'end_of_bar': 'Fin de la barra (End of Bar - Estándar NinjaTrader 8)',
+                    'start_of_bar': 'Inicio de la barra (Start of Bar - Hora original Exchange)'
+                },
+                value='end_of_bar'
+            ).classes('text-slate-200 text-sm my-1')
+
+            with ui.row().classes('w-full gap-4 mt-3'):
+                nt8_delimiter = ui.select({';': 'Punto y coma (;)', ',': 'Coma (,)'}, label='Delimitador de columnas', value=';').classes('w-48')
+                nt8_date_fmt = ui.select({
+                    'auto': 'Automático (Diario: YYYYMMDD, Intradía: YYYYMMDD HHMMSS)',
+                    'daily_only': 'Solamente Fecha YYYYMMDD (Ej: 20200101;7165.72;7238.14;...)',
+                    'single_field': 'YYYYMMDD HHMMSS (Fecha y Hora campo único)',
+                    'split_field': 'YYYYMMDD;HHMMSS (Fecha y Hora campos separados)'
+                }, label='Formato de Fecha / Hora', value='auto').classes('flex-1')
+
+            def do_nt8_export():
+                if not viewer_symbol_select.value or not viewer_tf_select.value:
+                    ui.notify('Por favor selecciona primero un Símbolo y Timeframe', type='warning')
+                    return
+                try:
+                    start_dt = datetime.strptime(viewer_start_input.value, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+                    end_dt = datetime.strptime(viewer_end_input.value, '%Y-%m-%d').replace(hour=23, minute=59, tzinfo=timezone.utc)
+                except Exception:
+                    ui.notify('Fechas inválidas. Usa YYYY-MM-DD', type='negative')
+                    return
+
+                db = SessionLocal()
+                is_market = viewer_symbol_select.value.startswith('Market:')
+                if is_market:
+                    symbol = viewer_symbol_select.value.replace('Market: ', '')
+                    mgr = MarketDataManager(db)
+                    df = mgr.get_data(symbol, viewer_tf_select.value, start_dt, end_dt)
+                else:
+                    parts = viewer_symbol_select.value.replace('On-Chain: ', '').split(' - ')
+                    symbol = parts[0]
+                    metric_name = parts[1]
+                    query = db.query(OnChainMetric).filter(
+                        OnChainMetric.symbol == symbol,
+                        OnChainMetric.metric_name == metric_name,
+                        OnChainMetric.timestamp >= start_dt.replace(tzinfo=None),
+                        OnChainMetric.timestamp <= end_dt.replace(tzinfo=None)
+                    ).order_by(OnChainMetric.timestamp.asc())
+                    df = pd.read_sql(query.statement, db.bind)
+
+                db.close()
+
+                if df is None or df.empty:
+                    ui.notify('No se encontraron datos almacenados para la consulta seleccionada', type='warning')
+                    return
+
+                tf_val = viewer_tf_select.value
+                ts_mode = nt8_ts_mode.value
+                delim = nt8_delimiter.value
+
+                txt_content = export_df_to_ninjatrader8(
+                    df=df,
+                    timeframe=tf_val,
+                    timestamp_mode=ts_mode,
+                    delimiter=delim,
+                    date_format_mode=nt8_date_fmt.value,
+                    volume_as_int=True
+                )
+
+                clean_sym = symbol.replace('/', '').replace(':', '_').replace(' ', '_')
+                filename = f"{clean_sym}_{tf_val}_NinjaTrader8.txt"
+
+                ui.download(bytes(txt_content, 'utf-8'), filename=filename)
+                ui.notify(f"¡Exportación exitosa! Se descargó {filename} ({len(df)} barras)", type='positive')
+                nt8_dialog.close()
+
+            with ui.row().classes('w-full gap-4 mt-6'):
+                ui.button('Descargar Archivo NinjaTrader 8 (.txt)', on_click=do_nt8_export, icon='file_download').classes('flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 shadow-lg')
+                ui.button('Cancelar', on_click=nt8_dialog.close).classes('bg-slate-700 hover:bg-slate-600 text-white px-6')
+
+        def open_nt8_dialog():
+            if not viewer_symbol_select.value or not viewer_tf_select.value:
+                ui.notify('Selecciona primero un Símbolo y Timeframe en el panel', type='warning')
+                return
+            nt8_dialog.open()
             
         # Initial load
         load_data()

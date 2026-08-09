@@ -153,7 +153,8 @@ def build_tradingview_plotly_figure(
     trades_df: Optional[pd.DataFrame] = None,
     config: Optional[Dict[str, Any]] = None,
     symbol: str = "BTC/USDT",
-    timeframe: str = "1d"
+    timeframe: str = "1d",
+    uirevision: Any = True
 ) -> go.Figure:
     """
     Construye una figura Plotly profesional estilo TradingView / NinjaTrader 8 con tema oscuro,
@@ -179,9 +180,9 @@ def build_tradingview_plotly_figure(
     # Calcular indicadores sobre el DataFrame
     df_calc = calculate_indicators(df, config)
     
-    # Limitar a las últimas 1000 velas para evitar desconexiones de WebSocket (payload demasiado grande)
-    if len(df_calc) > 1000:
-        df_calc = df_calc.tail(1000)
+    # Conservar el rango completo de velas solicitado para el backtest (hasta 8000 velas)
+    if len(df_calc) > 8000:
+        df_calc = df_calc.tail(8000)
 
     # Formatear fechas para eje X
     if not isinstance(df_calc.index, pd.DatetimeIndex):
@@ -244,17 +245,35 @@ def build_tradingview_plotly_figure(
     )
 
     # ── 2. Overlays de Indicadores en el gráfico principal ──
-    overlay_colors = ['#f59e0b', '#10b981', '#06b6d4', '#6366f1', '#3b82f6', '#8b5cf6', '#ec4899', '#f43f5e']
-    color_idx = 0
-    
+    preset_colors = {
+        'SMA_20': '#3b82f6', 'SMA_50': '#8b5cf6', 'SMA_200': '#ec4899',
+        'EMA_9': '#f59e0b', 'EMA_21': '#10b981', 'EMA_50': '#06b6d4', 'EMA_200': '#6366f1',
+        'EMA_1': '#f43f5e', 'EMA_5': '#fb7185', 'EMA_10': '#38bdf8', 'EMA_12': '#f59e0b',
+        'EMA_26': '#a855f7', 'EMA_30': '#10b981'
+    }
+    color_palette = [
+        '#3b82f6', '#f59e0b', '#10b981', '#a855f7', '#06b6d4',
+        '#ec4899', '#f97316', '#eab308', '#f43f5e', '#84cc16', '#6366f1'
+    ]
+
+    palette_idx = 0
     for col_name in df_calc.columns:
-        if col_name.startswith('SMA_') or col_name.startswith('EMA_'):
-            color = overlay_colors[color_idx % len(overlay_colors)]
-            fig.add_trace(
-                go.Scatter(x=x_dates, y=df_calc[col_name], mode='lines', name=col_name, line=dict(color=color, width=1.5)),
-                row=1, col=1
-            )
-            color_idx += 1
+        col_upper = col_name.upper()
+        if col_upper.startswith(('SMA_', 'EMA_')):
+            cfg_key = col_name.lower()
+            if config.get(cfg_key, True):
+                color = preset_colors.get(col_upper, color_palette[palette_idx % len(color_palette)])
+                palette_idx += 1
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_dates,
+                        y=df_calc[col_name],
+                        mode='lines',
+                        name=col_upper,
+                        line=dict(color=color, width=1.5)
+                    ),
+                    row=1, col=1
+                )
 
     # Bandas de Bollinger
     if 'BB_upper' in df_calc.columns and 'BB_lower' in df_calc.columns:
@@ -303,20 +322,24 @@ def build_tradingview_plotly_figure(
         show_lines = config.get('show_trade_lines', True)
         show_labels = config.get('show_trade_labels', True)
 
+        long_e_x, long_e_y, long_e_text, long_e_hover = [], [], [], []
+        short_e_x, short_e_y, short_e_text, short_e_hover = [], [], [], []
+        win_x_x, win_x_y, win_x_text, win_x_hover = [], [], [], []
+        loss_x_x, loss_x_y, loss_x_text, loss_x_hover = [], [], [], []
+        
+        line_win_x, line_win_y = [], []
+        line_loss_x, line_loss_y = [], []
+
         for _, t in visible_trades.iterrows():
             pnl = float(t.get('pnl', 0) or 0)
             side = str(t.get('side', 'LONG')).upper()
             is_win = pnl > 0
 
             # Aplicar filtro de trades
-            if t_filter == 'WINS' and not is_win:
-                continue
-            if t_filter == 'LOSSES' and is_win:
-                continue
-            if t_filter == 'LONG' and side != 'LONG':
-                continue
-            if t_filter == 'SHORT' and side != 'SHORT':
-                continue
+            if t_filter == 'WINS' and not is_win: continue
+            if t_filter == 'LOSSES' and is_win: continue
+            if t_filter == 'LONG' and side != 'LONG': continue
+            if t_filter == 'SHORT' and side != 'SHORT': continue
 
             try:
                 e_time = str(pd.to_datetime(t.get('entry_time')))[:19]
@@ -327,68 +350,57 @@ def build_tradingview_plotly_figure(
             except Exception:
                 continue
 
-            # Marcador de entrada
-            entry_symbol = 'triangle-up' if side == 'LONG' else 'triangle-down'
-            entry_color = '#22c55e' if side == 'LONG' else '#ef4444'
             entry_text = f"Entrada {side}<br>Precio: {e_price:,.2f}"
-
-            fig.add_trace(
-                go.Scatter(
-                    x=[e_time], y=[e_price],
-                    mode='markers+text' if show_labels else 'markers',
-                    name=f"Entrada {side}",
-                    marker=dict(symbol=entry_symbol, size=13, color=entry_color, line=dict(color='#ffffff', width=1)),
-                    text=[f"Buy" if side == 'LONG' else "Sell"],
-                    textposition="bottom center" if side == 'LONG' else "top center",
-                    textfont=dict(color=entry_color, size=10, family="sans-serif"),
-                    hoverinfo="skip",
-                    hovertext=entry_text,
-                    showlegend=False
-                ),
-                row=1, col=1
-            )
-
-            # Marcador de salida
-            exit_color = '#06b6d4' if is_win else '#f43f5e'
-            exit_symbol = 'circle' if is_win else 'x'
-            
             pnl_pct = 0.0
             if e_price > 0:
                 pnl_pct = (x_price - e_price) / e_price * 100.0 if side == 'LONG' else (e_price - x_price) / e_price * 100.0
-
-            label_str = f"{'+' if pnl_pct > 0 else ''}{pnl_pct:.2f}% ({exit_reason})"
+            
+            label_str = f"{'+' if pnl_pct > 0 else ''}{pnl_pct:.2f}%"
             hover_str = f"Salida {side} ({exit_reason})<br>Precio: {x_price:,.2f}<br>PnL: {pnl:+,.2f} ({pnl_pct:+.2f}%)"
 
-            fig.add_trace(
-                go.Scatter(
-                    x=[x_time], y=[x_price],
-                    mode='markers+text' if show_labels else 'markers',
-                    name="Salida",
-                    marker=dict(symbol=exit_symbol, size=11, color=exit_color, line=dict(color='#ffffff', width=1)),
-                    text=[label_str],
-                    textposition="top center" if side == 'LONG' else "bottom center",
-                    textfont=dict(color=exit_color, size=9, family="sans-serif"),
-                    hoverinfo="skip",
-                    hovertext=hover_str,
-                    showlegend=False
-                ),
-                row=1, col=1
-            )
+            if side == 'LONG':
+                long_e_x.append(e_time); long_e_y.append(e_price)
+                long_e_text.append("Buy"); long_e_hover.append(entry_text)
+            else:
+                short_e_x.append(e_time); short_e_y.append(e_price)
+                short_e_text.append("Sell"); short_e_hover.append(entry_text)
 
-            # Línea conectora entre entrada y salida
-            if show_lines:
-                line_color = '#22c55e' if is_win else '#ef4444'
-                fig.add_trace(
-                    go.Scatter(
-                        x=[e_time, x_time],
-                        y=[e_price, x_price],
-                        mode='lines',
-                        line=dict(color=line_color, width=1.5, dash='dot'),
-                        hoverinfo='none',
-                        showlegend=False
-                    ),
-                    row=1, col=1
-                )
+            if is_win:
+                win_x_x.append(x_time); win_x_y.append(x_price)
+                win_x_text.append(label_str); win_x_hover.append(hover_str)
+                line_win_x.extend([e_time, x_time, None])
+                line_win_y.extend([e_price, x_price, None])
+            else:
+                loss_x_x.append(x_time); loss_x_y.append(x_price)
+                loss_x_text.append(label_str); loss_x_hover.append(hover_str)
+                line_loss_x.extend([e_time, x_time, None])
+                line_loss_y.extend([e_price, x_price, None])
+
+        # Agregar Traces (Batching)
+        if long_e_x:
+            fig.add_trace(go.Scatter(x=long_e_x, y=long_e_y, mode='markers+text' if show_labels else 'markers', name="Entradas Long",
+                marker=dict(symbol='triangle-up', size=13, color='#22c55e', line=dict(color='#ffffff', width=1)),
+                text=long_e_text, textposition="bottom center", textfont=dict(color='#22c55e', size=10),
+                hoverinfo="text", hovertext=long_e_hover, showlegend=False), row=1, col=1)
+        if short_e_x:
+            fig.add_trace(go.Scatter(x=short_e_x, y=short_e_y, mode='markers+text' if show_labels else 'markers', name="Entradas Short",
+                marker=dict(symbol='triangle-down', size=13, color='#ef4444', line=dict(color='#ffffff', width=1)),
+                text=short_e_text, textposition="top center", textfont=dict(color='#ef4444', size=10),
+                hoverinfo="text", hovertext=short_e_hover, showlegend=False), row=1, col=1)
+        if win_x_x:
+            fig.add_trace(go.Scatter(x=win_x_x, y=win_x_y, mode='markers+text' if show_labels else 'markers', name="Salidas Win",
+                marker=dict(symbol='circle', size=11, color='#06b6d4', line=dict(color='#ffffff', width=1)),
+                text=win_x_text, textposition="top center", textfont=dict(color='#06b6d4', size=9),
+                hoverinfo="text", hovertext=win_x_hover, showlegend=False), row=1, col=1)
+        if loss_x_x:
+            fig.add_trace(go.Scatter(x=loss_x_x, y=loss_x_y, mode='markers+text' if show_labels else 'markers', name="Salidas Loss",
+                marker=dict(symbol='x', size=11, color='#f43f5e', line=dict(color='#ffffff', width=1)),
+                text=loss_x_text, textposition="bottom center", textfont=dict(color='#f43f5e', size=9),
+                hoverinfo="text", hovertext=loss_x_hover, showlegend=False), row=1, col=1)
+        if show_lines and line_win_x:
+            fig.add_trace(go.Scatter(x=line_win_x, y=line_win_y, mode='lines', line=dict(color='#22c55e', width=1.5, dash='dot'), hoverinfo='none', showlegend=False), row=1, col=1)
+        if show_lines and line_loss_x:
+            fig.add_trace(go.Scatter(x=line_loss_x, y=line_loss_y, mode='lines', line=dict(color='#ef4444', width=1.5, dash='dot'), hoverinfo='none', showlegend=False), row=1, col=1)
 
     # ── 4. Subgráfico de Osciladores (RSI / MACD / ATR) ──
     if osc_row is not None:
@@ -439,10 +451,11 @@ def build_tradingview_plotly_figure(
         template="plotly_dark",
         paper_bgcolor="#0e131f",
         plot_bgcolor="#0e131f",
-        margin=dict(l=50, r=50, t=40, b=40),
-        height=760,
+        margin=dict(l=35, r=35, t=30, b=30),
+        height=800,
         hovermode="x unified",
         dragmode="pan",
+        uirevision=uirevision,
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -454,13 +467,15 @@ def build_tradingview_plotly_figure(
         )
     )
 
+    show_rangeslider = bool(config.get('show_rangeslider', False)) if config else False
+
     fig.update_xaxes(
         showgrid=True,
         gridcolor="#1e293b",
         zerolinecolor="#1e293b",
         fixedrange=False,
         side="top",
-        rangeslider=dict(visible=True, thickness=0.05),
+        rangeslider=dict(visible=show_rangeslider, thickness=0.05),
         rangeselector=dict(
             buttons=list([
                 dict(count=1, label="1M", step="month", stepmode="backward"),

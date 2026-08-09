@@ -18,9 +18,37 @@ def create_gui(app):
         ui.dark_mode().enable()
         ui.colors(primary='#06b6d4', secondary='#0f172a', accent='#f59e0b') # Cyan-500, Slate-900, Amber-500
         
+        ui.add_head_html('''
+            <style>
+            /* Sticky Header & Estilizado de Tablas */
+            .q-table__middle {
+                max-height: 520px;
+                overflow-y: auto !important;
+            }
+            .q-table thead tr th {
+                position: sticky !important;
+                top: 0 !important;
+                z-index: 20 !important;
+                background-color: #0f172a !important;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.4);
+                font-size: 0.8125rem !important;
+                font-weight: 700 !important;
+                letter-spacing: 0.03em;
+                color: #cbd5e1 !important;
+                padding: 8px 10px !important;
+            }
+            .q-table tbody td {
+                font-size: 0.875rem !important; /* 14px */
+                font-weight: 500 !important;
+                padding: 6px 10px !important;
+            }
+            </style>
+        ''')
+        
         # Header oscuro premium con glassmorphism
         with ui.header().classes('bg-slate-900/80 backdrop-blur-md text-white justify-between items-center px-6 py-4 shadow-md border-b border-slate-700'):
             with ui.row().classes('items-center gap-3'):
+                ui.button(icon='menu', on_click=lambda: drawer.toggle()).props('flat round text-color=white').classes('hover:bg-slate-800 transition-colors').tooltip('Contraer / Expandir Menú')
                 ui.icon('rocket_launch', size='2rem').classes('text-cyan-400')
                 ui.label('Trading Quant Terminal').classes('text-2xl font-bold tracking-tight')
             ui.button('Configuración', icon='settings').props('flat round text-color=white').classes('hover:bg-slate-800 transition-colors')
@@ -32,8 +60,77 @@ def create_gui(app):
             for name, container in pages.items():
                 container.set_visibility(name == page_name)
         
-        # Sidebar izquierdo
-        with ui.left_drawer(value=True).classes('bg-slate-900 text-slate-300 border-r border-slate-800 p-4 shadow-xl') as drawer:
+        # Sidebar izquierdo ajustable en ancho
+        with ui.left_drawer(value=True).classes('bg-slate-900 text-slate-300 border-r border-slate-800 p-4 shadow-xl relative').props('width=280') as drawer:
+            ui.html('''
+                <div id="drawer-resizer" style="
+                    position: absolute;
+                    top: 0;
+                    right: -3px;
+                    width: 8px;
+                    height: 100%;
+                    cursor: col-resize;
+                    z-index: 1000;
+                    background: transparent;
+                    transition: background 0.2s;
+                " title="Arrastra el borde para cambiar el ancho del menú (Doble clic para restablecer 280px)">
+                </div>
+            ''')
+            ui.add_body_html('''
+                <script>
+                (function() {
+                    const setupResizer = () => {
+                        const resizer = document.getElementById('drawer-resizer');
+                        if (!resizer) return;
+                        let isResizing = false;
+                        const drawerEl = resizer.closest('.q-drawer');
+                        
+                        const setWidth = (w) => {
+                            if (drawerEl) drawerEl.style.width = w + 'px';
+                            const pc = document.querySelector('.q-page-container');
+                            if (pc) pc.style.paddingLeft = w + 'px';
+                        };
+
+                        resizer.addEventListener('mouseover', () => { resizer.style.background = '#06b6d4'; });
+                        resizer.addEventListener('mouseout', () => { if (!isResizing) resizer.style.background = 'transparent'; });
+
+                        resizer.addEventListener('mousedown', function(e) {
+                            isResizing = true;
+                            resizer.style.background = '#06b6d4';
+                            document.body.style.cursor = 'col-resize';
+                            document.body.style.userSelect = 'none';
+                        });
+                        
+                        document.addEventListener('mousemove', function(e) {
+                            if (!isResizing || !drawerEl) return;
+                            const rect = drawerEl.getBoundingClientRect();
+                            const newWidth = e.clientX - rect.left;
+                            if (newWidth >= 160 && newWidth <= 650) {
+                                setWidth(newWidth);
+                                window.dispatchEvent(new Event('resize'));
+                            }
+                        });
+                        
+                        document.addEventListener('mouseup', function(e) {
+                            if (isResizing) {
+                                isResizing = false;
+                                resizer.style.background = 'transparent';
+                                document.body.style.cursor = '';
+                                document.body.style.userSelect = '';
+                                window.dispatchEvent(new Event('resize'));
+                            }
+                        });
+
+                        resizer.addEventListener('dblclick', function() {
+                            setWidth(280);
+                            window.dispatchEvent(new Event('resize'));
+                        });
+                    };
+                    setTimeout(setupResizer, 300);
+                })();
+                </script>
+            ''')
+
             ui.label('MENÚ PRINCIPAL').classes('text-xs font-bold text-slate-500 mb-4 tracking-widest')
             
             def menu_item(text, icon, page_id):

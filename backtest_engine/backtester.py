@@ -41,8 +41,9 @@ class Backtester:
             slippage=self.slippage_pct
         )
         
-        # Mapeo de métricas a nuestro formato
-        metrics = portfolio.stats()
+        # Se omiten las métricas de vectorbt (portfolio.stats()) porque son muy costosas en tiempo
+        # y bloquean el GIL. La UI calcula sus propias métricas usando `calculate_metrics`.
+        metrics = {}
         try:
             vbt_trades = portfolio.trades.records_readable
         except AttributeError:
@@ -75,12 +76,12 @@ class Backtester:
             "trades": trades_df,
             "equity_curve": pd.DataFrame({"equity": portfolio.value()}),
             "raw_data": df,
-            "cagr": metrics.get("CAGR [%]", 0) / 100,
-            "max_drawdown_pct": metrics.get("Max Drawdown [%]", 0),
-            "percent_profitable": metrics.get("Win Rate [%]", 0),
-            "profit_factor": metrics.get("Profit Factor", 0),
-            "total_trades": metrics.get("Total Trades", 0),
-            "average_trade_net_profit": metrics.get("Avg Winning Trade [%]", 0)
+            "cagr": 0.0,
+            "max_drawdown_pct": 0.0,
+            "percent_profitable": 0.0,
+            "profit_factor": 0.0,
+            "total_trades": 0,
+            "average_trade_net_profit": 0.0
         }
         return run_results
 
@@ -317,6 +318,31 @@ class Backtester:
         trade_metrics = calculate_metrics(trades_df, self.initial_capital)
         eq_metrics = calculate_equity_curve_metrics(equity_df['equity'])
         
+        def _calc_fees(tdf):
+            if tdf.empty: return 0.0, 0.0
+            tot_comm = ((tdf['entry_price'] + tdf['exit_price']) * tdf['quantity'] * self.commission_pct).fillna(0).sum()
+            longs = tdf[tdf['side'].str.lower() == 'long']
+            shorts = tdf[tdf['side'].str.lower() == 'short']
+            slip_pct = self.slippage_pct
+            tot_slip = 0.0
+            if not longs.empty:
+                tot_slip += ((longs['entry_price'] * (slip_pct / (1 + slip_pct)) +
+                              longs['exit_price'] * (slip_pct / (1 - slip_pct))) * longs['quantity']).fillna(0).sum()
+            if not shorts.empty:
+                tot_slip += ((shorts['entry_price'] * (slip_pct / (1 - slip_pct)) +
+                              shorts['exit_price'] * (slip_pct / (1 + slip_pct))) * shorts['quantity']).fillna(0).sum()
+            return tot_comm, tot_slip
+
+        tot_comm, tot_slip = _calc_fees(trades_df)
+        
+        run_results['real_total_commission'] = tot_comm
+        run_results['real_total_slippage'] = tot_slip
+        run_results['real_commission_pct_cap'] = (tot_comm / self.initial_capital * 100) if self.initial_capital > 0 else 0
+        run_results['real_slippage_pct_cap'] = (tot_slip / self.initial_capital * 100) if self.initial_capital > 0 else 0
+        
+        run_results['commission_pct_cfg'] = self.commission_pct * 100
+        run_results['slippage_pct_cfg'] = self.slippage_pct * 100
+
         # Combinar métricas
         run_results.update(trade_metrics)
         run_results.update(eq_metrics)

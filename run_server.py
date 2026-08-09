@@ -118,6 +118,12 @@ def main():
         "--port", str(PORT),
         "--host", HOST,
         "--ws-max-size", "104857600",
+        "--ws-ping-interval", "60",
+        "--ws-ping-timeout", "120",
+        "--timeout-keep-alive", "120",
+        "--reload-exclude", "*.pyc",
+        "--reload-exclude", "*.nbi",
+        "--reload-exclude", "*__pycache__*"
     ]
     # Añadir --reload-dir para cada directorio de código fuente
     for rd in reload_dirs:

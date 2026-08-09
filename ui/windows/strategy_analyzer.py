@@ -362,7 +362,12 @@ class StrategyAnalyzerWindow(QMainWindow):
                 # Lo convertimos a Quote Asset (ej. USDT) para el motor del backtester
                 capital = capital * df.iloc[0]['close']
                 
-            backtester = Backtester(self.current_strategy, initial_capital=capital)
+            ec_config = self.current_strategy.config.get("equity_curve_management", {})
+            if ec_config.get("enabled", False):
+                from backtest_engine.equity_curve_backtester import EquityCurveBacktester
+                backtester = EquityCurveBacktester(self.current_strategy, initial_capital=capital)
+            else:
+                backtester = Backtester(self.current_strategy, initial_capital=capital)
             
             # Idealmente esto correría en un QThread para no bloquear la UI
             results = backtester.run(df)
