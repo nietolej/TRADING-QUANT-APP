@@ -69,6 +69,21 @@ class BacktestRun(Base):
     percent_profitable = Column(Float)
     average_trade_net_profit = Column(Float)
 
+class PaperTrade(Base):
+    __tablename__ = "paper_trades"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, index=True)
+    symbol = Column(String, index=True)
+    strategy_name = Column(String)
+    side = Column(String)
+    entry_time = Column(DateTime)
+    exit_time = Column(DateTime)
+    entry_price = Column(Float)
+    exit_price = Column(Float)
+    pnl = Column(Float)
+    reason = Column(String)
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 

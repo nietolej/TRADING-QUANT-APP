@@ -1,6 +1,8 @@
 strategy_name: EMA LONG
 description: EMA LONG
 trade_direction: Long
+symbol: BTC/USDT
+timeframe: 1h
 parameters:
   FAST: 1
   LOW: 35

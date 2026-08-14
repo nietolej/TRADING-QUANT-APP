@@ -102,11 +102,10 @@ def main():
     project_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(project_dir)
 
-    # Directorios de código fuente Python que uvicorn debe vigilar para hot-reload.
-    # Solo estos directorios disparan un reinicio. Archivos de datos (.db),
-    # configuraciones YAML, logs, etc. quedan fuera y NUNCA causan reload.
-    reload_dirs = ["api", "web_gui", "backtest_engine", "strategy_engine",
-                   "data_layer", "ml_engine", "execution_engine", "notifications"]
+    # Hot-reload solo se activa si DEV_MODE=1 (para desarrollo de código).
+    # En uso normal NO se usa --reload para que el backtest y otras
+    # operaciones pesadas nunca causen un reinicio inesperado del servidor.
+    dev_mode = os.environ.get("DEV_MODE", "0") == "1"
 
     # Ruta a uvicorn
     uvicorn_path = os.path.join(project_dir, "venv", "Scripts", "uvicorn.exe")
@@ -114,22 +113,25 @@ def main():
 
     cmd = base_exe + [
         "api.main:app",
-        "--reload",
         "--port", str(PORT),
         "--host", HOST,
         "--ws-max-size", "104857600",
         "--ws-ping-interval", "60",
         "--ws-ping-timeout", "120",
         "--timeout-keep-alive", "120",
-        "--reload-exclude", "*.pyc",
-        "--reload-exclude", "*.nbi",
-        "--reload-exclude", "*__pycache__*"
     ]
-    # Añadir --reload-dir para cada directorio de código fuente
-    for rd in reload_dirs:
-        rd_path = os.path.join(project_dir, rd)
-        if os.path.isdir(rd_path):
-            cmd.extend(["--reload-dir", rd_path])
+
+    # Activar reload solo en modo desarrollo
+    if dev_mode:
+        reload_dirs = ["api", "web_gui", "backtest_engine", "strategy_engine",
+                       "data_layer", "ml_engine", "execution_engine", "notifications"]
+        cmd.append("--reload")
+        cmd += ["--reload-exclude", "*.pyc", "--reload-exclude", "*.nbi", "--reload-exclude", "*__pycache__*"]
+        for rd in reload_dirs:
+            rd_path = os.path.join(project_dir, rd)
+            if os.path.isdir(rd_path):
+                cmd.extend(["--reload-dir", rd_path])
+        print(f"{YELLOW}  [DEV_MODE] Hot-reload activado.{RESET}\n")
 
     # Verificar y liberar el puerto si está en uso (LISTENING)
     print(f"Verificando puerto {PORT}...")

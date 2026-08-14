@@ -10,10 +10,14 @@ class BinanceTestnetClient:
         self.api_key = os.getenv("BINANCE_API_KEY", "")
         self.api_secret = os.getenv("BINANCE_SECRET_KEY", "")
         
-        # Testnet URL
-        self.client = Client(self.api_key, self.api_secret, testnet=True)
-        self.twm = ThreadedWebsocketManager(api_key=self.api_key, api_secret=self.api_secret, testnet=True)
-        self.twm.start()
+        # Testnet URL con timeout para evitar cuelgues infinitos
+        self.client = Client(
+            self.api_key, 
+            self.api_secret, 
+            testnet=True, 
+            requests_params={'timeout': 10}
+        )
+        self.twm = None
 
     def get_historical_klines(self, symbol: str, interval: str, lookback_str: str):
         """
@@ -56,5 +60,4 @@ class BinanceTestnetClient:
         return stream_name
 
     def stop(self):
-        print("Cerrando conexiones WebSocket...")
-        self.twm.stop()
+        pass

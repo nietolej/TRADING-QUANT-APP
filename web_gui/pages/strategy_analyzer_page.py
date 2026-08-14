@@ -20,7 +20,7 @@ import yaml
 from web_gui.components.tradingview_chart import build_tradingview_plotly_figure
 
 
-def render_strategy_analyzer(on_back_to_builder=None):
+def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
     with ui.column().classes('w-full q-pa-md'):
         with ui.row().classes('w-full justify-between items-center mb-4'):
             ui.label('Análisis de Estrategia y Backtesting').classes('text-2xl font-bold text-slate-200')
@@ -1078,6 +1078,12 @@ def render_strategy_analyzer(on_back_to_builder=None):
                 'EJECUTAR PRUEBA RETROSPECTIVA',
                 on_click=lambda e: asyncio.create_task(run_backtest(e))
             ).classes('bg-blue-700 hover:bg-blue-800 text-white font-bold flex-1 py-3')
+            
+            if on_go_to_live:
+                ui.button(
+                    '▶ CORRER EN VIVO (PAPER TRADING)',
+                    on_click=lambda: on_go_to_live(state.get('strategy_name'))
+                ).classes('bg-amber-600 hover:bg-amber-700 text-white font-bold py-3 px-5 shadow')
             
             btn_portfolio = ui.button(
                 '💼 SIMULAR PORTAFOLIO (COMBINAR ESTRATEGIAS)'

@@ -43,6 +43,54 @@ def create_gui(app):
                 padding: 6px 10px !important;
             }
             </style>
+            <script>
+            // ─────────────────────────────────────────────────────────────────
+            // FIX: Previene que la tecla Enter en un <input> o <input[type=number]>
+            // dispare el primer <button> del DOM (que pertenece a otra página oculta).
+            // Todas las páginas conviven en el mismo DOM (sólo se ocultan con
+            // visibility/display), por lo que sin esta protección el Enter en el
+            // Analyzer dispararía "Guardar Estrategia" del Builder.
+            // ─────────────────────────────────────────────────────────────────
+            document.addEventListener('keydown', function(e) {
+                if (e.key !== 'Enter') return;
+                var el = e.target;
+                // Sólo actuar en inputs de texto y numéricos (no en textareas ni selects)
+                if (el.tagName !== 'INPUT') return;
+                var t = (el.type || '').toLowerCase();
+                if (t === 'textarea') return;
+                // Permitir Enter en q-btn o si el input está dentro de un dialog abierto
+                // (los dialogs son portales y se manejan correctamente por Quasar)
+                var inDialog = el.closest('.q-dialog');
+                if (inDialog) return;
+                // Prevenir submit/trigger por defecto
+                e.preventDefault();
+                e.stopPropagation();
+            }, true); // capture phase
+
+            // Además: asegurar que todos los <button> sin type explícito
+            // se traten como type="button" y no como type="submit".
+            document.addEventListener('DOMContentLoaded', function() {
+                document.querySelectorAll('button:not([type])').forEach(function(btn) {
+                    btn.setAttribute('type', 'button');
+                });
+            });
+
+            // MutationObserver para botones añadidos dinámicamente por NiceGUI/Vue
+            var _btnObserver = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    m.addedNodes.forEach(function(node) {
+                        if (node.nodeType !== 1) return;
+                        if (node.tagName === 'BUTTON' && !node.getAttribute('type')) {
+                            node.setAttribute('type', 'button');
+                        }
+                        node.querySelectorAll && node.querySelectorAll('button:not([type])').forEach(function(btn) {
+                            btn.setAttribute('type', 'button');
+                        });
+                    });
+                });
+            });
+            _btnObserver.observe(document.body, { childList: true, subtree: true });
+            </script>
         ''')
         
         # Header oscuro premium con glassmorphism
@@ -55,10 +103,13 @@ def create_gui(app):
             
         # Contenedores de las páginas (mantienen estado al ocultarse en lugar de destruirse)
         pages = {}
+        live_page = None
         
         def show_page(page_name):
             for name, container in pages.items():
                 container.set_visibility(name == page_name)
+            # Persistir la página activa en localStorage del navegador
+            ui.run_javascript(f"localStorage.setItem('tqa_active_page', '{page_name}');")
         
         # Sidebar izquierdo ajustable en ancho
         with ui.left_drawer(value=True).classes('bg-slate-900 text-slate-300 border-r border-slate-800 p-4 shadow-xl relative').props('width=280') as drawer:
@@ -170,7 +221,14 @@ def create_gui(app):
             with ui.column().classes('w-full h-full') as pages['analyzer']:
                 def on_back_to_builder():
                     show_page('builder')
-                analyzer_state = render_strategy_analyzer(on_back_to_builder=on_back_to_builder)
+                
+                def on_go_to_live(strategy_filename):
+                    if strategy_filename and live_page:
+                        live_page.selected_strategy = strategy_filename
+                        live_page.strat_select.value = strategy_filename
+                    show_page('live')
+                    
+                analyzer_state = render_strategy_analyzer(on_back_to_builder=on_back_to_builder, on_go_to_live=on_go_to_live)
 
             with ui.column().classes('w-full h-full') as pages['history']:
                 def on_load_to_analyzer(row):
@@ -195,10 +253,15 @@ def create_gui(app):
                 render_ml_page()
 
             with ui.column().classes('w-full h-full') as pages['live']:
-                render_live_monitor_page()
+                live_page = render_live_monitor_page()
                 
-        # Mostrar builder por defecto
-        show_page('builder')
+        # Restaurar la última página activa desde localStorage (evita volver a builder tras reconexiones)
+        async def restore_active_page():
+            stored = await ui.run_javascript("localStorage.getItem('tqa_active_page') || 'analyzer'")
+            target = stored if stored in pages else 'analyzer'
+            show_page(target)
+        
+        ui.timer(0, restore_active_page, once=True)
 
     # Run NiceGUI over the existing FastAPI app
     ui.run_with(
