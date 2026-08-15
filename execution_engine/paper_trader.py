@@ -38,13 +38,17 @@ class PaperTrader:
         initial_balance: float = 10_000.0,
         update_callback: Optional[Callable] = None,
         custom_parameters: Optional[dict] = None,
+        use_testnet: bool = False,
+        custom_timeframe: Optional[str] = None,
+        custom_symbol: Optional[str] = None,
     ):
         self.strategy = BaseStrategy(strategy_yaml_path, custom_parameters=custom_parameters)
         self.update_callback = update_callback
+        self.use_testnet = use_testnet
 
-        # Símbolo y timeframe tomados del YAML o con fallback sensato
-        self.symbol = self.strategy.config.get("symbol", "BTC/USDT")
-        self.timeframe = self.strategy.config.get("timeframe", "1h")
+        # Símbolo y timeframe tomados del YAML o con fallback sensato, con override del usuario
+        self.symbol = custom_symbol if custom_symbol else self.strategy.config.get("symbol", "BTC/USDT")
+        self.timeframe = custom_timeframe if custom_timeframe else self.strategy.config.get("timeframe", "1h")
 
         self.initial_balance = initial_balance
         self.current_balance = initial_balance
@@ -86,7 +90,7 @@ class PaperTrader:
         )
 
         try:
-            self._client = BinanceTestnetClient()
+            self._client = BinanceTestnetClient(use_testnet=self.use_testnet)
         except Exception as e:
             self._notify(f"❌ Error conectando a Binance Testnet: {e}")
             self.is_running = False
@@ -141,6 +145,13 @@ class PaperTrader:
         binance_symbol = self.symbol.replace("/", "").upper()
         while self.is_running:
             try:
+                # Obtener bid/ask actual (Orderbook ticker)
+                ticker = self._client.client.get_orderbook_ticker(symbol=binance_symbol)
+                self.current_bid = float(ticker['bidPrice'])
+                self.current_ask = float(ticker['askPrice'])
+                self.current_bid_qty = float(ticker['bidQty'])
+                self.current_ask_qty = float(ticker['askQty'])
+                
                 # Limit=2 para obtener la vela actual (en curso)
                 raw_klines = self._client.client.get_klines(
                     symbol=binance_symbol, interval=self.timeframe, limit=2
@@ -159,6 +170,7 @@ class PaperTrader:
             except Exception as e:
                 logger.error(f"Error polling klines: {e}")
             
+            import time
             time.sleep(2)
 
     def stop(self):
@@ -212,6 +224,9 @@ class PaperTrader:
             except Exception as exc:
                 logger.error("Error en _evaluate_market: %s", exc, exc_info=True)
                 self._notify(f"⚠️ Error evaluando mercado: {exc}")
+
+            # Notificar siempre para actualizar el gráfico en vivo
+            self._notify()
 
     # ──────────────────────────────────────────────────────────────
     # Lógica de mercado
@@ -307,8 +322,10 @@ class PaperTrader:
         # PNL bruto
         if pos.side == "long":
             pnl = (price - pos.entry_price) * pos.quantity
+            pnl_pct = ((price - pos.entry_price) / pos.entry_price) * 100
         else:
             pnl = (pos.entry_price - price) * pos.quantity
+            pnl_pct = ((pos.entry_price - price) / pos.entry_price) * 100
 
         # Comisión estimada (0.1% entrada + 0.1% salida)
         fee = pos.quantity * price * 0.002
@@ -325,6 +342,7 @@ class PaperTrader:
             "tp_price": pos.tp_price,
             "quantity": pos.quantity,
             "pnl": net_pnl,
+            "pnl_pct": pnl_pct,
             "reason": reason,
         }
         self.trade_history.append(trade)
@@ -382,26 +400,33 @@ class PaperTrader:
     # Notificaciones
     # ──────────────────────────────────────────────────────────────
 
-    def _notify(self, message: str):
-        logger.info("[PaperTrader] %s", message)
+    def _notify(self, message: str = ""):
+        if message:
+            logger.info("[PaperTrader] %s", message)
 
-        # Telegram (no-op si no está configurado)
-        if self.telegram:
-            try:
-                self.telegram.send_message(f"<b>[PaperTrader]</b>\n{message}")
-            except Exception:
-                pass
+            # Telegram (no-op si no está configurado)
+            if self.telegram:
+                try:
+                    self.telegram.send_message(f"<b>[PaperTrader]</b>\n{message}")
+                except Exception:
+                    pass
 
         # Callback a la UI — debe ser thread-safe
         if self.update_callback:
             state = {
-                "message": message,
                 "balance": self.current_balance,
                 "position": self.position,
                 "trades": self.trade_history[:],   # copia para seguridad
                 "stats": dict(self.stats),
-                "klines": self.klines_df.copy() if not self.klines_df.empty else pd.DataFrame()
+                "klines": self.klines_df.copy() if not self.klines_df.empty else pd.DataFrame(),
+                "current_bid": getattr(self, 'current_bid', 0.0),
+                "current_ask": getattr(self, 'current_ask', 0.0),
+                "current_bid_qty": getattr(self, 'current_bid_qty', 0.0),
+                "current_ask_qty": getattr(self, 'current_ask_qty', 0.0)
             }
+            if message:
+                state["message"] = message
+                
             try:
                 self.update_callback(state)
             except Exception as exc:

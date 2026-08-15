@@ -43,6 +43,22 @@ class LiveMonitorPage:
         self.custom_params = self._load_strategy_params(self.selected_strategy)
         self._render_params_form()
 
+    def _on_symbol_change(self, e):
+        if not hasattr(self, 'balance_currency_select'):
+            return
+            
+        symbol = e.value.upper()
+        if '/' in symbol:
+            parts = symbol.split('/')
+            if len(parts) == 2:
+                base, quote = parts[0].strip(), parts[1].strip()
+                if base and quote:
+                    options = [base, quote]
+                    self.balance_currency_select.options = options
+                    if self.balance_currency_select.value not in options:
+                        self.balance_currency_select.value = quote
+                    self.balance_currency_select.update()
+
     def _on_state_update(self, new_state):
         self.state.update(new_state)
         # Acumular mensajes en el log (máx. 50 líneas)
@@ -82,7 +98,10 @@ class LiveMonitorPage:
             strategy_path,
             initial_balance=initial_bal,
             update_callback=self._on_state_update,
-            custom_parameters=params_to_pass
+            custom_parameters=params_to_pass,
+            use_testnet=(self.network_select.value == 'Binance Testnet'),
+            custom_timeframe=self.timeframe_select.value,
+            custom_symbol=getattr(self, 'symbol_input', None) and self.symbol_input.value
         )
         self.status_label.set_text("Estado: INICIANDO ⏳")
         ui.notify('Iniciando Paper Trading (descargando histórico)...', type='info')
@@ -106,8 +125,9 @@ class LiveMonitorPage:
 
     def _ui_update_loop(self):
         try:
+            curr = self.balance_currency_select.value if hasattr(self, 'balance_currency_select') else 'USDT'
             # Balance
-            self.balance_label.set_text(f"Saldo Virtual: ${self.state['balance']:.2f}")
+            self.balance_label.set_text(f"Saldo Virtual: {self.state['balance']:.2f} {curr}")
             
             # Posición abierta
             if self.state['position']:
@@ -127,8 +147,25 @@ class LiveMonitorPage:
             stats = self.state.get('stats', {})
             win_rate = stats.get('win_rate', 0.0)
             total_pnl = stats.get('total_pnl', 0.0)
-            self.stats_label.set_text(f"Win Rate: {win_rate:.2f}% | Total PNL: ${total_pnl:.2f}")
+            initial_balance = self.trader.initial_balance if hasattr(self, 'trader') and self.trader else 10000.0
+            total_pnl_pct = (total_pnl / initial_balance) * 100 if initial_balance > 0 else 0.0
+            self.stats_label.set_text(f"Win Rate: {win_rate:.2f}% | Total PNL: {total_pnl:+.2f} {curr} ({total_pnl_pct:+.2f}%)")
             
+            # Actualizar Bid/Ask Ticker si existe
+            if hasattr(self, 'bid_label'):
+                bid = self.state.get('current_bid', 0.0)
+                ask = self.state.get('current_ask', 0.0)
+                bid_qty = self.state.get('current_bid_qty', 0.0)
+                ask_qty = self.state.get('current_ask_qty', 0.0)
+                spread = ask - bid
+                self.bid_label.set_text(f"{bid:,.2f}")
+                self.ask_label.set_text(f"{ask:,.2f}")
+                self.spread_label.set_text(f"{spread:.2f}")
+                
+                if hasattr(self, 'bid_qty_label'):
+                    self.bid_qty_label.set_text(f"Vol: {bid_qty:.3f}")
+                    self.ask_qty_label.set_text(f"Vol: {ask_qty:.3f}")
+
             # Actualizar gráfico
             if hasattr(self, 'chart') and self.state.get('klines') is not None and not self.state['klines'].empty:
                 df = self.state['klines']
@@ -140,13 +177,17 @@ class LiveMonitorPage:
                 rows = []
                 for t in reversed(trades_list):
                     pnl_val = t.get('pnl', 0.0)
+                    pnl_pct = t.get('pnl_pct', 0.0)
+                    # Formatear como "15.00 (1.50%)"
+                    pnl_str = f"{pnl_val:+.2f} ({pnl_pct:+.2f}%)"
+                    
                     rows.append({
                         'side': t.get('side', '').upper(),
                         'entry_price': f"{t.get('entry_price', 0):.4f}",
                         'exit_price': f"{t.get('exit_price', 0):.4f}",
                         'sl_price': f"{t.get('sl_price', 0):.4f}" if t.get('sl_price') else '-',
                         'tp_price': f"{t.get('tp_price', 0):.4f}" if t.get('tp_price') else '-',
-                        'pnl': f"{pnl_val:+.2f}",
+                        'pnl': pnl_str,
                         'reason': t.get('reason', '')
                     })
                 self.trades_grid.options['rowData'] = rows
@@ -209,9 +250,12 @@ class LiveMonitorPage:
     def _build_chart(self, df, trades):
         fig = go.Figure()
         
+        # Convert index to string to avoid Timestamp JSON serialization error
+        x_vals = df.index.astype(str).tolist()
+
         # Velas
         fig.add_trace(go.Candlestick(
-            x=df.index,
+            x=x_vals,
             open=df['open'],
             high=df['high'],
             low=df['low'],
@@ -219,29 +263,105 @@ class LiveMonitorPage:
             name='Precio'
         ))
         
-        # Añadir indicadores simples basados en parámetros (ej. EMA FAST y SLOW)
+        # Añadir indicadores dinámicos basados en la estrategia configurada
         import ta
         try:
-            fast = int(self.param_inputs.get('FAST').value) if 'FAST' in self.param_inputs else None
-            slow = int(self.param_inputs.get('SLOW').value) if 'SLOW' in self.param_inputs else None
-            if fast and fast > 0:
-                df[f'EMA_{fast}'] = ta.trend.ema_indicator(df['close'], window=fast)
-                fig.add_trace(go.Scatter(x=df.index, y=df[f'EMA_{fast}'], mode='lines', name=f'EMA {fast}', line=dict(color='yellow', width=1)))
-            if slow and slow > 0:
-                df[f'EMA_{slow}'] = ta.trend.ema_indicator(df['close'], window=slow)
-                fig.add_trace(go.Scatter(x=df.index, y=df[f'EMA_{slow}'], mode='lines', name=f'EMA {slow}', line=dict(color='orange', width=1)))
+            if hasattr(self, 'trader') and self.trader and self.trader.strategy:
+                config = self.trader.strategy.config
+                params = self.trader.strategy.parameters or {}
+                
+                # Helper para resolver el periodo de un indicador
+                def resolve_period(p):
+                    if isinstance(p, str) and p in params:
+                        return int(params[p])
+                    try:
+                        return int(float(p))
+                    except:
+                        return 20
+                        
+                # Recopilar todas las reglas de entrada y salida
+                rules = []
+                for cond_type in ["entry_conditions", "exit_conditions"]:
+                    conds = config.get(cond_type, {})
+                    rules.extend(conds.get("rules", []))
+                    
+                try:
+                    with open("chart_debug.txt", "a") as f:
+                        f.write(f"Chart updating. Rules found: {len(rules)}, Params: {params}\n")
+                except:
+                    pass
+
+                added_indicators = set()
+                
+                # Iterar sobre las reglas y extraer indicadores a graficar (SMA, EMA)
+                for rule in rules:
+                    rule_type = rule.get("type")
+                    if rule_type == "ma_cross":
+                        fast = resolve_period(rule.get("fast_period", 20))
+                        slow = resolve_period(rule.get("slow_period", 50))
+                        ma_type = rule.get("ma_type", "SMA")
+                        
+                        for p, m_type in [(fast, ma_type), (slow, ma_type)]:
+                            ind_name = f"{m_type}_{p}"
+                            if ind_name not in added_indicators:
+                                series = ta.trend.sma_indicator(df['close'], window=p) if m_type == "SMA" else ta.trend.ema_indicator(df['close'], window=p)
+                                import pandas as pd
+                                series_list = [None if pd.isna(v) else v for v in series]
+                                fig.add_trace(go.Scatter(x=x_vals, y=series_list, mode='lines', name=f'{m_type} {p}', line=dict(width=1.5)))
+                                added_indicators.add(ind_name)
+                                
+                    elif rule_type == "technical_indicator":
+                        ind1 = rule.get("indicator1", "EMA")
+                        p1 = resolve_period(rule.get("period1", 20))
+                        ind2 = rule.get("indicator2", "Price")
+                        p2 = resolve_period(rule.get("period2", 50))
+                        
+                        for ind, p in [(ind1, p1), (ind2, p2)]:
+                            if ind in ["SMA", "EMA"]:
+                                ind_name = f"{ind}_{p}"
+                                if ind_name not in added_indicators:
+                                    series = ta.trend.sma_indicator(df['close'], window=p) if ind == "SMA" else ta.trend.ema_indicator(df['close'], window=p)
+                                    import pandas as pd
+                                    series_list = [None if pd.isna(v) else v for v in series]
+                                    fig.add_trace(go.Scatter(x=x_vals, y=series_list, mode='lines', name=f'{ind} {p}', line=dict(width=1.5)))
+                                    added_indicators.add(ind_name)
         except Exception as exc:
-            pass
+            import logging, traceback
+            logging.error("Error al construir indicadores: %s", exc, exc_info=True)
+            try:
+                with open("chart_debug.txt", "a") as f:
+                    f.write(f"Exception: {exc}\n{traceback.format_exc()}\n")
+            except:
+                pass
 
         # Marcadores de Trades
         for t in trades:
+            entry_time_str = str(t['entry_time'])
+            exit_time_str = str(t['exit_time']) if t['exit_time'] else None
+            
             # Entrada
             if t['side'] == 'long':
-                fig.add_annotation(x=t['entry_time'], y=t['entry_price'], text="▲ BUY", showarrow=True, arrowhead=1, arrowcolor="green", font=dict(color="green"))
-                fig.add_annotation(x=t['exit_time'], y=t['exit_price'], text="▼ SELL", showarrow=True, arrowhead=1, arrowcolor="red", font=dict(color="red"))
+                fig.add_annotation(x=entry_time_str, y=t['entry_price'], text="▲ BUY", showarrow=True, arrowhead=1, arrowcolor="green", font=dict(color="green"))
+                if exit_time_str:
+                    fig.add_annotation(x=exit_time_str, y=t['exit_price'], text="▼ SELL", showarrow=True, arrowhead=1, arrowcolor="red", font=dict(color="red"))
             else:
-                fig.add_annotation(x=t['entry_time'], y=t['entry_price'], text="▼ SELL", showarrow=True, arrowhead=1, arrowcolor="red", font=dict(color="red"))
-                fig.add_annotation(x=t['exit_time'], y=t['exit_price'], text="▲ BUY", showarrow=True, arrowhead=1, arrowcolor="green", font=dict(color="green"))
+                fig.add_annotation(x=entry_time_str, y=t['entry_price'], text="▼ SELL", showarrow=True, arrowhead=1, arrowcolor="red", font=dict(color="red"))
+                if exit_time_str:
+                    fig.add_annotation(x=exit_time_str, y=t['exit_price'], text="▲ BUY", showarrow=True, arrowhead=1, arrowcolor="green", font=dict(color="green"))
+                
+        # Línea de Precio Actual (estilo TradingView)
+        if not df.empty:
+            current_price = df['close'].iloc[-1]
+            fig.add_hline(
+                y=current_price, 
+                line_dash="dot", 
+                line_color="#f23645", 
+                line_width=1,
+                annotation_text=f"{current_price:.2f}",
+                annotation_position="right",
+                annotation_font_color="white",
+                annotation_bgcolor="#f23645"
+            )
                 
         fig.update_layout(
             template='plotly_dark',
@@ -249,7 +369,8 @@ class LiveMonitorPage:
             plot_bgcolor='rgba(0,0,0,0)',
             margin=dict(l=40, r=40, t=30, b=30),
             xaxis_rangeslider_visible=False,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            uirevision='constant'
         )
         return fig
 
@@ -269,7 +390,31 @@ class LiveMonitorPage:
                 self.params_container = ui.column().classes('w-full mb-4 gap-2')
                 self._render_params_form()
 
-                self.balance_input = ui.number(label='Saldo Inicial (USDT)', value=10000.0).classes('w-full mb-4')
+                with ui.row().classes('w-full items-center gap-2 mb-4'):
+                    self.balance_input = ui.number(label='Saldo Inicial', value=10000.0).classes('flex-1')
+                    self.balance_currency_select = ui.select(
+                        ['BTC', 'USDT'], 
+                        value='USDT', 
+                        label='Moneda'
+                    ).classes('w-32')
+                
+                self.timeframe_select = ui.select(
+                    ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M'],
+                    value='1h',
+                    label='Temporalidad (Timeframe)'
+                ).classes('w-full mb-4')
+
+                self.symbol_input = ui.input(
+                    label='Par/Moneda (ej. BTC/USDT)', 
+                    value='BTC/USDT',
+                    on_change=self._on_symbol_change
+                ).classes('w-full mb-4')
+                
+                self.network_select = ui.select(
+                    ['Binance Real (Mainnet)', 'Binance Testnet'], 
+                    label='Red de Datos', 
+                    value='Binance Real (Mainnet)'
+                ).classes('w-full mb-4')
                 
                 with ui.row().classes('w-full justify-between mt-4'):
                     ui.button('Iniciar Bot', on_click=self._start_bot).classes('bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded')
@@ -278,13 +423,28 @@ class LiveMonitorPage:
             with ui.card().classes('bg-gray-800 text-white p-4 flex-1'):
                 ui.label('Estado en Vivo').classes('text-xl font-bold mb-4')
                 self.status_label = ui.label('Estado: DETENIDO 🔴').classes('text-lg font-semibold mb-2')
-                self.balance_label = ui.label('Saldo Virtual: $10000.00').classes('text-lg font-semibold mb-2 text-green-400')
-                self.stats_label = ui.label('Win Rate: 0.00% | Total PNL: $0.00').classes('text-lg font-semibold mb-2 text-yellow-400')
+                self.balance_label = ui.label('Saldo Virtual: 10000.00 USDT').classes('text-lg font-semibold mb-2 text-green-400')
+                self.stats_label = ui.label('Win Rate: 0.00% | Total PNL: 0.00 USDT').classes('text-lg font-semibold mb-2 text-yellow-400')
                 self.pos_label = ui.label('Posición Abierta: NINGUNA').classes('text-lg mb-2 text-blue-400')
                 self.trades_label = ui.label('Trades Completados: 0').classes('text-lg mb-2')
                 
         with ui.card().classes('bg-gray-800 p-4 w-full mb-6'):
-            ui.label('Gráfico en Vivo').classes('text-xl font-bold text-white mb-4')
+            with ui.row().classes('w-full justify-between items-center mb-4'):
+                ui.label('Gráfico en Vivo').classes('text-xl font-bold text-white')
+                # Order Book Ticker (Bid / Spread / Ask)
+                with ui.row().classes('gap-4 items-center'):
+                    with ui.column().classes('items-center border border-red-500 rounded px-4 py-1'):
+                        self.bid_label = ui.label('0.00').classes('text-red-500 font-bold text-xl')
+                        with ui.row().classes('gap-2 items-center'):
+                            ui.label('SELL').classes('text-red-500 text-sm font-bold')
+                            self.bid_qty_label = ui.label('0.000').classes('text-red-300 text-xs')
+                    self.spread_label = ui.label('0.0').classes('text-gray-400 font-bold text-lg')
+                    with ui.column().classes('items-center border border-blue-500 rounded px-4 py-1'):
+                        self.ask_label = ui.label('0.00').classes('text-blue-500 font-bold text-xl')
+                        with ui.row().classes('gap-2 items-center'):
+                            ui.label('BUY').classes('text-blue-500 text-sm font-bold')
+                            self.ask_qty_label = ui.label('0.000').classes('text-blue-300 text-xs')
+
             self.chart = ui.plotly(self._build_empty_chart()).classes('w-full h-96')
                 
         with ui.card().classes('bg-gray-800 p-4 w-full mb-6'):

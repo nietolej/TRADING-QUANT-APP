@@ -6,15 +6,16 @@ from binance import ThreadedWebsocketManager
 load_dotenv()
 
 class BinanceTestnetClient:
-    def __init__(self):
+    def __init__(self, use_testnet: bool = False):
         self.api_key = os.getenv("BINANCE_API_KEY", "")
         self.api_secret = os.getenv("BINANCE_SECRET_KEY", "")
         
         # Testnet URL con timeout para evitar cuelgues infinitos
+        # Permite seleccionar si conectar a Mainnet (datos reales) o Testnet
         self.client = Client(
             self.api_key, 
             self.api_secret, 
-            testnet=True, 
+            testnet=use_testnet, 
             requests_params={'timeout': 10}
         )
         self.twm = None
