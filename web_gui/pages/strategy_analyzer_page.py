@@ -907,9 +907,22 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                 ui.label('Símbolo / Par de activo').classes('text-xs text-gray-500 mb-1')
 
                 def _parse_assets(symbol: str):
-                    """Devuelve (base, quote) dado 'BNB/BTC'."""
-                    parts = symbol.split('/') if '/' in symbol else [symbol, 'USDT']
-                    return parts[0].strip(), parts[1].strip()
+                    """Devuelve (base, quote) dado 'BNB/BTC' o 'ETHBTC'."""
+                    if '/' in symbol:
+                        parts = symbol.split('/')
+                        return parts[0].strip(), parts[1].strip()
+                    
+                    # Heurística para separar pares sin slash (ej. ETHBTC, BTCUSDT)
+                    symbol_upper = symbol.upper()
+                    quotes = ['USDT', 'USDC', 'BUSD', 'TUSD', 'FDUSD', 'BTC', 'ETH', 'BNB', 'USD', 'EUR']
+                    for q in quotes:
+                        if symbol_upper.endswith(q):
+                            base = symbol[:-len(q)].strip()
+                            if base:
+                                return base, symbol[-len(q):].strip()
+                    
+                    # Fallback si no coincide con los quotes comunes
+                    return symbol.strip(), 'USDT'
 
                 sym_combo = ui.select(
                     available_symbols,
@@ -1182,6 +1195,81 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                 </q-td>
             ''')
 
+            # ── Dialog para mostrar trades de una simulación ──
+            with ui.dialog().props('maximized') as opt_trades_dialog, \
+                 ui.card().classes('w-full h-full q-pa-md overflow-auto bg-gray-900 text-white'):
+                with ui.row().classes('w-full justify-between items-center mb-4'):
+                    lbl_opt_trades_title = ui.label('Operaciones de la simulación').classes('text-2xl font-bold text-blue-400')
+                    ui.button(icon='close', on_click=opt_trades_dialog.close).props('flat round text-white')
+                
+                opt_trades_cols = [
+                    {'name': 'id',           'label': 'ID',          'field': 'id',           'sortable': True, 'align': 'left'},
+                    {'name': 'entry_time',   'label': 'Entrada',     'field': 'entry_time',   'sortable': True, 'align': 'left'},
+                    {'name': 'exit_time',    'label': 'Salida',      'field': 'exit_time',    'sortable': True, 'align': 'left'},
+                    {'name': 'side',         'label': 'Lado',        'field': 'side',         'sortable': True, 'align': 'center'},
+                    {'name': 'entry_price',  'label': 'P.Ent.',      'field': 'entry_price',  'sortable': True, 'align': 'right'},
+                    {'name': 'exit_price',   'label': 'P.Sal.',      'field': 'exit_price',   'sortable': True, 'align': 'right'},
+                    {'name': 'pnl_pct',      'label': '%PnL',        'field': 'pnl_pct',      'sortable': True, 'align': 'right'},
+                    {'name': 'pnl_quote',    'label': 'PnL',         'field': 'pnl_quote',    'sortable': True, 'align': 'right'},
+                    {'name': 'exit_reason',  'label': 'Razón',       'field': 'exit_reason',  'sortable': True, 'align': 'center'},
+                ]
+                opt_trades_table = ui.table(columns=opt_trades_cols, rows=[], row_key='id').classes('w-full').props('dark')
+
+            async def _on_opt_row_click(e):
+                row = e.args[1]
+                raw_params = row.get('raw_params')
+                if not raw_params: return
+                
+                df_opt = state.get('opt_df')
+                initial_cap = state.get('opt_initial_cap')
+                if df_opt is None or df_opt.empty:
+                    ui.notify('Los datos de mercado no están disponibles.', type='warning')
+                    return
+                    
+                file_path = strategies.get(state['strategy_name'])
+                with open(file_path, 'r', encoding='utf-8') as fh:
+                    base_config = yaml.safe_load(fh)
+                    
+                strategy = BaseStrategy(base_config, custom_parameters=raw_params)
+                bt = Backtester(strategy, initial_capital=initial_cap)
+                
+                ui.notify(f'Calculando operaciones para {row.get("params")}...', type='info')
+                run_result = await run.io_bound(bt.run, df_opt)
+                trades_df = run_result.get('trades')
+                
+                if trades_df is None or trades_df.empty:
+                    ui.notify('No hubo operaciones en esta simulación.', type='warning')
+                    return
+                    
+                trades_rows = []
+                for i, (_, tr) in enumerate(trades_df.iterrows()):
+                    ent_p = float(tr.get('entry_price', 1))
+                    ex_p = float(tr.get('exit_price', 1))
+                    side = str(tr.get('side', '')).upper()
+                    
+                    if ent_p > 0:
+                        pnl_pct_val = ((ex_p - ent_p) / ent_p * 100) if side == 'LONG' else ((ent_p - ex_p) / ent_p * 100)
+                    else:
+                        pnl_pct_val = 0.0
+                        
+                    trades_rows.append({
+                        'id': i + 1,
+                        'entry_time': str(tr.get('entry_time', ''))[:16].replace('T', ' '),
+                        'exit_time': str(tr.get('exit_time', ''))[:16].replace('T', ' '),
+                        'side': side,
+                        'entry_price': f"{ent_p:,.2f}",
+                        'exit_price': f"{ex_p:,.2f}",
+                        'pnl_pct': f"{pnl_pct_val:+.2f}%",
+                        'pnl_quote': f"{float(tr.get('pnl', 0)):+,.2f}",
+                        'exit_reason': str(tr.get('exit_reason', ''))
+                    })
+                    
+                opt_trades_table.rows = trades_rows
+                lbl_opt_trades_title.set_text(f'Operaciones: {row.get("params")}')
+                opt_trades_dialog.open()
+
+            opt_result_table.on('rowClick', _on_opt_row_click)
+
             btn_run_opt = ui.button(
                 'INICIAR OPTIMIZADOR',
                 icon='play_arrow'
@@ -1337,6 +1425,9 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                     initial_cap = state['capital'] * start_price
                 else:
                     initial_cap = state['capital']
+                    
+                state['opt_df'] = df_opt
+                state['opt_initial_cap'] = initial_cap
 
                 done_counter = [0]
                 def _progress(done, total):
@@ -1361,6 +1452,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                     rows.append({
                         'rank': i,
                         'params': param_str,
+                        'raw_params': r['params'],
                         'sharpe': r['sharpe_ratio'],
                         'cagr': r['cagr'],
                         'maxdd': f"{r['max_drawdown_pct']:.2f}%",

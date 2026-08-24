@@ -6,6 +6,7 @@ from .pages.strategy_analyzer_page import render_strategy_analyzer
 from .pages.backtest_history_page import render_backtest_history_page
 from .pages.ml_page import render_ml_page
 from .pages.live_monitor_page import render_live_monitor_page
+from .pages.mle_thermometer_page import render_mle_thermometer_page
 
 def create_gui(app):
     """
@@ -41,6 +42,14 @@ def create_gui(app):
                 font-size: 0.875rem !important; /* 14px */
                 font-weight: 500 !important;
                 padding: 6px 10px !important;
+            }
+            /* Ocultar barra de scroll para el menú horizontal */
+            .hide-scrollbar::-webkit-scrollbar {
+                display: none;
+            }
+            .hide-scrollbar {
+                -ms-overflow-style: none;
+                scrollbar-width: none;
             }
             </style>
             <script>
@@ -93,14 +102,6 @@ def create_gui(app):
             </script>
         ''')
         
-        # Header oscuro premium con glassmorphism
-        with ui.header().classes('bg-slate-900/80 backdrop-blur-md text-white justify-between items-center px-6 py-4 shadow-md border-b border-slate-700'):
-            with ui.row().classes('items-center gap-3'):
-                ui.button(icon='menu', on_click=lambda: drawer.toggle()).props('flat round text-color=white').classes('hover:bg-slate-800 transition-colors').tooltip('Contraer / Expandir Menú')
-                ui.icon('rocket_launch', size='2rem').classes('text-cyan-400')
-                ui.label('Trading Quant Terminal').classes('text-2xl font-bold tracking-tight')
-            ui.button('Configuración', icon='settings').props('flat round text-color=white').classes('hover:bg-slate-800 transition-colors')
-            
         # Contenedores de las páginas (mantienen estado al ocultarse en lugar de destruirse)
         pages = {}
         live_page = None
@@ -110,94 +111,37 @@ def create_gui(app):
                 container.set_visibility(name == page_name)
             # Persistir la página activa en localStorage del navegador
             ui.run_javascript(f"localStorage.setItem('tqa_active_page', '{page_name}');")
-        
-        # Sidebar izquierdo ajustable en ancho
-        with ui.left_drawer(value=True).classes('bg-slate-900 text-slate-300 border-r border-slate-800 p-4 shadow-xl relative').props('width=280') as drawer:
-            ui.html('''
-                <div id="drawer-resizer" style="
-                    position: absolute;
-                    top: 0;
-                    right: -3px;
-                    width: 8px;
-                    height: 100%;
-                    cursor: col-resize;
-                    z-index: 1000;
-                    background: transparent;
-                    transition: background 0.2s;
-                " title="Arrastra el borde para cambiar el ancho del menú (Doble clic para restablecer 280px)">
-                </div>
-            ''')
-            ui.add_body_html('''
-                <script>
-                (function() {
-                    const setupResizer = () => {
-                        const resizer = document.getElementById('drawer-resizer');
-                        if (!resizer) return;
-                        let isResizing = false;
-                        const drawerEl = resizer.closest('.q-drawer');
-                        
-                        const setWidth = (w) => {
-                            if (drawerEl) drawerEl.style.width = w + 'px';
-                            const pc = document.querySelector('.q-page-container');
-                            if (pc) pc.style.paddingLeft = w + 'px';
-                        };
 
-                        resizer.addEventListener('mouseover', () => { resizer.style.background = '#06b6d4'; });
-                        resizer.addEventListener('mouseout', () => { if (!isResizing) resizer.style.background = 'transparent'; });
-
-                        resizer.addEventListener('mousedown', function(e) {
-                            isResizing = true;
-                            resizer.style.background = '#06b6d4';
-                            document.body.style.cursor = 'col-resize';
-                            document.body.style.userSelect = 'none';
-                        });
-                        
-                        document.addEventListener('mousemove', function(e) {
-                            if (!isResizing || !drawerEl) return;
-                            const rect = drawerEl.getBoundingClientRect();
-                            const newWidth = e.clientX - rect.left;
-                            if (newWidth >= 160 && newWidth <= 650) {
-                                setWidth(newWidth);
-                                window.dispatchEvent(new Event('resize'));
-                            }
-                        });
-                        
-                        document.addEventListener('mouseup', function(e) {
-                            if (isResizing) {
-                                isResizing = false;
-                                resizer.style.background = 'transparent';
-                                document.body.style.cursor = '';
-                                document.body.style.userSelect = '';
-                                window.dispatchEvent(new Event('resize'));
-                            }
-                        });
-
-                        resizer.addEventListener('dblclick', function() {
-                            setWidth(280);
-                            window.dispatchEvent(new Event('resize'));
-                        });
-                    };
-                    setTimeout(setupResizer, 300);
-                })();
-                </script>
-            ''')
-
-            ui.label('MENÚ PRINCIPAL').classes('text-xs font-bold text-slate-500 mb-4 tracking-widest')
+        # Header oscuro premium con glassmorphism y menú horizontal
+        with ui.header().classes('bg-slate-900/95 backdrop-blur-md text-white shadow-md border-b border-slate-700'):
+            # Fila Superior: Título y Configuración
+            with ui.row().classes('w-full justify-between items-center px-6 py-2 border-b border-slate-800'):
+                with ui.row().classes('items-center gap-3'):
+                    ui.icon('rocket_launch', size='2rem').classes('text-cyan-400')
+                    ui.label('Trading Quant Terminal').classes('text-xl md:text-2xl font-bold tracking-tight')
+                ui.button('Configuración', icon='settings').props('flat round text-color=white').classes('hover:bg-slate-800 transition-colors')
             
-            def menu_item(text, icon, page_id):
-                btn = ui.button(text, icon=icon, on_click=lambda: show_page(page_id))
-                btn.props('flat align="left"').classes('w-full text-slate-300 hover:text-white hover:bg-slate-800 transition-all justify-start py-3')
-                return btn
+            # Fila Inferior: Menú Horizontal
+            with ui.row().classes('w-full items-center px-4 py-1 gap-1 overflow-x-auto no-wrap hide-scrollbar'):
+                def menu_item(text, icon, page_id):
+                    btn = ui.button(text, icon=icon, on_click=lambda p=page_id: show_page(p))
+                    btn.props('flat no-caps').classes('text-slate-300 hover:text-white hover:bg-slate-800 transition-all text-sm py-1 px-3 rounded whitespace-nowrap')
+                    return btn
                 
-            menu_item('Strategy Builder', 'build', 'builder')
-            menu_item('Estrategias Guardadas', 'list', 'catalog')
-            menu_item('Strategy Analyzer', 'analytics', 'analyzer')
-            menu_item('Historial Backtests', 'history', 'history')
-            ui.separator().classes('my-4 bg-slate-700')
-            ui.label('HERRAMIENTAS AVANZADAS').classes('text-xs font-bold text-slate-500 mb-4 tracking-widest')
-            menu_item('Datos Almacenados', 'storage', 'market')
-            menu_item('Machine Learning', 'psychology', 'ml')
-            menu_item('Live Monitor', 'play_circle', 'live')
+                ui.label('PRINCIPAL').classes('text-[10px] font-bold text-slate-500 tracking-widest mx-2')
+                menu_item('Strategy Builder', 'build', 'builder')
+                menu_item('Estrategias Guardadas', 'list', 'catalog')
+                menu_item('Strategy Analyzer', 'analytics', 'analyzer')
+                menu_item('Historial Backtests', 'history', 'history')
+                
+                ui.separator().props('vertical').classes('mx-2 h-5 bg-slate-700')
+                
+                ui.label('AVANZADAS').classes('text-[10px] font-bold text-slate-500 tracking-widest mx-2')
+                menu_item('Datos Almacenados', 'storage', 'market')
+                menu_item('Machine Learning', 'psychology', 'ml')
+                menu_item('Filtro MLE', 'thermostat', 'mle')
+                menu_item('Live Monitor', 'play_circle', 'live')
+
 
         # Contenedor principal
         with ui.column().classes('w-full h-full p-4 bg-slate-950'):
@@ -254,6 +198,9 @@ def create_gui(app):
 
             with ui.column().classes('w-full h-full') as pages['live']:
                 live_page = render_live_monitor_page()
+                
+            with ui.column().classes('w-full h-full') as pages['mle']:
+                render_mle_thermometer_page()
                 
         # Restaurar la última página activa desde localStorage (evita volver a builder tras reconexiones)
         async def restore_active_page():

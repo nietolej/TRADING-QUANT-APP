@@ -169,12 +169,34 @@ class LiveMonitorPage:
             # Actualizar gráfico
             if hasattr(self, 'chart') and self.state.get('klines') is not None and not self.state['klines'].empty:
                 df = self.state['klines']
-                fig = self._build_chart(df, trades_list)
+                fig = self._build_chart(df, trades_list, self.state.get('position'))
                 self.chart.update_figure(fig)
             
             # Actualizar tabla aggrid
             if hasattr(self, 'trades_grid'):
                 rows = []
+                
+                # Añadir posición abierta como primera fila si existe
+                if self.state.get('position'):
+                    pos = self.state['position']
+                    current_price = df['close'].iloc[-1] if 'df' in locals() and not df.empty else pos.entry_price
+                    if pos.side == 'long':
+                        pnl = (current_price - pos.entry_price) * pos.quantity
+                        pnl_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100 if pos.entry_price else 0
+                    else:
+                        pnl = (pos.entry_price - current_price) * pos.quantity
+                        pnl_pct = ((pos.entry_price - current_price) / pos.entry_price) * 100 if pos.entry_price else 0
+                    
+                    rows.append({
+                        'side': f"📈 {pos.side.upper()}" if pos.side == 'long' else f"📉 {pos.side.upper()}",
+                        'entry_price': f"{pos.entry_price:.4f}",
+                        'exit_price': "-",
+                        'sl_price': f"{pos.sl_price:.4f}" if pos.sl_price else '-',
+                        'tp_price': f"{pos.tp_price:.4f}" if pos.tp_price else '-',
+                        'pnl': f"{pnl:+.2f} ({pnl_pct:+.2f}%)",
+                        'reason': 'ABIERTA'
+                    })
+
                 for t in reversed(trades_list):
                     pnl_val = t.get('pnl', 0.0)
                     pnl_pct = t.get('pnl_pct', 0.0)
@@ -247,7 +269,7 @@ class LiveMonitorPage:
         )
         return fig
 
-    def _build_chart(self, df, trades):
+    def _build_chart(self, df, trades, position=None):
         fig = go.Figure()
         
         # Convert index to string to avoid Timestamp JSON serialization error
@@ -348,6 +370,20 @@ class LiveMonitorPage:
                 fig.add_annotation(x=entry_time_str, y=t['entry_price'], text="▼ SELL", showarrow=True, arrowhead=1, arrowcolor="red", font=dict(color="red"))
                 if exit_time_str:
                     fig.add_annotation(x=exit_time_str, y=t['exit_price'], text="▲ BUY", showarrow=True, arrowhead=1, arrowcolor="green", font=dict(color="green"))
+
+        # Posición Abierta
+        if position:
+            entry_time_str = str(position.entry_timestamp)
+            if position.side == 'long':
+                fig.add_annotation(x=entry_time_str, y=position.entry_price, text="▲ BUY (ABIERTA)", showarrow=True, arrowhead=1, arrowcolor="#00ff00", font=dict(color="#00ff00", size=14, weight="bold"))
+            else:
+                fig.add_annotation(x=entry_time_str, y=position.entry_price, text="▼ SELL (ABIERTA)", showarrow=True, arrowhead=1, arrowcolor="#ff0000", font=dict(color="#ff0000", size=14, weight="bold"))
+            
+            # Dibujar líneas horizontales para Stop Loss y Take Profit
+            if position.sl_price:
+                fig.add_hline(y=position.sl_price, line_dash="dash", line_color="rgba(255, 0, 0, 0.6)", annotation_text="SL", annotation_position="right", annotation_font_color="rgba(255, 0, 0, 0.9)")
+            if position.tp_price:
+                fig.add_hline(y=position.tp_price, line_dash="dash", line_color="rgba(0, 255, 0, 0.6)", annotation_text="TP", annotation_position="right", annotation_font_color="rgba(0, 255, 0, 0.9)")
                 
         # Línea de Precio Actual (estilo TradingView)
         if not df.empty:
@@ -475,6 +511,7 @@ class LiveMonitorPage:
         # Se guarda referencia para cancelarlo cuando el cliente se desconecta
         # (recarga de página, cierre de pestaña) y evitar el RuntimeError de slot eliminado.
         self.timer = ui.timer(1.0, self._ui_update_loop)
+        
         ui.context.client.on_disconnect(lambda: self.timer.deactivate() if self.timer else None)
 
 def render_live_monitor_page():
