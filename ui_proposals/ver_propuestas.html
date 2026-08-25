@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Comparativa de Diseños de UI - Trading Quant App</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #090d16;
+      --card-bg: #111827;
+      --border: #1f293d;
+      --text: #f1f5f9;
+      --text-muted: #94a3b8;
+      --gold: #f59e0b;
+      --gold-light: #fbbf24;
+      --cyan: #06b6d4;
+      --emerald: #10b981;
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      padding: 30px 20px 60px;
+      line-height: 1.5;
+    }
+    header {
+      max-width: 1300px;
+      margin: 0 auto 35px;
+      text-align: center;
+    }
+    .badge {
+      display: inline-block;
+      padding: 6px 14px;
+      background: rgba(245, 158, 11, 0.12);
+      border: 1px solid var(--gold);
+      color: var(--gold-light);
+      font-size: 13px;
+      font-weight: 700;
+      border-radius: 9999px;
+      margin-bottom: 12px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    h1 {
+      font-size: 32px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 10px;
+      background: linear-gradient(135deg, #ffffff 40%, #94a3b8 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    p.subtitle {
+      color: var(--text-muted);
+      font-size: 16px;
+      max-width: 750px;
+      margin: 0 auto;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(580px, 1fr));
+      gap: 28px;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+      transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+    .card:hover {
+      border-color: var(--gold);
+      box-shadow: 0 12px 30px rgba(245, 158, 11, 0.15);
+      transform: translateY(-2px);
+    }
+    .img-container {
+      position: relative;
+      background: #000;
+      cursor: zoom-in;
+      overflow: hidden;
+    }
+    .img-container img {
+      width: 100%;
+      height: auto;
+      display: block;
+      transition: transform 0.3s ease;
+    }
+    .img-container:hover img {
+      transform: scale(1.02);
+    }
+    .img-hint {
+      position: absolute;
+      bottom: 12px;
+      right: 12px;
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(6px);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      color: #e2e8f0;
+      border: 1px solid rgba(255,255,255,0.1);
+    }
+    .card-body {
+      padding: 24px;
+      flex-grow: 1;
+      display: flex;
+      flex-direction: column;
+    }
+    .option-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .option-num {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--gold);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .option-title {
+      font-size: 20px;
+      font-weight: 700;
+      color: #fff;
+      margin-bottom: 8px;
+    }
+    .option-desc {
+      color: var(--text-muted);
+      font-size: 14px;
+      margin-bottom: 16px;
+      line-height: 1.6;
+    }
+    .features-list {
+      list-style: none;
+      margin-bottom: 20px;
+      font-size: 13.5px;
+      color: #cbd5e1;
+    }
+    .features-list li {
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .features-list li::before {
+      content: "✓";
+      color: var(--emerald);
+      font-weight: bold;
+    }
+    .color-palette {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: auto;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+    .color-swatch {
+      width: 26px;
+      height: 26px;
+      border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.2);
+    }
+
+    /* Modal de Zoom */
+    .modal {
+      display: none;
+      position: fixed;
+      z-index: 1000;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+      background-color: rgba(0, 0, 0, 0.92);
+      backdrop-filter: blur(8px);
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .modal.active {
+      display: flex;
+    }
+    .modal img {
+      max-width: 95vw;
+      max-height: 92vh;
+      border-radius: 8px;
+      box-shadow: 0 0 40px rgba(0,0,0,0.8);
+      border: 1px solid rgba(255,255,255,0.15);
+    }
+    .modal-close {
+      position: absolute;
+      top: 20px;
+      right: 25px;
+      color: #fff;
+      font-size: 36px;
+      font-weight: bold;
+      cursor: pointer;
+      line-height: 1;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="badge">Propuestas de Rediseño UI / UX</div>
+    <h1>Selector de Paleta, Tipografía y Visibilidad</h1>
+    <p class="subtitle">Haz clic en cualquier imagen para verla en pantalla completa y evaluar el contraste, tamaños de fuente y colores.</p>
+  </header>
+
+  <div class="grid">
+    <!-- OPCIÓN 1 -->
+    <div class="card">
+      <div class="img-container" onclick="openModal('opcion_1_hibrido_ejecutivo.jpg')">
+        <img src="opcion_1_hibrido_ejecutivo.jpg" alt="Opción 1: Híbrido Ejecutivo">
+        <span class="img-hint">🔍 Clic para ampliar</span>
+      </div>
+      <div class="card-body">
+        <div class="option-header">
+          <span class="option-num">Opción 1</span>
+          <span style="background: rgba(16, 185, 129, 0.15); color: #10b981; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px;">Evolución Directa</span>
+        </div>
+        <h2 class="option-title">Híbrido Ejecutivo (Clean Light & Dark Navy)</h2>
+        <p class="option-desc">Ideal si quieres el estilo de tu imagen de referencia pero con contraste perfecto (100% legible), eliminando el texto claro borroso.</p>
+        <ul class="features-list">
+          <li><strong>Fondo:</strong> Blanco perla nítido (#F8FAFC) y tarjetas en blanco puro (#FFFFFF).</li>
+          <li><strong>Sidebar:</strong> Dark Navy (#0F172A) con badge dorado suave (#D97706).</li>
+          <li><strong>Texto:</strong> Negro-azulado profundo (#0F172A) de máximo contraste.</li>
+          <li><strong>Tipografía:</strong> Plus Jakarta Sans (ultra moderna y legible).</li>
+        </ul>
+        <div class="color-palette">
+          <span style="font-size: 12px; color: var(--text-muted); margin-right: 6px;">Paleta:</span>
+          <div class="color-swatch" style="background: #0F172A;" title="Sidebar Navy: #0F172A"></div>
+          <div class="color-swatch" style="background: #F8FAFC;" title="Fondo: #F8FAFC"></div>
+          <div class="color-swatch" style="background: #D97706;" title="Dorado: #D97706"></div>
+          <div class="color-swatch" style="background: #10B981;" title="Esmeralda: #10B981"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- OPCIÓN 2 -->
+    <div class="card">
+      <div class="img-container" onclick="openModal('opcion_2_titanium_gold_dark.jpg')">
+        <img src="opcion_2_titanium_gold_dark.jpg" alt="Opción 2: Titanium Gold Dark">
+        <span class="img-hint">🔍 Clic para ampliar</span>
+      </div>
+      <div class="card-body">
+        <div class="option-header">
+          <span class="option-num">Opción 2</span>
+          <span style="background: rgba(245, 158, 11, 0.15); color: #fbbf24; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px;">Quant Pro Dark</span>
+        </div>
+        <h2 class="option-title">Titanium Gold & Obsidian (Modo Oscuro Elite)</h2>
+        <p class="option-desc">Diseño oscuro especializado para trading cuantitativo y análisis intensivo. Cero deslumbramiento y gran resalte de métricas.</p>
+        <ul class="features-list">
+          <li><strong>Fondo:</strong> Dark Slate (#111827) con tarjetas obsidian (#0B0F19).</li>
+          <li><strong>Bordes:</strong> Titanio sutil (#1F2937) que delimita cada caja con precisión.</li>
+          <li><strong>Acentos:</strong> Dorado Ámbar brillante (#F59E0B) y verde positivo (#10B981).</li>
+          <li><strong>Tipografía:</strong> Inter + JetBrains Mono para números financieros.</li>
+        </ul>
+        <div class="color-palette">
+          <span style="font-size: 12px; color: var(--text-muted); margin-right: 6px;">Paleta:</span>
+          <div class="color-swatch" style="background: #0B0F19;" title="Obsidian: #0B0F19"></div>
+          <div class="color-swatch" style="background: #111827;" title="Slate: #111827"></div>
+          <div class="color-swatch" style="background: #F59E0B;" title="Gold: #F59E0B"></div>
+          <div class="color-swatch" style="background: #10B981;" title="Emerald: #10B981"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- OPCIÓN 3 -->
+    <div class="card">
+      <div class="img-container" onclick="openModal('opcion_3_bloomberg_obsidian.jpg')">
+        <img src="opcion_3_bloomberg_obsidian.jpg" alt="Opción 3: Bloomberg Obsidian">
+        <span class="img-hint">🔍 Clic para ampliar</span>
+      </div>
+      <div class="card-body">
+        <div class="option-header">
+          <span class="option-num">Opción 3</span>
+          <span style="background: rgba(6, 182, 212, 0.15); color: #06b6d4; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px;">Fintech Institucional</span>
+        </div>
+        <h2 class="option-title">Bloomberg Obsidian & Emerald/Gold</h2>
+        <p class="option-desc">Enfoque institucional de alta densidad de datos. Tablas con filas y columnas ultra legibles y números financieros de alto impacto.</p>
+        <ul class="features-list">
+          <li><strong>Fondo:</strong> Charcoal Profundo (#0A0E17) sin reflejos molestos.</li>
+          <li><strong>Datos:</strong> Resalte en Verde Esmeralda (+14.2M), Cian y Oro Cálido.</li>
+          <li><strong>Tabla:</strong> Cabeceras claras, tipografía compacta y números alineados.</li>
+          <li><strong>Tipografía:</strong> Space Grotesk / Inter con alto contraste blanco (#FFFFFF).</li>
+        </ul>
+        <div class="color-palette">
+          <span style="font-size: 12px; color: var(--text-muted); margin-right: 6px;">Paleta:</span>
+          <div class="color-swatch" style="background: #0A0E17;" title="Charcoal: #0A0E17"></div>
+          <div class="color-swatch" style="background: #F59E0B;" title="Gold: #F59E0B"></div>
+          <div class="color-swatch" style="background: #10B981;" title="Emerald: #10B981"></div>
+          <div class="color-swatch" style="background: #00E5FF;" title="Cyan: #00E5FF"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- OPCIÓN 4 -->
+    <div class="card">
+      <div class="img-container" onclick="openModal('opcion_4_slate_glassmorphism.jpg')">
+        <img src="opcion_4_slate_glassmorphism.jpg" alt="Opción 4: Slate Glassmorphism">
+        <span class="img-hint">🔍 Clic para ampliar</span>
+      </div>
+      <div class="card-body">
+        <div class="option-header">
+          <span class="option-num">Opción 4</span>
+          <span style="background: rgba(147, 51, 234, 0.15); color: #c084fc; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px;">Glass Modern</span>
+        </div>
+        <h2 class="option-title">Slate Glassmorphism Pro (Cristal Suave)</h2>
+        <p class="option-desc">Efecto translúcido con desenfoque de fondo, píldoras activas redondeadas y sombras elegantes de última generación.</p>
+        <ul class="features-list">
+          <li><strong>Fondo:</strong> Slate-900 (#0F172A) con paneles traslúcidos.</li>
+          <li><strong>Interacción:</strong> Píldoras redondeadas con brillo dorado (#FBBF24).</li>
+          <li><strong>Ambiente:</strong> Suave, sofisticado y agradable a la vista.</li>
+          <li><strong>Tipografía:</strong> Inter (pesos 600 y 700 para jerarquía precisa).</li>
+        </ul>
+        <div class="color-palette">
+          <span style="font-size: 12px; color: var(--text-muted); margin-right: 6px;">Paleta:</span>
+          <div class="color-swatch" style="background: #0F172A;" title="Slate-900: #0F172A"></div>
+          <div class="color-swatch" style="background: #1E293B;" title="Slate-800: #1E293B"></div>
+          <div class="color-swatch" style="background: #FBBF24;" title="Gold Pill: #FBBF24"></div>
+          <div class="color-swatch" style="background: #38BDF8;" title="Sky Blue: #38BDF8"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal -->
+  <div id="imageModal" class="modal" onclick="closeModal()">
+    <span class="modal-close" onclick="closeModal()">&times;</span>
+    <img id="modalImg" src="" alt="Vista previa">
+  </div>
+
+  <script>
+    function openModal(src) {
+      document.getElementById('modalImg').src = src;
+      document.getElementById('imageModal').classList.add('active');
+    }
+    function closeModal() {
+      document.getElementById('imageModal').classList.remove('active');
+    }
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') closeModal();
+    });
+  </script>
+</body>
+</html>
