@@ -9,14 +9,15 @@ BASE_DIR = os.path.abspath(os.path.join(_PAGE_DIR, '..', '..'))
 STRATEGIES_DIR = os.path.join(BASE_DIR, 'config', 'strategies')
 
 def render_strategy_catalog(on_edit_strategy=None, on_select_strategy=None):
-    with ui.column().classes('w-full q-pa-md'):
-        # Hero Header
-        with ui.card().classes('w-full bg-slate-900 text-white p-6 rounded-2xl shadow-xl mb-6'):
-            with ui.row().classes('items-center gap-4'):
-                ui.icon('list_alt', size='3rem').classes('text-blue-400')
-                with ui.column().classes('gap-1'):
-                    ui.label('Estrategias Guardadas').classes('text-3xl font-extrabold tracking-tight')
-                    ui.label('Administra, edita o analiza tus configuraciones de trading').classes('text-slate-400 text-sm')
+    with ui.column().classes('w-full q-pa-sm'):
+        # Header Compacto y Optimizado
+        with ui.card().classes('w-full bg-slate-900 text-white rounded-xl shadow border border-slate-800 px-4 py-2.5 mb-3'):
+            with ui.row().classes('items-center gap-2.5'):
+                with ui.row().classes('items-center justify-center w-8 h-8 rounded-lg bg-blue-500/15 border border-blue-500/30 text-blue-400'):
+                    ui.icon('list_alt', size='1.25rem')
+                with ui.column().classes('gap-0'):
+                    ui.label('Estrategias Guardadas').classes('text-base font-bold tracking-tight text-white leading-tight')
+                    ui.label('Administra, edita o analiza tus configuraciones de trading').classes('text-slate-400 text-[11px] leading-tight')
         
         with ui.card().classes('w-full bg-slate-900/50 p-6 rounded-2xl shadow-xl border border-slate-700/50'):
             catalog_columns = [

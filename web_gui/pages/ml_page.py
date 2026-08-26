@@ -4,18 +4,19 @@ from data_layer.storage import SessionLocal, OHLCV
 from ml_engine.model_trainer import MLModelTrainer
 
 def render_ml_page():
-    with ui.column().classes('w-full q-pa-md'):
-        # Hero Header
-        with ui.card().classes('w-full bg-slate-900 text-white p-6 rounded-2xl shadow-xl mb-6'):
-            with ui.row().classes('items-center gap-4'):
-                ui.icon('psychology', size='3rem').classes('text-blue-400')
-                with ui.column().classes('gap-1'):
-                    ui.label('Machine Learning Studio').classes('text-3xl font-extrabold tracking-tight')
-                    ui.label('Entrenamiento de modelos predictivos y análisis').classes('text-slate-400 text-sm')
+    with ui.column().classes('w-full q-pa-sm'):
+        # Header Compacto y Optimizado
+        with ui.card().classes('w-full bg-slate-900 text-white rounded-xl shadow border border-slate-800 px-4 py-2.5 mb-3'):
+            with ui.row().classes('items-center gap-2.5'):
+                with ui.row().classes('items-center justify-center w-8 h-8 rounded-lg bg-purple-500/15 border border-purple-500/30 text-purple-400'):
+                    ui.icon('psychology', size='1.25rem')
+                with ui.column().classes('gap-0'):
+                    ui.label('Machine Learning Studio').classes('text-base font-bold tracking-tight text-white leading-tight')
+                    ui.label('Entrenamiento de modelos predictivos y análisis').classes('text-slate-400 text-[11px] leading-tight')
         
         state = {
             'symbol': 'BTC/USDT',
-            'timeframe': '4h',
+            'timeframe': '1d',
             'model_type': 'Random Forest',
             'status': 'Ready',
             'metrics': None

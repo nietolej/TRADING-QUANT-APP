@@ -56,7 +56,7 @@ def normalize_timeframe(tf: str) -> str:
     o variaciones de texto a los timeframes canónicos de CCXT/DB ('1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w').
     """
     if not tf or not isinstance(tf, str):
-        return '4h'
+        return '1d'
     s = tf.strip().lower()
     mapping = {
         '1m': '1m', '1 minuto': '1m', '1 minutes': '1m', '1min': '1m',

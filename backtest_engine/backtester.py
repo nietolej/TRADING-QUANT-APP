@@ -144,7 +144,7 @@ class Backtester:
             
             # Revisar condiciones de salida o SL/TP si estamos en posición
             if position > 0:
-                # Actualizar Trailing Stop Loss (incluye chandelier)
+                # Actualizar Trailing Stop Loss (incluye chandelier y break-even)
                 current_atr = row.get('ATR', None)
                 sl_price = self.strategy.risk_manager.update_trailing_sl(
                     current_sl=sl_price, 
@@ -152,7 +152,8 @@ class Backtester:
                     current_high=row['high'], 
                     current_low=row['low'], 
                     current_atr=current_atr, 
-                    side="long"
+                    side="long",
+                    entry_price=entry_price
                 )
                 
                 exit_reason = None
@@ -199,7 +200,8 @@ class Backtester:
                     current_high=row['high'], 
                     current_low=row['low'], 
                     current_atr=current_atr, 
-                    side="short"
+                    side="short",
+                    entry_price=entry_price
                 )
                 
                 exit_reason = None

@@ -294,17 +294,18 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
             finally:
                 db.close()
 
-        # Hero Header
-        with ui.card().classes('w-full bg-slate-900 text-white p-6 rounded-2xl shadow-xl mb-6'):
+        # Header Compacto y Optimizado
+        with ui.card().classes('w-full bg-slate-900 text-white rounded-xl shadow border border-slate-800 px-4 py-2.5 mb-3'):
             with ui.row().classes('items-center justify-between w-full'):
-                with ui.row().classes('items-center gap-4'):
-                    ui.icon('analytics', size='3rem').classes('text-blue-400')
-                    with ui.column().classes('gap-1'):
-                        ui.label('Strategy Analyzer').classes('text-3xl font-extrabold tracking-tight')
-                        ui.label('Análisis de estrategia e historial de pruebas retrospectivas').classes('text-slate-400 text-sm')
-                with ui.row().classes('items-center gap-3'):
-                    ui.button('Ver Catálogo', on_click=load_catalog, icon='list').props('rounded').classes('bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-2 shadow-lg transition-all')
-                    ui.button('Historial de Backtests', on_click=load_history, icon='history').props('rounded').classes('bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-4 py-2 shadow-lg transition-all')
+                with ui.row().classes('items-center gap-2.5'):
+                    with ui.row().classes('items-center justify-center w-8 h-8 rounded-lg bg-blue-500/15 border border-blue-500/30 text-blue-400'):
+                        ui.icon('analytics', size='1.25rem')
+                    with ui.column().classes('gap-0'):
+                        ui.label('Strategy Analyzer').classes('text-base font-bold tracking-tight text-white leading-tight')
+                        ui.label('Análisis de estrategia e historial de pruebas retrospectivas').classes('text-slate-400 text-[11px] leading-tight')
+                with ui.row().classes('items-center gap-2'):
+                    ui.button('Ver Catálogo', on_click=load_catalog, icon='list').props('dense size=sm rounded').classes('bg-blue-600 hover:bg-blue-500 text-white font-bold px-3 py-1 text-xs shadow transition-all')
+                    ui.button('Historial de Backtests', on_click=load_history, icon='history').props('dense size=sm rounded').classes('bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-1 text-xs shadow transition-all')
 
         # Rutas absolutas — independientes del directorio de trabajo
         _page_dir = os.path.dirname(os.path.abspath(__file__))
@@ -330,12 +331,13 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
         state = {
             'strategy_name': list(strategies.keys())[0] if strategies else '',
             'symbol': available_symbols[0],
-            'timeframe': '4h',
+            'timeframe': '1d',
             'start_date': '2020-01-01',
             'end_date': datetime.now().strftime('%Y-%m-%d'),
             'capital': 1.0,
             'capital_type': 'BASE',
             'sizing_mode': 'Interés Compuesto (100% Capital)',
+            'fixed_amount': 1.0,
             'commission_pct': 0.1,
             'slippage_pct': 0.05,
             
@@ -351,6 +353,12 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
             'quote_asset': 'USDT',
             'base_asset': 'BTC',
             'custom_parameters': {},
+            'ec_enabled': False,
+            'ec_start_dd': 30.0,
+            'ec_stop_dd': 0.0,
+            'cl_enabled': False,
+            'cl_start': 3,
+            'cl_stop': 0,
             # Reactive display strings for overview cards
             'init_quote_str': '--',
             'init_base_str': '--',
@@ -427,6 +435,13 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                 slip_pct = float(slip_val) if slip_val is not None and str(slip_val).strip() != '' else 0.05
                 sizing_mode = state.get('sizing_mode', 'Interés Compuesto (100% Capital)')
                 
+                # Monto fijo en divisa quote (USDT) si se seleccionó 'Monto Fijo'
+                raw_fixed_val = float(state.get('fixed_amount', cap_val) or cap_val)
+                if state.get('capital_type', 'QUOTE') == 'BASE':
+                    fixed_quote_amt = raw_fixed_val * start_price
+                else:
+                    fixed_quote_amt = raw_fixed_val
+
                 # Ejecutar descarga + simulación en hilo I/O secundario para NO congelar la UI
                 results = await run.io_bound(
                     _sync_load_and_run,
@@ -439,7 +454,8 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                     initial_cap_quote,
                     sizing_mode,
                     comm_pct,
-                    slip_pct
+                    slip_pct,
+                    fixed_quote_amt
                 )
                 
                 with client:
@@ -764,8 +780,8 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                         trades_table.update()
                         
                         def _upd_color(lbl, positive):
-                            lbl.classes(remove='text-white text-gray-900 text-slate-900 text-green-600 text-red-600',
-                                        add='text-green-600' if positive else 'text-red-600')
+                            lbl.classes(remove='text-white text-gray-900 text-slate-900 text-slate-100 text-green-600 text-red-600 text-green-500 text-rose-500',
+                                        add='text-green-500' if positive else 'text-rose-500')
 
                         v_trades_df = results.get("virtual_trades")
                         if state.get('has_virtual') and v_trades_df is not None:
@@ -1006,10 +1022,16 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                 state['capital_type'] = 'BASE'
 
                 lbl_asset_hdr = ui.label(f'Activo inicial ({_init_base}/{_init_quote})').classes('text-xs text-gray-500 mb-1')
+                def _get_active_asset():
+                    sym = state.get('symbol', 'BTC/USDT')
+                    b, q = _parse_assets(sym)
+                    return b if state.get('capital_type', 'BASE') == 'BASE' else q
+
                 def _on_asset_change(e):
                     val = getattr(e, 'value', None) or _asset_opts[1]
                     state['capital_asset'] = val
                     state['capital_type'] = 'QUOTE' if '(CITA)' in val else 'BASE'
+                    _update_sizing_ui()
 
                 capital_type = ui.select(
                     _asset_opts,
@@ -1028,18 +1050,36 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                     state['capital_type'] = 'BASE'
                     lbl_asset_hdr.set_text(f'Activo inicial ({b}/{q})')
                     capital_type.update()
+                    _update_sizing_ui()
 
                 sym_combo.on('update:model-value', _update_asset_combo)
 
         # ── Fila 3: Configuración de Fricción y Tamaño de Posición (Sizing / Comisiones / Slippage) ──
+        if 'fixed_amount' not in state:
+            state['fixed_amount'] = state.get('capital', 1.0)
+
         with ui.row().classes('w-full gap-3 items-end mt-2'):
             with ui.column().classes('flex-1 gap-0'):
                 ui.label('Modo de Posición (Sizing)').classes('text-xs text-gray-500 mb-1')
                 sizing_combo = ui.select(
-                    ['Interés Compuesto (100% Capital)', 'Riesgo Fijo (1% por trade)', 'Monto Fijo ($1000)'],
+                    ['Interés Compuesto (100% Capital)', 'Monto Fijo por Operación', 'Riesgo Fijo (1% por trade)'],
                     label='Modo de Tamaño',
-                    value=state['sizing_mode']
+                    value=state['sizing_mode'] if state.get('sizing_mode') in ['Interés Compuesto (100% Capital)', 'Monto Fijo por Operación', 'Riesgo Fijo (1% por trade)'] else 'Interés Compuesto (100% Capital)'
                 ).bind_value(state, 'sizing_mode').classes('w-full')
+
+            with ui.column().classes('w-44 gap-0') as col_fixed_amt:
+                lbl_fixed_amt = ui.label(f"Monto por Trade ({_get_active_asset()})").classes('text-xs text-gray-500 mb-1')
+                fixed_amt_input = ui.number('Monto Fijo', value=state['fixed_amount'], min=0.000001, step=0.1).bind_value(state, 'fixed_amount').classes('w-full')
+
+            def _update_sizing_ui(e=None):
+                cur_mode = str(state.get('sizing_mode', ''))
+                is_fixed = 'Monto Fijo' in cur_mode
+                col_fixed_amt.set_visibility(is_fixed)
+                lbl_fixed_amt.set_text(f"Monto por Trade ({_get_active_asset()})")
+
+            sizing_combo.on_value_change(_update_sizing_ui)
+            _update_sizing_ui()
+
             with ui.column().classes('flex-1 gap-0'):
                 ui.label('Comisión por Trade (%)').classes('text-xs text-gray-500 mb-1')
                 comm_input = ui.number('Comisión (%)', value=state['commission_pct'], step=0.01, min=0.0).bind_value(state, 'commission_pct').classes('w-full')
@@ -1055,7 +1095,10 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
         with ui.row().classes('w-full gap-3 items-end mt-2 bg-slate-900/50 p-2 rounded border border-slate-800'):
             with ui.column().classes('flex-none gap-0 justify-center h-full'):
                 ui.label('Filtro Drawdown').classes('text-xs text-orange-400 font-bold mb-1')
-                ec_toggle = ui.toggle(['Inactivo', 'Activo'], value='Activo' if state['ec_enabled'] else 'Inactivo').props('color=orange size=sm').classes('mt-1')
+                ec_toggle = ui.toggle(
+                    ['Inactivo', 'Activo'],
+                    value='Activo' if state.get('ec_enabled', False) else 'Inactivo'
+                ).props('toggle-color=amber-8 color=grey-9 text-color=grey-4 toggle-text-color=white size=sm no-caps').classes('mt-1')
                 def _on_ec_toggle(e):
                     state['ec_enabled'] = (e.value == 'Activo')
                 ec_toggle.on_value_change(_on_ec_toggle)
@@ -1073,8 +1116,11 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
 
         with ui.row().classes('w-full gap-3 items-end mt-2 bg-slate-900/50 p-2 rounded border border-slate-800'):
             with ui.column().classes('flex-none gap-0 justify-center h-full'):
-                ui.label('Filtro Perdedoras Consec.').classes('text-xs text-rose-400 font-bold mb-1')
-                cl_toggle = ui.toggle(['Inactivo', 'Activo'], value='Activo' if state['cl_enabled'] else 'Inactivo').props('color=rose size=sm').classes('mt-1')
+                ui.label('Filtro Perdedoras Consec.').classes('text-xs text-orange-400 font-bold mb-1')
+                cl_toggle = ui.toggle(
+                    ['Inactivo', 'Activo'],
+                    value='Activo' if state.get('cl_enabled', False) else 'Inactivo'
+                ).props('toggle-color=amber-8 color=grey-9 text-color=grey-4 toggle-text-color=white size=sm no-caps').classes('mt-1')
                 def _on_cl_toggle(e):
                     state['cl_enabled'] = (e.value == 'Activo')
                 cl_toggle.on_value_change(_on_cl_toggle)
@@ -1111,371 +1157,6 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                 '📋 HISTORIAL',
                 on_click=load_history
             ).classes('bg-slate-700 hover:bg-slate-800 text-white font-bold py-3 px-5 shadow')
-
-            btn_optimizer = ui.button(
-                'EJECUTAR OPTIMIZADOR (BÚSQUEDA EN CUADRÍCULA)'
-            ).classes('bg-purple-600 hover:bg-purple-700 text-white font-bold flex-1 py-3')
-
-        # ════════════════════════════════════════════════════════
-        # DIALOG DEL OPTIMIZADOR
-        # ════════════════════════════════════════════════════════
-        with ui.dialog().props('maximized') as optimizer_dialog, \
-             ui.card().classes('w-full h-full q-pa-md overflow-auto'):
-
-            # ── Encabezado ──
-            with ui.row().classes('w-full justify-between items-center mb-4'):
-                ui.label('Optimizador — Búsqueda en Cuadrícula').classes('text-2xl font-bold text-purple-700')
-                ui.button(icon='close', on_click=optimizer_dialog.close).props('flat round')
-
-            ui.label(
-                'Define el rango de cada parámetro (mínimo, máximo, paso). '
-                'El optimizador probará TODAS las combinaciones posibles.'
-            ).classes('text-sm text-gray-500 mb-4')
-
-            # ── Información de combinaciones ──
-            lbl_combo_info = ui.label('').classes('text-sm font-semibold text-blue-700 mb-2')
-
-            # ── Contenedor de rangos (se llena dinámicamente) ──
-            opt_ranges_container = ui.column().classes('w-full gap-2')
-            opt_ranges: dict = {}   # { param_name: {'min': el, 'max': el, 'step': el} }
-
-            # ── Métrica de optimización ──
-            with ui.row().classes('items-center gap-4 mt-2 mb-4'):
-                ui.label('Optimizar por:').classes('font-semibold')
-                opt_metric = ui.select(
-                    {'sharpe_ratio': 'Coeficiente de Sharpe',
-                     'cagr': 'CAGR (%)',
-                     'net_pnl': 'PnL Neto',
-                     'max_drawdown_pct': 'Menor Reducción Máxima'},
-                    value='sharpe_ratio'
-                ).classes('w-64')
-
-            # ── Barra de progreso ──
-            opt_progress = ui.linear_progress(value=0).classes('w-full').props('color=purple')
-            lbl_progress = ui.label('').classes('text-xs text-gray-500 mt-1')
-
-            # ── Tabla de resultados ──
-            opt_result_cols = [
-                {'name': 'rank',          'label': '#',           'field': 'rank',         'sortable': True,  'align': 'center'},
-                {'name': 'params',        'label': 'Parámetros',  'field': 'params',       'sortable': False, 'align': 'left'},
-                {'name': 'sharpe',        'label': 'Sharpe',      'field': 'sharpe',       'sortable': True,  'align': 'right'},
-                {'name': 'cagr',          'label': 'CAGR',        'field': 'cagr',         'sortable': True,  'align': 'right'},
-                {'name': 'maxdd',         'label': 'Max DD',      'field': 'maxdd',        'sortable': True,  'align': 'right'},
-                {'name': 'profit_factor', 'label': 'PF',          'field': 'profit_factor','sortable': True,  'align': 'right'},
-                {'name': 'trades',        'label': 'Trades',      'field': 'trades',       'sortable': True,  'align': 'right'},
-                {'name': 'wins',          'label': 'Wins',        'field': 'wins',         'sortable': True,  'align': 'right'},
-                {'name': 'losses',        'label': 'Losses',      'field': 'losses',       'sortable': True,  'align': 'right'},
-                {'name': 'win_rate',      'label': 'Win Rate',    'field': 'win_rate',     'sortable': True,  'align': 'right'},
-                {'name': 'cons_losses',   'label': 'Max L-Seq',   'field': 'cons_losses',  'sortable': True,  'align': 'right'},
-                {'name': 'init_cap',      'label': 'Cap. Inicial','field': 'init_cap',    'sortable': True,  'align': 'right'},
-                {'name': 'final_eq',      'label': 'Balance Final','field': 'final_eq',   'sortable': True,  'align': 'right'},
-                {'name': 'pnl',           'label': 'PnL',         'field': 'pnl',          'sortable': True,  'align': 'right'},
-            ]
-            opt_result_table = ui.table(
-                columns=opt_result_cols, rows=[], row_key='rank'
-            ).props('dense flat').classes('w-full mt-4 text-sm font-medium')
-            opt_result_table.add_slot('body-cell-rank', '''
-                <q-td :props="props">
-                    <q-badge :color="props.value <= 3 ? 'purple' : 'grey-6'" :label="'#' + props.value" />
-                </q-td>
-            ''')
-            opt_result_table.add_slot('body-cell-sharpe', '''
-                <q-td :props="props">
-                    <span :style="{color: props.value >= 1 ? '#16a34a' : props.value >= 0 ? '#d97706' : '#dc2626',
-                                   fontWeight: 'bold'}">
-                        {{ props.value }}
-                    </span>
-                </q-td>
-            ''')
-            opt_result_table.add_slot('body-cell-cagr', '''
-                <q-td :props="props">
-                    <span :style="{color: props.value >= 0 ? '#16a34a' : '#dc2626', fontWeight:'bold'}">
-                        {{ props.value }}%
-                    </span>
-                </q-td>
-            ''')
-
-            # ── Dialog para mostrar trades de una simulación ──
-            with ui.dialog().props('maximized') as opt_trades_dialog, \
-                 ui.card().classes('w-full h-full q-pa-md overflow-auto bg-gray-900 text-white'):
-                with ui.row().classes('w-full justify-between items-center mb-4'):
-                    lbl_opt_trades_title = ui.label('Operaciones de la simulación').classes('text-2xl font-bold text-blue-400')
-                    ui.button(icon='close', on_click=opt_trades_dialog.close).props('flat round text-white')
-                
-                opt_trades_cols = [
-                    {'name': 'id',           'label': 'ID',          'field': 'id',           'sortable': True, 'align': 'left'},
-                    {'name': 'entry_time',   'label': 'Entrada',     'field': 'entry_time',   'sortable': True, 'align': 'left'},
-                    {'name': 'exit_time',    'label': 'Salida',      'field': 'exit_time',    'sortable': True, 'align': 'left'},
-                    {'name': 'side',         'label': 'Lado',        'field': 'side',         'sortable': True, 'align': 'center'},
-                    {'name': 'entry_price',  'label': 'P.Ent.',      'field': 'entry_price',  'sortable': True, 'align': 'right'},
-                    {'name': 'exit_price',   'label': 'P.Sal.',      'field': 'exit_price',   'sortable': True, 'align': 'right'},
-                    {'name': 'pnl_pct',      'label': '%PnL',        'field': 'pnl_pct',      'sortable': True, 'align': 'right'},
-                    {'name': 'pnl_quote',    'label': 'PnL',         'field': 'pnl_quote',    'sortable': True, 'align': 'right'},
-                    {'name': 'exit_reason',  'label': 'Razón',       'field': 'exit_reason',  'sortable': True, 'align': 'center'},
-                ]
-                opt_trades_table = ui.table(columns=opt_trades_cols, rows=[], row_key='id').classes('w-full').props('dark')
-
-            async def _on_opt_row_click(e):
-                row = e.args[1]
-                raw_params = row.get('raw_params')
-                if not raw_params: return
-                
-                df_opt = state.get('opt_df')
-                initial_cap = state.get('opt_initial_cap')
-                if df_opt is None or df_opt.empty:
-                    ui.notify('Los datos de mercado no están disponibles.', type='warning')
-                    return
-                    
-                file_path = strategies.get(state['strategy_name'])
-                with open(file_path, 'r', encoding='utf-8') as fh:
-                    base_config = yaml.safe_load(fh)
-                    
-                strategy = BaseStrategy(base_config, custom_parameters=raw_params)
-                bt = Backtester(strategy, initial_capital=initial_cap)
-                
-                ui.notify(f'Calculando operaciones para {row.get("params")}...', type='info')
-                run_result = await run.io_bound(bt.run, df_opt)
-                trades_df = run_result.get('trades')
-                
-                if trades_df is None or trades_df.empty:
-                    ui.notify('No hubo operaciones en esta simulación.', type='warning')
-                    return
-                    
-                trades_rows = []
-                for i, (_, tr) in enumerate(trades_df.iterrows()):
-                    ent_p = float(tr.get('entry_price', 1))
-                    ex_p = float(tr.get('exit_price', 1))
-                    side = str(tr.get('side', '')).upper()
-                    
-                    if ent_p > 0:
-                        pnl_pct_val = ((ex_p - ent_p) / ent_p * 100) if side == 'LONG' else ((ent_p - ex_p) / ent_p * 100)
-                    else:
-                        pnl_pct_val = 0.0
-                        
-                    trades_rows.append({
-                        'id': i + 1,
-                        'entry_time': str(tr.get('entry_time', ''))[:16].replace('T', ' '),
-                        'exit_time': str(tr.get('exit_time', ''))[:16].replace('T', ' '),
-                        'side': side,
-                        'entry_price': f"{ent_p:,.2f}",
-                        'exit_price': f"{ex_p:,.2f}",
-                        'pnl_pct': f"{pnl_pct_val:+.2f}%",
-                        'pnl_quote': f"{float(tr.get('pnl', 0)):+,.2f}",
-                        'exit_reason': str(tr.get('exit_reason', ''))
-                    })
-                    
-                opt_trades_table.rows = trades_rows
-                lbl_opt_trades_title.set_text(f'Operaciones: {row.get("params")}')
-                opt_trades_dialog.open()
-
-            opt_result_table.on('rowClick', _on_opt_row_click)
-
-            btn_run_opt = ui.button(
-                'INICIAR OPTIMIZADOR',
-                icon='play_arrow'
-            ).classes('bg-purple-700 text-white font-bold mt-4 w-full py-3')
-
-            # ── Funciones del optimizador ──
-            def _build_opt_ranges_ui():
-                """Reconstruye la UI de rangos cuando cambia la estrategia."""
-                opt_ranges_container.clear()
-                opt_ranges.clear()
-                preview_labels = {}
-                file_path = strategies.get(state['strategy_name'])
-                if not file_path or not os.path.exists(file_path):
-                    return
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        cfg = yaml.safe_load(f)
-                    params = cfg.get('parameters', {})
-                    if not params:
-                        with opt_ranges_container:
-                            ui.label('Esta estrategia no tiene parámetros editables.').classes('text-gray-400')
-                        return
-
-                    # Encabezado de columnas
-                    with opt_ranges_container:
-                        with ui.row().classes('w-full gap-2 font-semibold text-xs text-gray-500 border-b pb-1'):
-                            ui.label('Parámetro').classes('w-36')
-                            ui.label('Valor actual').classes('w-28 text-center')
-                            ui.label('Mínimo').classes('flex-1')
-                            ui.label('Máximo').classes('flex-1')
-                            ui.label('Paso').classes('flex-1')
-                            ui.label('Valores a probar').classes('w-48')
-
-                        for p_name, p_val in params.items():
-                            try:
-                                p_num = float(p_val)
-                            except (ValueError, TypeError):
-                                continue  # Saltamos parámetros no numéricos
-
-                            # Estado de rango para este parámetro
-                            r = {'min': p_num, 'max': p_num * 3 if p_num > 0 else 10, 'step': max(1.0, p_num)}
-                            opt_ranges[p_name] = r
-
-                            def _update_preview(pn, pl):
-                                cfg_r = opt_ranges[pn]
-                                try:
-                                    mn = float(cfg_r['min']); mx = float(cfg_r['max']); st = float(cfg_r['step'])
-                                    vals = []
-                                    v = mn
-                                    while v <= mx + 1e-9:
-                                        vals.append(int(v) if float(v) == int(v) else round(v, 4))
-                                        v += st
-                                        if len(vals) > 20: vals.append('...'); break
-                                    combo_count = count_combinations(opt_ranges)
-                                    pl.set_text(', '.join(str(x) for x in vals))
-                                    lbl_combo_info.set_text(
-                                        f'ℹ️  Total combinaciones: {combo_count:,}  '
-                                        f'(tiempo estimado: ~{max(1, combo_count // 5)}s)'
-                                    )
-                                except Exception:
-                                    pl.set_text('?')
-
-                            with ui.row().classes('w-full gap-2 items-center py-1 border-b border-gray-100'):
-                                ui.label(p_name).classes('w-36 font-bold text-purple-800')
-                                ui.label(str(int(p_num) if p_num == int(p_num) else p_num)).classes('w-28 text-center text-gray-600 text-sm')
-
-                                def _mk_field(key, pn=p_name):
-                                    def _on_change(e, k=key, n=pn):
-                                        try:
-                                            if e.value is not None:
-                                                opt_ranges[n][k] = float(e.value)
-                                                if n in preview_labels:
-                                                    _update_preview(n, preview_labels[n])
-                                        except Exception:
-                                            pass
-                                    inp = ui.number(
-                                        label=key.capitalize(),
-                                        value=opt_ranges[pn][key],
-                                        format='%.4g',
-                                        on_change=_on_change
-                                    ).classes('flex-1')
-                                    return inp
-
-                                _mk_field('min')
-                                _mk_field('max')
-                                _mk_field('step')
-                                
-                                plbl = ui.label('').classes('w-48 text-xs text-blue-700 font-mono self-center')
-                                preview_labels[p_name] = plbl
-
-                            _update_preview(p_name, preview_labels[p_name])
-
-                except Exception as ex:
-                    with opt_ranges_container:
-                        ui.label(f'Error cargando parámetros: {ex}').classes('text-red-500')
-
-            def open_optimizer():
-                _build_opt_ranges_ui()
-                optimizer_dialog.open()
-
-            btn_optimizer.on_click(open_optimizer)
-
-            async def _run_optimizer():
-                if not state['strategy_name']:
-                    ui.notify('No hay estrategia seleccionada', type='warning')
-                    return
-                if not opt_ranges:
-                    ui.notify('No hay parámetros de rango definidos', type='warning')
-                    return
-
-                file_path = strategies.get(state['strategy_name'])
-                if not file_path:
-                    ui.notify('No se encontró el archivo de estrategia', type='warning')
-                    return
-
-                total_combos = count_combinations(opt_ranges)
-                if total_combos > 2000:
-                    ui.notify(
-                        f'El grid tiene {total_combos:,} combinaciones. Reduce los rangos para evitar tiempos muy largos.',
-                        type='warning', timeout=5000
-                    )
-
-                btn_run_opt.set_text(f'Calculando... (0/{total_combos})')
-                btn_run_opt.props('disabled')
-                opt_progress.value = 0
-                lbl_progress.set_text(f'0 / {total_combos} combinaciones probadas')
-                opt_result_table.rows = []
-                opt_result_table.update()
-
-                # Cargar datos del mercado
-                try:
-                    start_dt = datetime.strptime(state['start_date'], '%Y-%m-%d').replace(tzinfo=timezone.utc)
-                    end_dt = datetime.strptime(state['end_date'], '%Y-%m-%d').replace(hour=23, minute=59, tzinfo=timezone.utc)
-                    db = SessionLocal()
-                    market_mgr = MarketDataManager(db)
-                    df_opt = market_mgr.get_data(state['symbol'], state['timeframe'], start_dt, end_dt)
-                    db.close()
-                except Exception as ex:
-                    ui.notify(f'Error cargando datos: {ex}', type='negative')
-                    btn_run_opt.set_text('INICIAR OPTIMIZADOR')
-                    btn_run_opt.props(remove='disabled')
-                    return
-
-                if df_opt.empty:
-                    ui.notify('No hay datos para el par/periodo seleccionado. Descarga primero los datos.', type='warning')
-                    btn_run_opt.set_text('INICIAR OPTIMIZADOR')
-                    btn_run_opt.props(remove='disabled')
-                    return
-
-                # Capital inicial
-                start_price = df_opt.iloc[0]['open'] if not df_opt.empty else 1.0
-                if state.get('capital_type', 'QUOTE') == 'BASE':
-                    initial_cap = state['capital'] * start_price
-                else:
-                    initial_cap = state['capital']
-                    
-                state['opt_df'] = df_opt
-                state['opt_initial_cap'] = initial_cap
-
-                done_counter = [0]
-                def _progress(done, total):
-                    done_counter[0] = done
-
-                # Ejecutar en hilo para no bloquear la UI
-                import copy
-                param_ranges_copy = copy.deepcopy(opt_ranges)
-                metric_key = opt_metric.value
-
-                results = await run.io_bound(
-                    lambda: run_grid_search(
-                        file_path, df_opt, initial_cap,
-                        param_ranges_copy, metric_key, _progress
-                    )
-                )
-
-                # Mostrar resultados
-                rows = []
-                for i, r in enumerate(results, 1):
-                    param_str = '  |  '.join(f"{k}={v}" for k, v in r['params'].items())
-                    rows.append({
-                        'rank': i,
-                        'params': param_str,
-                        'raw_params': r['params'],
-                        'sharpe': r['sharpe_ratio'],
-                        'cagr': r['cagr'],
-                        'maxdd': f"{r['max_drawdown_pct']:.2f}%",
-                        'profit_factor': r.get('profit_factor', 0),
-                        'trades': r['total_trades'],
-                        'wins': r.get('winning_trades', 0),
-                        'losses': r.get('losing_trades', 0),
-                        'win_rate': f"{r.get('percent_profitable', 0):.2f}%",
-                        'cons_losses': r.get('max_consecutive_losers', 0),
-                        'init_cap': r.get('initial_capital', 0),
-                        'final_eq': r.get('final_equity', 0),
-                        'pnl': r['net_pnl'],
-                    })
-
-                opt_result_table.rows = rows
-                opt_result_table.update()
-                opt_progress.value = 1.0
-                lbl_progress.set_text(f'{len(results)} combinaciones completadas — ordenadas por {metric_key}')
-                btn_run_opt.set_text('INICIAR OPTIMIZADOR')
-                btn_run_opt.props(remove='disabled')
-                ui.notify(f'Optimización completa: {len(results)} combinaciones', type='positive')
-
-            btn_run_opt.on('click', lambda: asyncio.ensure_future(_run_optimizer()))
 
         ui.label('Strategy Parameters').classes('text-lg font-bold mt-6')
         params_container = ui.row().classes('w-full gap-4 flex-wrap mb-4')
@@ -1548,113 +1229,113 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
         lbl_real_title = ui.label('Resumen de resultados (ESTRATEGIA ORIGINAL)').classes('text-xl font-bold')
         lbl_real_title.bind_text_from(state, 'has_virtual', lambda h: 'Resumen de resultados (REAL CON FILTRO)' if h else 'Resumen de resultados (ESTRATEGIA ORIGINAL)')
         with ui.row().classes('w-full gap-4 mt-4 flex-wrap'):
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                ui.label('CAGR').classes('text-sm text-gray-500')
-                lbl_cagr = ui.label('-- %').classes('text-2xl font-bold text-green-600')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                ui.label('Reducción máxima').classes('text-sm text-gray-500')
-                lbl_maxdd = ui.label('-- %').classes('text-2xl font-bold text-red-600')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                ui.label('Coeficiente de Sharpe').classes('text-sm text-gray-500')
-                lbl_sharpe = ui.label('--').classes('text-2xl font-bold text-blue-600')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                ui.label('Profit Factor').classes('text-sm text-gray-500')
-                lbl_profit_factor = ui.label('--').classes('text-2xl font-bold text-indigo-600')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                ui.label('Comercios totales').classes('text-sm text-gray-500')
-                lbl_total_trades = ui.label('--').classes('text-2xl font-bold text-gray-900')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                ui.label('Ganadoras').classes('text-sm text-gray-500')
-                lbl_win_trades = ui.label('--').classes('text-2xl font-bold text-green-600')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                ui.label('Perdedoras').classes('text-sm text-gray-500')
-                lbl_lose_trades = ui.label('--').classes('text-2xl font-bold text-red-600')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                ui.label('% Ganadoras').classes('text-sm text-gray-500')
-                lbl_win_rate = ui.label('-- %').classes('text-2xl font-bold text-gray-900')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                ui.label('Perdedoras consec.').classes('text-sm text-gray-500')
-                lbl_max_cons_losers = ui.label('--').classes('text-2xl font-bold text-orange-600')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                lbl_hdr_init_q = ui.label('Capital Inicial (CITA)').classes('text-sm text-gray-500')
-                lbl_init_quote = ui.label('--').classes('text-2xl font-bold text-gray-900')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                lbl_hdr_init_b = ui.label('Capital Inicial (BASE)').classes('text-sm text-gray-500')
-                lbl_init_base = ui.label('--').classes('text-2xl font-bold text-gray-900')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                lbl_hdr_bal_q = ui.label('Saldo final (CITA)').classes('text-sm text-gray-500')
-                lbl_bal_quote = ui.label('--').classes('text-2xl font-bold text-gray-900')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                lbl_hdr_bal_b = ui.label('Saldo final (BASE)').classes('text-sm text-gray-500')
-                lbl_bal_base = ui.label('--').classes('text-2xl font-bold text-gray-900')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                lbl_hdr_pnl_q = ui.label('Total de pérdidas y ganancias (CITA)').classes('text-sm text-gray-500')
-                lbl_pnl_quote = ui.label('--').classes('text-2xl font-bold text-gray-900')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                lbl_hdr_pnl_b = ui.label('Total de pérdidas y ganancias (BASE)').classes('text-sm text-gray-500')
-                lbl_pnl_base = ui.label('--').classes('text-2xl font-bold text-gray-900')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                ui.label('Deslizamiento Acumulado').classes('text-sm text-gray-500')
-                lbl_cfg_slip = ui.label('--').classes('text-xl font-bold text-gray-600')
-            with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                ui.label('Comisión Acumulada').classes('text-sm text-gray-500')
-                lbl_cfg_comm = ui.label('--').classes('text-xl font-bold text-gray-600')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                ui.label('CAGR').classes('text-sm text-slate-400')
+                lbl_cagr = ui.label('-- %').classes('text-2xl font-bold text-green-500')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                ui.label('Reducción máxima').classes('text-sm text-slate-400')
+                lbl_maxdd = ui.label('-- %').classes('text-2xl font-bold text-rose-500')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                ui.label('Coeficiente de Sharpe').classes('text-sm text-slate-400')
+                lbl_sharpe = ui.label('--').classes('text-2xl font-bold text-blue-400')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                ui.label('Profit Factor').classes('text-sm text-slate-400')
+                lbl_profit_factor = ui.label('--').classes('text-2xl font-bold text-indigo-400')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                ui.label('Comercios totales').classes('text-sm text-slate-400')
+                lbl_total_trades = ui.label('--').classes('text-2xl font-bold text-slate-100')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                ui.label('Ganadoras').classes('text-sm text-slate-400')
+                lbl_win_trades = ui.label('--').classes('text-2xl font-bold text-green-500')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                ui.label('Perdedoras').classes('text-sm text-slate-400')
+                lbl_lose_trades = ui.label('--').classes('text-2xl font-bold text-rose-500')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                ui.label('% Ganadoras').classes('text-sm text-slate-400')
+                lbl_win_rate = ui.label('-- %').classes('text-2xl font-bold text-slate-100')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                ui.label('Perdedoras consec.').classes('text-sm text-slate-400')
+                lbl_max_cons_losers = ui.label('--').classes('text-2xl font-bold text-amber-500')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                lbl_hdr_init_q = ui.label('Capital Inicial (CITA)').classes('text-sm text-slate-400')
+                lbl_init_quote = ui.label('--').classes('text-2xl font-bold text-blue-400')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                lbl_hdr_init_b = ui.label('Capital Inicial (BASE)').classes('text-sm text-slate-400')
+                lbl_init_base = ui.label('--').classes('text-2xl font-bold text-amber-400')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                lbl_hdr_bal_q = ui.label('Saldo final (CITA)').classes('text-sm text-slate-400')
+                lbl_bal_quote = ui.label('--').classes('text-2xl font-bold text-slate-100')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                lbl_hdr_bal_b = ui.label('Saldo final (BASE)').classes('text-sm text-slate-400')
+                lbl_bal_base = ui.label('--').classes('text-2xl font-bold text-slate-100')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                lbl_hdr_pnl_q = ui.label('Total P&L (CITA)').classes('text-sm text-slate-400')
+                lbl_pnl_quote = ui.label('--').classes('text-2xl font-bold text-slate-100')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                lbl_hdr_pnl_b = ui.label('Total P&L (BASE)').classes('text-sm text-slate-400')
+                lbl_pnl_base = ui.label('--').classes('text-2xl font-bold text-slate-100')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                ui.label('Deslizamiento Acumulado').classes('text-sm text-slate-400')
+                lbl_cfg_slip = ui.label('--').classes('text-xl font-bold text-slate-300')
+            with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                ui.label('Comisión Acumulada').classes('text-sm text-slate-400')
+                lbl_cfg_comm = ui.label('--').classes('text-xl font-bold text-slate-300')
                 
         v_summary_container = ui.column().classes('w-full').bind_visibility_from(state, 'has_virtual')
         with v_summary_container:
             ui.label('Resumen de resultados (VIRTUAL SIN FILTRO)').classes('text-xl font-bold mt-8')
             with ui.row().classes('w-full gap-4 mt-4 flex-wrap'):
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    ui.label('CAGR').classes('text-sm text-gray-500')
-                    v_lbl_cagr = ui.label('-- %').classes('text-2xl font-bold text-green-600')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    ui.label('Reducción máxima').classes('text-sm text-gray-500')
-                    v_lbl_maxdd = ui.label('-- %').classes('text-2xl font-bold text-red-600')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    ui.label('Coeficiente de Sharpe').classes('text-sm text-gray-500')
-                    v_lbl_sharpe = ui.label('--').classes('text-2xl font-bold text-blue-600')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    ui.label('Profit Factor').classes('text-sm text-gray-500')
-                    v_lbl_profit_factor = ui.label('--').classes('text-2xl font-bold text-indigo-600')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    ui.label('Comercios totales').classes('text-sm text-gray-500')
-                    v_lbl_total_trades = ui.label('--').classes('text-2xl font-bold text-gray-900')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    ui.label('Ganadoras').classes('text-sm text-gray-500')
-                    v_lbl_win_trades = ui.label('--').classes('text-2xl font-bold text-green-600')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    ui.label('Perdedoras').classes('text-sm text-gray-500')
-                    v_lbl_lose_trades = ui.label('--').classes('text-2xl font-bold text-red-600')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    ui.label('% Ganadoras').classes('text-sm text-gray-500')
-                    v_lbl_win_rate = ui.label('-- %').classes('text-2xl font-bold text-gray-900')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    ui.label('Perdedoras consec.').classes('text-sm text-gray-500')
-                    v_lbl_max_cons_losers = ui.label('--').classes('text-2xl font-bold text-orange-600')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    v_lbl_hdr_init_q = ui.label('Capital Inicial (CITA)').classes('text-sm text-gray-500')
-                    v_lbl_init_quote = ui.label('--').classes('text-2xl font-bold text-gray-900')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    v_lbl_hdr_init_b = ui.label('Capital Inicial (BASE)').classes('text-sm text-gray-500')
-                    v_lbl_init_base = ui.label('--').classes('text-2xl font-bold text-gray-900')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    v_lbl_hdr_bal_q = ui.label('Saldo final (CITA)').classes('text-sm text-gray-500')
-                    v_lbl_bal_quote = ui.label('--').classes('text-2xl font-bold text-gray-900')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    v_lbl_hdr_bal_b = ui.label('Saldo final (BASE)').classes('text-sm text-gray-500')
-                    v_lbl_bal_base = ui.label('--').classes('text-2xl font-bold text-gray-900')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    v_lbl_hdr_pnl_q = ui.label('Total de pérdidas y ganancias (CITA)').classes('text-sm text-gray-500')
-                    v_lbl_pnl_quote = ui.label('--').classes('text-2xl font-bold text-gray-900')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    v_lbl_hdr_pnl_b = ui.label('Total de pérdidas y ganancias (BASE)').classes('text-sm text-gray-500')
-                    v_lbl_pnl_base = ui.label('--').classes('text-2xl font-bold text-gray-900')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    ui.label('Deslizamiento Acumulado').classes('text-sm text-gray-500')
-                    v_lbl_cfg_slip = ui.label('--').classes('text-xl font-bold text-gray-600')
-                with ui.card().classes('flex-1 items-center p-4 bg-gray-50 min-w-[150px]'):
-                    ui.label('Comisión Acumulada').classes('text-sm text-gray-500')
-                    v_lbl_cfg_comm = ui.label('--').classes('text-xl font-bold text-gray-600')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    ui.label('CAGR').classes('text-sm text-slate-400')
+                    v_lbl_cagr = ui.label('-- %').classes('text-2xl font-bold text-green-500')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    ui.label('Reducción máxima').classes('text-sm text-slate-400')
+                    v_lbl_maxdd = ui.label('-- %').classes('text-2xl font-bold text-rose-500')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    ui.label('Coeficiente de Sharpe').classes('text-sm text-slate-400')
+                    v_lbl_sharpe = ui.label('--').classes('text-2xl font-bold text-blue-400')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    ui.label('Profit Factor').classes('text-sm text-slate-400')
+                    v_lbl_profit_factor = ui.label('--').classes('text-2xl font-bold text-indigo-400')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    ui.label('Comercios totales').classes('text-sm text-slate-400')
+                    v_lbl_total_trades = ui.label('--').classes('text-2xl font-bold text-slate-100')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    ui.label('Ganadoras').classes('text-sm text-slate-400')
+                    v_lbl_win_trades = ui.label('--').classes('text-2xl font-bold text-green-500')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    ui.label('Perdedoras').classes('text-sm text-slate-400')
+                    v_lbl_lose_trades = ui.label('--').classes('text-2xl font-bold text-rose-500')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    ui.label('% Ganadoras').classes('text-sm text-slate-400')
+                    v_lbl_win_rate = ui.label('-- %').classes('text-2xl font-bold text-slate-100')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    ui.label('Perdedoras consec.').classes('text-sm text-slate-400')
+                    v_lbl_max_cons_losers = ui.label('--').classes('text-2xl font-bold text-amber-500')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    v_lbl_hdr_init_q = ui.label('Capital Inicial (CITA)').classes('text-sm text-slate-400')
+                    v_lbl_init_quote = ui.label('--').classes('text-2xl font-bold text-blue-400')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    v_lbl_hdr_init_b = ui.label('Capital Inicial (BASE)').classes('text-sm text-slate-400')
+                    v_lbl_init_base = ui.label('--').classes('text-2xl font-bold text-amber-400')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    v_lbl_hdr_bal_q = ui.label('Saldo final (CITA)').classes('text-sm text-slate-400')
+                    v_lbl_bal_quote = ui.label('--').classes('text-2xl font-bold text-slate-100')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    v_lbl_hdr_bal_b = ui.label('Saldo final (BASE)').classes('text-sm text-slate-400')
+                    v_lbl_bal_base = ui.label('--').classes('text-2xl font-bold text-slate-100')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    v_lbl_hdr_pnl_q = ui.label('Total P&L (CITA)').classes('text-sm text-slate-400')
+                    v_lbl_pnl_quote = ui.label('--').classes('text-2xl font-bold text-slate-100')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    v_lbl_hdr_pnl_b = ui.label('Total P&L (BASE)').classes('text-sm text-slate-400')
+                    v_lbl_pnl_base = ui.label('--').classes('text-2xl font-bold text-slate-100')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    ui.label('Deslizamiento Acumulado').classes('text-sm text-slate-400')
+                    v_lbl_cfg_slip = ui.label('--').classes('text-xl font-bold text-slate-300')
+                with ui.card().classes('flex-1 items-center p-4 bg-slate-900/80 border border-slate-800 rounded-xl min-w-[150px] shadow'):
+                    ui.label('Comisión Acumulada').classes('text-sm text-slate-400')
+                    v_lbl_cfg_comm = ui.label('--').classes('text-xl font-bold text-slate-300')
 
         # ════════════════════════════════════════════════════════
         # PANEL DE CONTROL DE GRÁFICO Y INDICADORES TRADINGVIEW / NT8
@@ -2047,7 +1728,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                 </q-tr>
             ''')
 
-        def _sync_load_and_run(strategy_path, custom_params, symbol, timeframe, start_dt, end_dt, initial_capital, sizing_mode, comm_pct, slip_pct):
+        def _sync_load_and_run(strategy_path, custom_params, symbol, timeframe, start_dt, end_dt, initial_capital, sizing_mode, comm_pct, slip_pct, fixed_quote_amt=None):
             db = SessionLocal()
             try:
                 market_mgr = MarketDataManager(db)
@@ -2066,10 +1747,11 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                 if 'risk_management' not in strategy.config:
                     strategy.config['risk_management'] = {}
                     
-                if 'Riesgo Fijo' in sizing_mode:
+                if 'Riesgo Fijo' in str(sizing_mode):
                     strategy.config['risk_management']['position_sizing'] = {'method': 'fixed_fractional', 'risk_per_trade_pct': 1.0}
-                elif 'Monto Fijo' in sizing_mode:
-                    strategy.config['risk_management']['position_sizing'] = {'method': 'fixed_amount', 'value': 1000.0}
+                elif 'Monto Fijo' in str(sizing_mode):
+                    f_val = fixed_quote_amt if fixed_quote_amt is not None else initial_capital
+                    strategy.config['risk_management']['position_sizing'] = {'method': 'fixed_amount', 'value': f_val}
                 else:
                     strategy.config['risk_management']['position_sizing'] = {'method': 'compounding', 'value': 100.0}
                     
@@ -2079,9 +1761,9 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                 ec_config = strategy.config.get('equity_curve_management', {})
                 
                 # Drawdown Filter
-                dd_enabled = state.get('ec_enabled', False) or ec_config.get('enabled', False)
+                dd_enabled = bool(state.get('ec_enabled', False))
                 # Consecutive Losers Filter
-                cl_enabled = state.get('cl_enabled', False)
+                cl_enabled = bool(state.get('cl_enabled', False))
                 
                 # Buscar en custom parameters primero (útil para el optimizador)
                 params = strategy.parameters
@@ -2347,7 +2029,7 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
         portfolio_state = {
             'items': [
                 {'strategy': list(strategies.keys())[0] if strategies else '', 'symbol': available_symbols[0], 'timeframe': '1d', 'weight_pct': 50.0},
-                {'strategy': list(strategies.keys())[0] if strategies else '', 'symbol': available_symbols[min(1, len(available_symbols)-1)], 'timeframe': '4h', 'weight_pct': 50.0}
+                {'strategy': list(strategies.keys())[0] if strategies else '', 'symbol': available_symbols[min(1, len(available_symbols)-1)], 'timeframe': '1d', 'weight_pct': 50.0}
             ]
         }
 

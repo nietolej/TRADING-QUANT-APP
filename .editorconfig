@@ -1,0 +1,32 @@
+# EditorConfig configuration
+# Reference: https://editorconfig.org
+
+root = true
+
+# Reglas globales por defecto
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Archivos de código Python
+[*.py]
+indent_style = space
+indent_size = 4
+max_line_length = 100
+
+# Archivos de configuración y frontend (JSON, YAML, CSS, HTML, JS)
+[*.{json,yaml,yml,html,css,js,ts,jsx,tsx}]
+indent_style = space
+indent_size = 2
+
+# Documentación Markdown (permitir doble espacio para saltos de línea)
+[*.md]
+trim_trailing_whitespace = false
+
+# Scripts de Windows (Batch / PowerShell)
+[*.{bat,cmd,ps1}]
+end_of_line = crlf

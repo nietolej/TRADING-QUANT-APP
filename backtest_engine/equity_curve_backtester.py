@@ -90,7 +90,7 @@ class EquityCurveBacktester:
                 v_sl_price = self.strategy.risk_manager.update_trailing_sl(
                     current_sl=v_sl_price, current_price=row['close'], 
                     current_high=row['high'], current_low=row['low'], 
-                    current_atr=current_atr, side=side
+                    current_atr=current_atr, side=side, entry_price=v_entry_price
                 )
                 
                 exit_reason = None
@@ -193,7 +193,7 @@ class EquityCurveBacktester:
                 r_sl_price = self.strategy.risk_manager.update_trailing_sl(
                     current_sl=r_sl_price, current_price=row['close'], 
                     current_high=row['high'], current_low=row['low'], 
-                    current_atr=current_atr, side=side
+                    current_atr=current_atr, side=side, entry_price=r_entry_price
                 )
                 
                 exit_reason = None

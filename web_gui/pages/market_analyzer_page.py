@@ -321,7 +321,7 @@ def render_market_analyzer():
             onchain_select = ui.select(options=[], label='On-Chain Metrics', multiple=True).classes('w-full mt-2').props('use-chips clearable')
             onchain_select.set_visibility(False)
             
-            tf_combo = ui.select(['1m', '5m', '15m', '1h', '4h', '1d'], label='Timeframe (Only for Market Data)', value='4h').classes('w-full mt-2')
+            tf_combo = ui.select(['1m', '5m', '15m', '1h', '4h', '1d'], label='Timeframe (Only for Market Data)', value='1d').classes('w-full mt-2')
             
             def on_source_change(e):
                 val = getattr(e, 'value', e)

@@ -2,7 +2,7 @@
 optimizer.py — Motor de búsqueda en cuadrícula (Grid Search) para estrategias.
 
 Para cada combinación de parámetros generada por el grid, ejecuta un backtest
-completo y recopila métricas clave para comparación. Ahora acelerado con multiprocesamiento y VectorBT.
+completo y recopila métricas clave para comparación. Diseñado para máxima estabilidad en Windows.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import concurrent.futures
 from typing import Any, Callable, Dict, Generator, List, Optional
 
 import pandas as pd
+import numpy as np
 import yaml
 
 from backtest_engine.backtester import Backtester
@@ -28,18 +29,35 @@ from strategy_engine.base_strategy import BaseStrategy
 def _build_range(min_val: float, max_val: float, step: float) -> List[float]:
     """
     Genera una lista de valores desde min_val hasta max_val (inclusive) con
-    incrementos de `step`.  Siempre incluye min_val y max_val.
+    incrementos de `step`. Siempre incluye min_val y max_val cuando corresponde.
     """
-    if step <= 0:
+    try:
+        min_v = float(min_val)
+        max_v = float(max_val)
+        st = float(step)
+    except (ValueError, TypeError):
         return [min_val]
+
+    if st <= 0:
+        return [min_v]
+    if min_v > max_v:
+        return [min_v]
+
     values: List[float] = []
-    v = min_val
-    while v <= max_val + 1e-9:
-        values.append(round(v, 10))
-        v += step
-    # Aseguramos que max_val esté siempre presente
-    if not values or abs(values[-1] - max_val) > 1e-9:
-        values.append(max_val)
+    v = min_v
+    while v <= max_v + 1e-9:
+        val = int(v) if abs(v - round(v)) < 1e-6 else round(v, 4)
+        if val not in values:
+            values.append(val)
+        v += st
+        if len(values) > 500:
+            break
+
+    # Asegurar que max_v esté presente
+    last_val = int(max_v) if abs(max_v - round(max_v)) < 1e-6 else round(max_v, 4)
+    if not values or (last_val not in values and values[-1] < max_v):
+        values.append(last_val)
+
     return values
 
 
@@ -48,7 +66,7 @@ def count_combinations(param_ranges: Dict[str, Dict[str, float]]) -> int:
     total = 1
     for cfg in param_ranges.values():
         vals = _build_range(cfg.get('min', 0), cfg.get('max', 0), cfg.get('step', 1))
-        total *= len(vals)
+        total *= max(1, len(vals))
     return total
 
 
@@ -56,11 +74,7 @@ def generate_param_grid(
     param_ranges: Dict[str, Dict[str, float]]
 ) -> Generator[Dict[str, Any], None, None]:
     """
-    Dado un diccionario de la forma:
-        { 'RAPIDA': {'min': 5, 'max': 20, 'step': 5},
-          'LENTA':  {'min': 20, 'max': 50, 'step': 10} }
-
-    Genera todos los dicts de parámetros que forman el grid.
+    Genera todas las combinaciones de parámetros del grid.
     """
     keys = list(param_ranges.keys())
     ranges = [
@@ -79,18 +93,50 @@ def generate_param_grid(
 # Optimizer Worker
 # ──────────────────────────────────────────────
 
-def _optimizer_worker(params: Dict[str, Any], base_config: Dict[str, Any], df: pd.DataFrame, initial_capital: float) -> Dict[str, Any]:
+def _optimizer_worker(
+    params: Dict[str, Any],
+    base_config: Dict[str, Any],
+    df: pd.DataFrame,
+    initial_capital: float,
+    commission_pct: float = 0.1,
+    slippage_pct: float = 0.05,
+    ec_config: Optional[Dict[str, Any]] = None,
+    sizing_config: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
-    Worker global puro (sin dependencias de closure) compatible con 
-    multiprocesamiento en Windows.
+    Ejecuta un backtest individual para una combinación específica de parámetros.
     """
     try:
         config_copy = copy.deepcopy(base_config)
+        
+        # Inyectar sizing si fue provisto
+        if sizing_config:
+            if 'risk_management' not in config_copy:
+                config_copy['risk_management'] = {}
+            config_copy['risk_management']['position_sizing'] = sizing_config
+
+        # Inyectar equity curve si fue provisto
+        if ec_config:
+            config_copy['equity_curve_management'] = ec_config
+
         strategy = BaseStrategy(config_copy, custom_parameters=params)
 
-        bt = Backtester(strategy, initial_capital=initial_capital)
-        # Ya no apagamos vectorbt. El backtester.run() decidirá 
-        # automáticamente usar vbt para velocidad si no hay SL/TP complejos.
+        if ec_config and ec_config.get('enabled', False):
+            from backtest_engine.equity_curve_backtester import EquityCurveBacktester
+            bt = EquityCurveBacktester(
+                strategy,
+                initial_capital=initial_capital,
+                commission_pct=commission_pct,
+                slippage_pct=slippage_pct
+            )
+        else:
+            bt = Backtester(
+                strategy,
+                initial_capital=initial_capital,
+                commission_pct=commission_pct,
+                slippage_pct=slippage_pct
+            )
+            
         run_result = bt.run(df)
 
         trades_df: Optional[pd.DataFrame] = run_result.get('trades')
@@ -110,10 +156,17 @@ def _optimizer_worker(params: Dict[str, Any], base_config: Dict[str, Any], df: p
                 else {'total_trades': 0}
             )
             final_equity = float(equity_curve['equity'].iloc[-1])
+            # Submuestrear para transferencias ligeras
+            if len(equity_curve) <= 400:
+                eq_list = equity_curve['equity'].tolist()
+            else:
+                step_s = max(1, len(equity_curve) // 400)
+                eq_list = equity_curve['equity'].iloc[::step_s].tolist()
         else:
             eq_metrics = {'sharpe_ratio': -999.0, 'cagr': -999.0, 'max_drawdown_pct': 0.0}
             trade_metrics = {'total_trades': 0}
             final_equity = initial_capital
+            eq_list = []
 
         return {
             'params': {k: (int(v) if float(v) == int(v) else float(v)) for k, v in params.items()},
@@ -129,6 +182,7 @@ def _optimizer_worker(params: Dict[str, Any], base_config: Dict[str, Any], df: p
             'initial_capital': initial_capital,
             'final_equity': round(final_equity, 6),
             'net_pnl': round(final_equity - initial_capital, 6),
+            'equity_curve': eq_list,
         }
 
     except Exception as ex:
@@ -147,7 +201,9 @@ def _optimizer_worker(params: Dict[str, Any], base_config: Dict[str, Any], df: p
             'final_equity': initial_capital,
             'net_pnl': 0.0,
             'error': str(ex),
+            'equity_curve': [],
         }
+
 
 # ──────────────────────────────────────────────
 # Optimizer Entry Point
@@ -158,14 +214,16 @@ def run_grid_search(
     df: pd.DataFrame,
     initial_capital: float,
     param_ranges: Dict[str, Dict[str, float]],
-    optimize_metric: str = 'sharpe_ratio',   # 'cagr', 'max_drawdown_pct', 'net_pnl'
+    optimize_metric: str = 'sharpe_ratio',
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    commission_pct: float = 0.1,
+    slippage_pct: float = 0.05,
+    ec_config: Optional[Dict[str, Any]] = None,
+    sizing_config: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
     """
-    Ejecuta Grid Search usando múltiples procesos de CPU y aceleración VBT.
-
-    Retorna una lista de resultados ordenados de mejor a peor según
-    `optimize_metric`.
+    Ejecuta Grid Search de forma segura y multihilo.
+    Retorna una lista de resultados ordenados de mejor a peor según `optimize_metric`.
     """
     results: List[Dict[str, Any]] = []
     total = count_combinations(param_ranges)
@@ -176,18 +234,24 @@ def run_grid_search(
         base_config = yaml.safe_load(fh)
         
     param_grids = list(generate_param_grid(param_ranges))
-    
-    # Utilizar n_cores - 1 (para no congelar el sistema del usuario)
-    max_workers = max(1, (os.cpu_count() or 2) - 1)
+    max_workers = min(16, max(1, (os.cpu_count() or 2) * 2))
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # Enviamos todas las tareas al pool
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(_optimizer_worker, params, base_config, df, initial_capital): params
+            executor.submit(
+                _optimizer_worker,
+                params,
+                base_config,
+                df,
+                initial_capital,
+                commission_pct,
+                slippage_pct,
+                ec_config,
+                sizing_config
+            ): params
             for params in param_grids
         }
         
-        # Procesamos a medida que van terminando para actualizar el progreso
         for future in concurrent.futures.as_completed(futures):
             try:
                 res = future.result()
@@ -208,7 +272,8 @@ def run_grid_search(
                     'initial_capital': initial_capital,
                     'final_equity': initial_capital,
                     'net_pnl': 0.0,
-                    'error': f"Crash del ejecutor: {str(e)}",
+                    'error': f"Error: {str(e)}",
+                    'equity_curve': [],
                 })
             
             done += 1
@@ -220,10 +285,10 @@ def run_grid_search(
 
     # Ordenar: sin errores primero, luego por métrica descendente
     def _sort_key(r):
-        if 'error' in r:
+        if r.get('error'):
             return -999_999.0
         val = float(r.get(optimize_metric, -999))
-        # Para drawdown: menos negativo = mejor → invertimos
+        # Para drawdown: menor (menos negativo/menor % caída) es mejor
         if optimize_metric == 'max_drawdown_pct':
             val = -abs(val)
         return val

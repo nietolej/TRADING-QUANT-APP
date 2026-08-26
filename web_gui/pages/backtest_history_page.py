@@ -77,40 +77,41 @@ def resolve_strategy_key(raw_name, strategies_dict, config_snapshot=None):
 def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=None):
     strategies = get_available_strategies()
 
-    with ui.column().classes('w-full q-pa-md'):
+    with ui.column().classes('w-full q-pa-sm'):
         
         # ════════════════════════════════════════════════════════
-        # 1. HERO HEADER DE HISTORIAL DE BACKTESTS
+        # 1. HEADER COMPACTO Y OPTIMIZADO
         # ════════════════════════════════════════════════════════
-        with ui.card().classes('w-full bg-slate-900 text-white p-6 rounded-2xl shadow-xl mb-6'):
+        with ui.card().classes('w-full bg-slate-900 text-white rounded-xl shadow border border-slate-800 px-4 py-2.5 mb-3'):
             with ui.row().classes('items-center justify-between w-full'):
-                with ui.row().classes('items-center gap-4'):
-                    ui.icon('history', size='3rem').classes('text-emerald-400')
-                    with ui.column().classes('gap-1'):
-                        ui.label('Historial de Backtests').classes('text-3xl font-extrabold tracking-tight')
-                        ui.label('Consulta, evalúa y recupera simulaciones cuantitativas guardadas').classes('text-slate-400 text-sm')
+                with ui.row().classes('items-center gap-2.5'):
+                    with ui.row().classes('items-center justify-center w-8 h-8 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-400'):
+                        ui.icon('history', size='1.25rem')
+                    with ui.column().classes('gap-0'):
+                        ui.label('Historial de Backtests').classes('text-base font-bold tracking-tight text-white leading-tight')
+                        ui.label('Consulta, evalúa y recupera simulaciones cuantitativas guardadas').classes('text-slate-400 text-[11px] leading-tight')
                 
-                with ui.row().classes('items-center gap-3'):
-                    btn_top_portfolio = ui.button('💼 SIMULAR PORTAFOLIO (COMBINAR ESTRATEGIAS)', icon='pie_chart').props('rounded').classes('bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-2 shadow-lg transition-all')
-                    btn_refresh = ui.button('Actualizar Lista', icon='refresh').props('rounded').classes('bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-4 py-2 shadow-lg transition-all')
+                with ui.row().classes('items-center gap-2'):
+                    btn_top_portfolio = ui.button('💼 SIMULAR PORTAFOLIO', icon='pie_chart').props('dense size=sm rounded').classes('bg-blue-600 hover:bg-blue-500 text-white font-bold px-3 py-1 text-xs shadow transition-all')
+                    btn_refresh = ui.button('Actualizar Lista', icon='refresh').props('dense size=sm rounded').classes('bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-1 text-xs shadow transition-all')
 
-        # Tarjetas de resumen rápido del historial
-        with ui.row().classes('w-full gap-4 mb-6'):
-            with ui.card().classes('flex-1 bg-slate-900/50 border border-slate-700/50 p-4 rounded-xl shadow-lg'):
-                ui.label('Total de Backtests').classes('text-xs font-medium text-slate-500 uppercase tracking-wider')
-                lbl_total_runs = ui.label('0').classes('text-2xl font-black text-slate-200 mt-1')
+        # Tarjetas de resumen rápido del historial (Compactas)
+        with ui.row().classes('w-full gap-3 mb-3'):
+            with ui.card().classes('flex-1 bg-slate-900/50 border border-slate-700/50 p-2.5 rounded-xl shadow'):
+                ui.label('Total de Backtests').classes('text-[10px] font-medium text-slate-500 uppercase tracking-wider')
+                lbl_total_runs = ui.label('0').classes('text-lg font-black text-slate-200')
 
-            with ui.card().classes('flex-1 bg-slate-900/50 border border-slate-700/50 p-4 rounded-xl shadow-lg'):
-                ui.label('Mejor CAGR').classes('text-xs font-medium text-slate-500 uppercase tracking-wider')
-                lbl_best_cagr = ui.label('-- %').classes('text-2xl font-black text-emerald-600 mt-1')
+            with ui.card().classes('flex-1 bg-slate-900/50 border border-slate-700/50 p-2.5 rounded-xl shadow'):
+                ui.label('Mejor CAGR').classes('text-[10px] font-medium text-slate-500 uppercase tracking-wider')
+                lbl_best_cagr = ui.label('-- %').classes('text-lg font-black text-emerald-500')
 
-            with ui.card().classes('flex-1 bg-slate-900/50 border border-slate-700/50 p-4 rounded-xl shadow-lg'):
-                ui.label('Mejor Profit Factor').classes('text-xs font-medium text-slate-500 uppercase tracking-wider')
-                lbl_best_pf = ui.label('--').classes('text-2xl font-black text-blue-600 mt-1')
+            with ui.card().classes('flex-1 bg-slate-900/50 border border-slate-700/50 p-2.5 rounded-xl shadow'):
+                ui.label('Mejor Profit Factor').classes('text-[10px] font-medium text-slate-500 uppercase tracking-wider')
+                lbl_best_pf = ui.label('--').classes('text-lg font-black text-blue-400')
 
-            with ui.card().classes('flex-1 bg-slate-900/50 border border-slate-700/50 p-4 rounded-xl shadow-lg'):
-                ui.label('Promedio % Ganadoras').classes('text-xs font-medium text-slate-500 uppercase tracking-wider')
-                lbl_avg_wr = ui.label('-- %').classes('text-2xl font-black text-purple-600 mt-1')
+            with ui.card().classes('flex-1 bg-slate-900/50 border border-slate-700/50 p-2.5 rounded-xl shadow'):
+                ui.label('Promedio % Ganadoras').classes('text-[10px] font-medium text-slate-500 uppercase tracking-wider')
+                lbl_avg_wr = ui.label('-- %').classes('text-lg font-black text-purple-400')
 
         # Tabla del Historial
         with ui.card().classes('w-full bg-slate-900/50 p-4 rounded-2xl shadow-xl border border-slate-700/50 mb-8'):
@@ -173,7 +174,7 @@ def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=Non
         # Lista de Estrategias en Portafolio
         portfolio_state = {
             'items': [
-                {'strategy': list(strategies.keys())[0] if strategies else '', 'symbol': 'BNB/BTC', 'timeframe': '4h', 'weight_pct': 50.0},
+                {'strategy': list(strategies.keys())[0] if strategies else '', 'symbol': 'BNB/BTC', 'timeframe': '1d', 'weight_pct': 50.0},
                 {'strategy': list(strategies.keys())[0] if strategies else '', 'symbol': 'BTC/USDT', 'timeframe': '1d', 'weight_pct': 50.0}
             ]
         }

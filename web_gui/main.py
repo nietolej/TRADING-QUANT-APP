@@ -3,6 +3,7 @@ from .pages.strategy_builder_page import render_strategy_builder
 from .pages.strategy_catalog_page import render_strategy_catalog
 from .pages.market_analyzer_page import render_market_analyzer
 from .pages.strategy_analyzer_page import render_strategy_analyzer
+from .pages.optimizer_page import render_optimizer_page
 from .pages.backtest_history_page import render_backtest_history_page
 from .pages.ml_page import render_ml_page
 from .pages.live_monitor_page import render_live_monitor_page
@@ -218,55 +219,57 @@ def create_gui(app):
                 container.set_visibility(name == page_name)
             for name, btn in menu_buttons.items():
                 if name == page_name:
-                    btn.classes(replace='bg-amber-500/20 text-amber-400 font-bold border border-amber-500/50 shadow-sm text-sm py-1.5 px-3.5 rounded-lg whitespace-nowrap transition-all')
+                    btn.classes(replace='w-full justify-start text-left bg-amber-500/20 text-amber-400 font-bold border border-amber-500/50 shadow-sm text-xs py-2.5 px-3 rounded-lg transition-all')
                 else:
-                    btn.classes(replace='text-slate-300 hover:text-white hover:bg-slate-800/80 font-medium text-sm py-1.5 px-3.5 rounded-lg whitespace-nowrap transition-all border border-transparent')
+                    btn.classes(replace='w-full justify-start text-left text-slate-300 hover:text-white hover:bg-slate-800/80 font-medium text-xs py-2.5 px-3 rounded-lg transition-all border border-transparent')
             # Persistir la página activa en localStorage del navegador
             ui.run_javascript(f"localStorage.setItem('tqa_active_page', '{page_name}');")
 
-        # Header oscuro premium con estilo Bloomberg Obsidian
-        with ui.header().classes('bg-[#080c14] text-white shadow-xl border-b border-[#1e293b]'):
-            # Fila Superior: Título y Configuración
-            with ui.row().classes('w-full justify-between items-center px-6 py-2.5 border-b border-[#1e293b]/80'):
-                with ui.row().classes('items-center gap-3'):
-                    with ui.row().classes('items-center justify-center w-9 h-9 rounded-lg bg-amber-500/15 border border-amber-500/40 text-amber-400'):
+        # Menú Lateral Vertical Izquierdo (Left Drawer) con estilo Bloomberg Obsidian
+        with ui.left_drawer(value=True).classes('bg-[#080c14] text-white border-r border-[#1e293b] p-3 flex flex-col justify-between overflow-y-auto').props('bordered width=260 :breakpoint="0" no-swipe-open') as left_drawer:
+            with ui.column().classes('w-full gap-2'):
+                # Logo y Título
+                with ui.row().classes('items-center gap-3 px-2 py-3 border-b border-[#1e293b]/80 w-full mb-1'):
+                    with ui.row().classes('items-center justify-center w-9 h-9 rounded-lg bg-amber-500/15 border border-amber-500/40 text-amber-400 flex-none'):
                         ui.icon('candlestick_chart', size='1.5rem')
-                    with ui.column().classes('gap-0'):
-                        ui.label('TRADING QUANT APP').classes('text-xs font-bold text-amber-400 tracking-widest uppercase font-mono')
-                        ui.label('Terminal Cuantitativo').classes('text-lg md:text-xl font-extrabold text-white tracking-tight font-heading')
+                    with ui.column().classes('gap-0 flex-1 min-w-0'):
+                        ui.label('TRADING QUANT APP').classes('text-[10px] font-bold text-amber-400 tracking-widest uppercase font-mono truncate')
+                        ui.label('Terminal Cuantitativo').classes('text-sm font-extrabold text-white tracking-tight font-heading truncate')
                 
-                with ui.row().classes('items-center gap-2'):
-                    with ui.row().classes('items-center gap-1.5 bg-[#111827] px-3 py-1 rounded-full border border-[#1e293b]'):
-                        ui.icon('circle', size='0.6rem').classes('text-emerald-400 animate-pulse')
-                        ui.label('EN LÍNEA').classes('text-xs font-bold text-emerald-400 font-mono')
-                    ui.button('Configuración', icon='settings').props('flat round text-color=white').classes('hover:bg-[#1e293b] text-slate-300 transition-colors')
-            
-            # Fila Inferior: Menú Horizontal con Píldoras Activas
-            with ui.row().classes('w-full items-center px-4 py-2 gap-1.5 overflow-x-auto no-wrap hide-scrollbar bg-[#0a0e17]'):
+                # Menú de Navegación Vertical
                 def menu_item(text, icon, page_id):
                     btn = ui.button(text, icon=icon, on_click=lambda p=page_id: show_page(p))
-                    btn.props('flat no-caps')
-                    btn.classes('text-slate-300 hover:text-white hover:bg-slate-800/80 font-medium text-sm py-1.5 px-3.5 rounded-lg whitespace-nowrap transition-all border border-transparent')
+                    btn.props('flat no-caps align=left')
+                    btn.classes('w-full justify-start text-left text-slate-300 hover:text-white hover:bg-slate-800/80 font-medium text-xs py-2.5 px-3 rounded-lg transition-all border border-transparent')
                     menu_buttons[page_id] = btn
                     return btn
-                
-                ui.label('PRINCIPAL').classes('text-[11px] font-extrabold text-slate-500 tracking-wider mx-2 font-mono')
+
+                ui.label('PRINCIPAL').classes('text-[10px] font-extrabold text-slate-500 tracking-wider px-3 pt-2 pb-0.5 font-mono')
                 menu_item('Strategy Builder', 'build', 'builder')
                 menu_item('Estrategias Guardadas', 'list', 'catalog')
                 menu_item('Strategy Analyzer', 'analytics', 'analyzer')
+                menu_item('Optimizador (Grid)', 'tune', 'optimizer')
                 menu_item('Historial Backtests', 'history', 'history')
-                
-                ui.separator().props('vertical').classes('mx-2 h-5 bg-[#1e293b]')
-                
-                ui.label('AVANZADAS').classes('text-[11px] font-extrabold text-slate-500 tracking-wider mx-2 font-mono')
+
+                ui.label('AVANZADAS').classes('text-[10px] font-extrabold text-slate-500 tracking-wider px-3 pt-4 pb-0.5 font-mono')
                 menu_item('Datos Almacenados', 'storage', 'market')
                 menu_item('Machine Learning', 'psychology', 'ml')
                 menu_item('Filtro MLE', 'thermostat', 'mle')
                 menu_item('Live Monitor', 'play_circle', 'live')
 
+            # Pie del Drawer Lateral
+            with ui.column().classes('w-full gap-2 pt-3 border-t border-[#1e293b]/80 mt-auto'):
+                with ui.row().classes('w-full items-center justify-between px-2'):
+                    with ui.row().classes('items-center gap-1.5 bg-[#111827] px-2.5 py-1 rounded-full border border-[#1e293b]'):
+                        ui.icon('circle', size='0.55rem').classes('text-emerald-400 animate-pulse')
+                        ui.label('EN LÍNEA').classes('text-[11px] font-bold text-emerald-400 font-mono')
+                    ui.label('v2.0').classes('text-xs text-slate-500 font-mono font-bold')
+                
+                ui.button('Configuración', icon='settings').props('flat no-caps align=left').classes('w-full justify-start text-left text-slate-300 hover:text-white hover:bg-slate-800/80 font-medium text-xs py-2 px-3 rounded-lg transition-all')
+
 
         # Contenedor principal
-        with ui.column().classes('w-full h-full p-4 bg-[#0a0e17]'):
+        with ui.column().classes('w-full h-full p-2 md:p-3 bg-[#0a0e17]'):
             
             # --- Instanciar Páginas ---
             with ui.column().classes('w-full h-full') as pages['builder']:
@@ -295,6 +298,15 @@ def create_gui(app):
                     show_page('live')
                     
                 analyzer_state = render_strategy_analyzer(on_back_to_builder=on_back_to_builder, on_go_to_live=on_go_to_live)
+
+            with ui.column().classes('w-full h-full') as pages['optimizer']:
+                def on_opt_go_to_analyzer(strat_name=None, symbol=None, timeframe=None, custom_params=None):
+                    if analyzer_state and 'select_strategy' in analyzer_state:
+                        if strat_name:
+                            analyzer_state['select_strategy'](strat_name)
+                    show_page('analyzer')
+
+                render_optimizer_page(on_go_to_analyzer=on_opt_go_to_analyzer)
 
             with ui.column().classes('w-full h-full') as pages['history']:
                 def on_load_to_analyzer(row):

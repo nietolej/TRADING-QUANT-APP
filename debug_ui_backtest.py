@@ -17,7 +17,7 @@ async def simulate_ui_run():
             'start_date': '2024-01-01',
             'end_date': '2026-07-25',
             'symbol': 'BNB/BTC',
-            'timeframe': '4h',
+            'timeframe': '1d',
             'capital': 1,
             'capital_type': 'QUOTE',
             'custom_parameters': {
