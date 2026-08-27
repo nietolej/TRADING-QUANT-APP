@@ -1,0 +1,24 @@
+strategy_name: "On-Chain Flow Framework"
+class_name: "OnChainFlowStrategy" # Apunta a la clase específica
+symbol: "BTC/USDT"
+timeframe: "1d"
+trade_direction: "Both" # Puede operar en ambas direcciones
+
+parameters:
+  z_window: 30
+  z_threshold: 1.5
+  SL: 5.0 # Porcentaje inicial
+  TP: 15.0
+
+risk_management:
+  position_sizing:
+    type: "risk_percent"
+    value: 2.0 # Arriesgar el 2% del capital
+  stop_loss:
+    type: "atr"
+    multiplier: 2.5
+    period: 14
+    trailing: true
+  take_profit:
+    type: "percentage"
+    value: 15.0 # Take profit estático inicial

@@ -1,3 +1,14 @@
+import pandas as pd
+from nicegui.json import orjson_wrapper
+
+# Patch global para orjson y pandas Timestamp (previene colapsos en la UI)
+original_converter = orjson_wrapper._orjson_converter
+def custom_orjson_converter(obj):
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    return original_converter(obj)
+orjson_wrapper._orjson_converter = custom_orjson_converter
+
 from nicegui import ui
 from .pages.strategy_builder_page import render_strategy_builder
 from .pages.strategy_catalog_page import render_strategy_catalog
@@ -8,6 +19,7 @@ from .pages.backtest_history_page import render_backtest_history_page
 from .pages.ml_page import render_ml_page
 from .pages.live_monitor_page import render_live_monitor_page
 from .pages.mle_thermometer_page import render_mle_thermometer_page
+from .pages.onchain_analyzer_page import render_onchain_analyzer
 
 def create_gui(app):
     """
@@ -255,6 +267,7 @@ def create_gui(app):
                 menu_item('Datos Almacenados', 'storage', 'market')
                 menu_item('Machine Learning', 'psychology', 'ml')
                 menu_item('Filtro MLE', 'thermostat', 'mle')
+                menu_item('Análisis On-Chain', 'currency_exchange', 'onchain')
                 menu_item('Live Monitor', 'play_circle', 'live')
 
             # Pie del Drawer Lateral
@@ -335,6 +348,9 @@ def create_gui(app):
                 
             with ui.column().classes('w-full h-full') as pages['mle']:
                 render_mle_thermometer_page()
+                
+            with ui.column().classes('w-full h-full') as pages['onchain']:
+                render_onchain_analyzer()
                 
         # Restaurar la última página activa desde localStorage (evita volver a builder tras reconexiones)
         async def restore_active_page():
