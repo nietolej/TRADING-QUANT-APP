@@ -5,32 +5,67 @@ from nicegui import ui, background_tasks
 from datetime import datetime, timezone, timedelta
 from data_layer.storage import SessionLocal, OnChainMetric
 from data_layer.onchain_flows import BlockExplorerClient
+from data_layer.onchain_data import OnChainDataManager
 from data_layer.market_data import MarketDataManager
 import asyncio
 import concurrent.futures
 
-def fetch_data_async(symbol, days):
+def fetch_data_async(symbol, days, metric=None):
     """
     Función síncrona que envuelve las llamadas pesadas de APIs para correr en threadpool.
     """
     start_date = datetime.now(timezone.utc) - timedelta(days=days)
-    client = BlockExplorerClient()
     
-    # 1. Obtener flujos on-chain (Mints/Burns, Exchange Flows y Total Supply)
-    mints_burns = client.fetch_stablecoin_supply(symbol, start_date)
-    flows = client.fetch_exchange_flows(symbol, start_date)
-    supply = client.fetch_total_supply(symbol, start_date)
+    cryptoquant_metrics = [
+        'exchange_netflow', 'exchange_inflow', 'exchange_outflow', 'exchange_reserve',
+        'miner_reserve', 'miner_netflow', 'puell_multiple', 'mvrv', 'nvt_golden_cross', 
+        'sopr', 'active_addresses', 'funding_rates', 'open_interest', 
+        'estimated_leverage_ratio', 'taker_buy_sell_ratio', 'nupl', 'stock_to_flow'
+    ]
     
+    records_saved = 0
+    metric_lower = metric.lower() if metric else ""
+    
+    if metric_lower in cryptoquant_metrics or symbol in ['BTC', 'ETH']:
+        # Usar CryptoQuant provider
+        db = SessionLocal()
+        mgr = OnChainDataManager(db)
+        try:
+            mapped_metric = metric_lower
+            if mapped_metric == 'total_supply':
+                mapped_metric = 'btc_market_cap' if symbol == 'BTC' else 'stablecoin_market_cap'
+                provider = 'coingecko' if symbol == 'BTC' else 'defillama'
+            else:
+                provider = 'cryptoquant'
+                
+            count = mgr.update_historical_data(
+                metric_name=mapped_metric,
+                symbol=symbol,
+                start_date=start_date,
+                provider_name=provider
+            )
+            records_saved = count if count else 0
+        except Exception as e:
+            print(f"Error fetching {metric}: {e}")
+            raise e
+        finally:
+            db.close()
+            
+    if symbol in ['USDT', 'USDC']:
+        # Legacy BlockExplorer metrics (para Stablecoins)
+        client = BlockExplorerClient()
+        mints_burns = client.fetch_stablecoin_supply(symbol, start_date)
+        flows = client.fetch_exchange_flows(symbol, start_date)
+        supply = client.fetch_total_supply(symbol, start_date)
+        records_saved += (mints_burns + flows + supply)
     
     # 2. Asegurar que tenemos precios históricos en DB
-    # Para comparar precios de USDT, usamos BTC/USDT ya que USDT suele valer 1$.
-    # Si symbol es BTC, descargamos BTC/USDT.
     market_symbol = f"{symbol}/USDT" if symbol != "USDT" else "BTC/USDT"
     
     market_mgr = MarketDataManager()
     market_mgr.update_historical_data(market_symbol, '1d', start_date)
     
-    return mints_burns + flows + supply
+    return records_saved
 
 def render_onchain_analyzer():
     """
@@ -43,9 +78,9 @@ def render_onchain_analyzer():
         # Contenedor Superior: Controles
         with ui.row().classes('w-full items-end gap-4 bg-obsidian p-4 rounded-xl border border-slate-800 mb-6'):
             symbol_select = ui.select(
-                options=['USDT', 'USDC'],
-                value='USDT',
-                label='Stablecoin / Activo'
+                options=['BTC', 'ETH', 'USDT', 'USDC'],
+                value='BTC',
+                label='Activo / Moneda'
             ).classes('w-48')
             
             days_input = ui.number(
@@ -56,8 +91,11 @@ def render_onchain_analyzer():
             ).classes('w-32')
             
             metric_select = ui.select(
-                options=['Mint', 'Burn', 'Exchange_Inflow', 'Exchange_Outflow', 'Total_Supply'],
-                value='Mint',
+                options=[
+                    'Mint', 'Burn', 'Exchange_Inflow', 'Exchange_Outflow', 'Total_Supply',
+                    'exchange_netflow', 'exchange_reserve', 'miner_reserve', 'puell_multiple', 'mvrv', 'nupl'
+                ],
+                value='Exchange_Inflow',
                 label='Métrica On-Chain'
             ).classes('w-64')
 
@@ -79,6 +117,7 @@ def render_onchain_analyzer():
         async def on_fetch_click():
             symbol = symbol_select.value
             days = int(days_input.value)
+            metric = metric_select.value
             
             fetch_btn.disable()
             loading_spinner.set_visibility(True)
@@ -87,7 +126,7 @@ def render_onchain_analyzer():
             try:
                 loop = asyncio.get_running_loop()
                 with concurrent.futures.ThreadPoolExecutor() as pool:
-                    records_saved = await loop.run_in_executor(pool, fetch_data_async, symbol, days)
+                    records_saved = await loop.run_in_executor(pool, fetch_data_async, symbol, days, metric)
                 
                 ui.notify(f"Sincronización completada. {records_saved} nuevos registros guardados.", type='positive')
                 await on_plot_click()
@@ -112,8 +151,13 @@ def render_onchain_analyzer():
             
             # Consultar Datos On-Chain
             db = SessionLocal()
+            
+            mapped_metric = metric_suffix.lower()
+            if mapped_metric == 'total_supply' and symbol == 'BTC':
+                mapped_metric = 'btc_market_cap'
+                
             query = db.query(OnChainMetric).filter(
-                OnChainMetric.metric_name == metric_name,
+                OnChainMetric.metric_name.in_([metric_name, metric_suffix, mapped_metric]),
                 OnChainMetric.symbol == symbol,
                 OnChainMetric.timestamp >= start_date.replace(tzinfo=None)
             ).order_by(OnChainMetric.timestamp.asc())
@@ -130,7 +174,7 @@ def render_onchain_analyzer():
             df_onchain.set_index('timestamp', inplace=True)
             
             # Agrupar diario para mejor visualización
-            if 'Total_Supply' in metric_name:
+            if 'Total_Supply' in metric_name or 'market_cap' in mapped_metric:
                 df_onchain_daily = df_onchain[['value']].resample('1D').last()
             else:
                 df_onchain_daily = df_onchain[['value']].resample('1D').sum().fillna(0)
@@ -143,7 +187,7 @@ def render_onchain_analyzer():
             )
             df_onchain_daily.index = df_onchain_daily.index.tz_localize(None).normalize()
             
-            if 'Total_Supply' in metric_name:
+            if 'Total_Supply' in metric_name or 'market_cap' in mapped_metric:
                 df_onchain_daily = df_onchain_daily.reindex(date_range).ffill().dropna()
             else:
                 df_onchain_daily = df_onchain_daily.reindex(date_range, fill_value=0)
@@ -157,8 +201,8 @@ def render_onchain_analyzer():
             fig = make_subplots(specs=[[{"secondary_y": True}]])
             
             # Añadir Serie On-Chain (Barras o Línea según la métrica)
-            is_supply = 'Total_Supply' in metric_name
-            bar_color = '#10b981' if 'Inflow' in metric_name or 'Mint' in metric_name else '#ef4444'
+            is_supply = ('Total_Supply' in metric_name or 'market_cap' in mapped_metric)
+            bar_color = '#10b981' if 'inflow' in metric_name.lower() or 'mint' in metric_name.lower() else '#ef4444'
             
             if is_supply:
                 fig.add_trace(
@@ -226,7 +270,13 @@ def render_onchain_analyzer():
                     'Burn': 'Destrucción de tokens (contracción monetaria). Representa retiros de liquidez del mercado hacia cuentas bancarias tradicionales. Suele ser una señal Bajista (Bearish).',
                     'Exchange_Inflow': 'Depósitos desde billeteras privadas hacia Exchanges. Un Inflow masivo de stablecoins representa "poder de compra" (municiones) listo para dispararse (Bullish).',
                     'Exchange_Outflow': 'Retiros desde Exchanges hacia billeteras frías. En el caso de stablecoins, indica una reducción en la liquidez inmediata para comprar activos (Bearish).',
-                    'Total_Supply': 'Oferta Total Circulante de la Stablecoin en todo el mercado cripto global (incluye todas las redes). Representa la masa monetaria total (Liquidez Global).'
+                    'Total_Supply': 'Oferta Total Circulante de la Stablecoin en todo el mercado cripto global (incluye todas las redes). Representa la masa monetaria total (Liquidez Global).',
+                    'exchange_netflow': 'Diferencia entre Inflow y Outflow en exchanges. Valores positivos indican más depósitos (Bearish para BTC), valores negativos indican más retiros (Bullish).',
+                    'exchange_reserve': 'Cantidad total de monedas guardadas en las wallets de los exchanges. Si sube, hay mayor presión de venta. Si baja, los inversores están acumulando en wallets frías.',
+                    'miner_reserve': 'Cantidad de monedas en las carteras de los mineros. Una caída indica que los mineros están vendiendo para cubrir gastos (Bearish).',
+                    'puell_multiple': 'Ratio entre el valor de emisión diaria de BTC y su media móvil anual. Valores bajos indican zona de compra, valores altos zona de venta.',
+                    'mvrv': 'Ratio entre el Market Cap y el Realized Cap. Ayuda a identificar si el precio está sobrevalorado (techo) o infravalorado (suelo).',
+                    'nupl': 'Net Unrealized Profit/Loss. Mide el estado de ganancias/pérdidas no realizadas de toda la red. Ayuda a ver el sentimiento general.'
                 }
                 desc = descriptions.get(metric_suffix, '')
                 

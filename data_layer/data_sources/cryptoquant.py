@@ -21,8 +21,7 @@ class CryptoQuantProvider(BaseOnChainProvider):
 
     def fetch_metric(self, metric_name: str, symbol: str, start_date: datetime, end_date: datetime) -> pd.DataFrame:
         if not self.api_key or self.api_key == "tu_clave_api_aqui":
-            print("ERROR: API Key de CryptoQuant no configurada.")
-            return pd.DataFrame()
+            raise ValueError("API Key de CryptoQuant no configurada en el archivo .env")
             
         # CryptoQuant espera el activo (ej. BTC) en lugar del par completo
         asset = symbol.split('/')[0].lower() if '/' in symbol else symbol.lower()

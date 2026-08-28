@@ -275,7 +275,7 @@ def render_market_analyzer():
         with ui.dialog() as download_dialog, ui.card().classes('w-[800px] max-w-4xl q-pa-md'):
             ui.label('Bulk Downloader').classes('text-xl font-bold q-mb-md')
             
-            source_combo = ui.select(['binance', 'yahoo', 'coingecko', 'defillama', 'cryptoquant'], label='Source', value='binance').classes('w-full mt-2')
+            source_combo = ui.select(['binance', 'yahoo', 'coingecko', 'defillama', 'cryptoquant', 'glassnode'], label='Source', value='binance').classes('w-full mt-2')
             
             ui.label('For Market: Select/Enter symbols. For On-Chain: Select metrics from dropdown.').classes('text-xs text-gray-500 mt-2 mb-1')
             
@@ -287,6 +287,11 @@ def render_market_analyzer():
                     'miner_reserve', 'miner_netflow', 'puell_multiple', 'mvrv', 'nvt_golden_cross', 
                     'sopr', 'active_addresses', 'funding_rates', 'open_interest', 
                     'estimated_leverage_ratio', 'taker_buy_sell_ratio', 'nupl', 'stock_to_flow'
+                ],
+                'glassnode': [
+                    'sopr', 'puell_multiple', 'mvrv', 'nupl', 'active_addresses',
+                    'exchange_netflow', 'exchange_inflow', 'exchange_outflow',
+                    'exchange_reserve', 'miner_reserve'
                 ]
             }
             
@@ -408,7 +413,7 @@ def render_market_analyzer():
                         elif "eth" in metric: inferred_symbol = "ETH"
                         elif "usdt" in metric: inferred_symbol = "USDT"
                         elif "usdc" in metric: inferred_symbol = "USDC"
-                        elif source_combo.value == 'cryptoquant': inferred_symbol = "BTC"
+                        elif source_combo.value in ['cryptoquant', 'glassnode']: inferred_symbol = "BTC"
                         
                         try:
                             count = mgr.update_historical_data(

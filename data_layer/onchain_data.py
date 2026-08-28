@@ -5,6 +5,7 @@ from .storage import OnChainMetric, SessionLocal
 from .data_sources.defillama import DefiLlamaProvider
 from .data_sources.cryptoquant import CryptoQuantProvider
 from .data_sources.coingecko import CoinGeckoProvider
+from .data_sources.glassnode import GlassnodeProvider
 
 class OnChainDataManager:
     def __init__(self, db_session: Session = None):
@@ -12,7 +13,8 @@ class OnChainDataManager:
         self.providers = {
             'defillama': DefiLlamaProvider(),
             'cryptoquant': CryptoQuantProvider(),
-            'coingecko': CoinGeckoProvider()
+            'coingecko': CoinGeckoProvider(),
+            'glassnode': GlassnodeProvider()
         }
         
     def update_historical_data(self, metric_name: str, symbol: str, start_date: datetime, provider_name: str):
