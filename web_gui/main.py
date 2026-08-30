@@ -21,6 +21,7 @@ from .pages.ml_page import render_ml_page
 from .pages.live_monitor_page import render_live_monitor_page
 from .pages.mle_thermometer_page import render_mle_thermometer_page
 from .pages.onchain_analyzer_page import render_onchain_analyzer
+from .pages.halving_analyzer_page import render_halving_analyzer
 
 def create_gui(app):
     """
@@ -267,6 +268,7 @@ def create_gui(app):
 
                 ui.label('AVANZADAS').classes('text-[10px] font-extrabold text-slate-500 tracking-wider px-3 pt-4 pb-0.5 font-mono')
                 menu_item('Datos Almacenados', 'storage', 'market')
+                menu_item('Ciclos Halving BTC', 'timelapse', 'halving')
                 menu_item('Machine Learning', 'psychology', 'ml')
                 menu_item('Filtro MLE', 'thermostat', 'mle')
                 menu_item('Análisis On-Chain', 'currency_exchange', 'onchain')
@@ -328,7 +330,7 @@ def create_gui(app):
                 def on_opt_go_to_analyzer(strat_name=None, symbol=None, timeframe=None, custom_params=None):
                     if analyzer_state and 'select_strategy' in analyzer_state:
                         if strat_name:
-                            analyzer_state['select_strategy'](strat_name)
+                            analyzer_state['select_strategy'](strat_name, symbol=symbol, timeframe=timeframe, custom_params=custom_params)
                     show_page('analyzer')
 
                 render_optimizer_page(on_go_to_analyzer=on_opt_go_to_analyzer)
@@ -372,6 +374,9 @@ def create_gui(app):
                 
             with ui.column().classes('w-full h-full') as pages['onchain']:
                 render_onchain_analyzer()
+                
+            with ui.column().classes('w-full h-full') as pages['halving']:
+                render_halving_analyzer()
                 
         # Restaurar la última página activa desde localStorage (evita volver a builder tras reconexiones)
         async def restore_active_page():

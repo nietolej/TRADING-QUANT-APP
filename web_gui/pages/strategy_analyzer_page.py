@@ -2787,10 +2787,18 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
 
         btn_portfolio.on_click(on_go_to_portfolio if on_go_to_portfolio else open_portfolio_modal)
 
-    def select_strategy(filename):
+    def select_strategy(filename, symbol=None, timeframe=None, custom_params=None):
         if filename in strategies:
             state['strategy_name'] = filename
             strat_combo.value = filename
+            if symbol:
+                state['symbol'] = symbol
+                sym_combo.value = symbol
+            if timeframe:
+                state['timeframe'] = timeframe
+                tf_combo.value = timeframe
+            if custom_params:
+                state['custom_parameters'] = dict(custom_params)
             update_parameters_ui()
 
     def load_from_history(row):

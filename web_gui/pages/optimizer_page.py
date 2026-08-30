@@ -4,6 +4,8 @@ import numpy as np
 import yaml
 import glob
 import os
+import threading
+import time
 from datetime import datetime, timezone
 import asyncio
 import plotly.graph_objects as go
@@ -22,6 +24,20 @@ def _parse_assets(symbol: str) -> tuple[str, str]:
         parts = symbol.split('/')
         return parts[0].strip(), parts[1].strip()
     return 'BTC', 'USDT'
+
+
+def _fetch_market_data_sync(symbol: str, timeframe: str, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+    """Descarga o consulta datos de mercado en un hilo secundario sin bloquear NiceGUI."""
+    db = SessionLocal()
+    try:
+        market_mgr = MarketDataManager(db)
+        df = market_mgr.get_data(symbol, timeframe, start_dt, end_dt)
+        if df.empty:
+            market_mgr.update_historical_data(symbol, timeframe, start_dt, end_dt)
+            df = market_mgr.get_data(symbol, timeframe, start_dt, end_dt)
+        return df
+    finally:
+        db.close()
 
 
 def render_optimizer_page(on_go_to_analyzer=None):
@@ -281,6 +297,8 @@ def render_optimizer_page(on_go_to_analyzer=None):
         # ════════════════════════════════════════════════════════
         # 3. PANEL DE RANGOS DE PARÁMETROS DINÁMICOS
         # ════════════════════════════════════════════════════════
+        cancel_token = {'event': None}
+
         with ui.card().classes('w-full bg-slate-900/60 border border-slate-800 rounded-xl p-4 shadow'):
             with ui.row().classes('w-full justify-between items-center mb-2'):
                 ui.label('2. Definición de Rangos de Parámetros a Explorar').classes('text-sm font-bold text-slate-200 uppercase tracking-wider')
@@ -289,7 +307,7 @@ def render_optimizer_page(on_go_to_analyzer=None):
             opt_ranges_container = ui.column().classes('w-full gap-2 mt-2')
 
             def _refresh_all_previews():
-                """Actualiza las etiquetas de previsualización y el total de combinaciones."""
+                """Actualiza las etiquetas de previsualización y el total de combinaciones con feedback visual claro."""
                 try:
                     for pn, pl in preview_labels.items():
                         cfg = opt_ranges.get(pn, {})
@@ -304,10 +322,16 @@ def render_optimizer_page(on_go_to_analyzer=None):
                         pl.set_text(disp if disp else '--')
 
                     combo_count = count_combinations(opt_ranges)
-                    lbl_combo_info.set_text(
-                        f'ℹ️  Total combinaciones: {combo_count:,}  '
-                        f'(tiempo estimado: ~{max(1, combo_count // 12)}s)'
-                    )
+                    est_sec = max(1, round(combo_count / 30.0))
+                    if combo_count <= 500:
+                        lbl_combo_info.set_text(f'⚡ {combo_count:,} combinaciones (Rápido: ~{est_sec}s)')
+                        lbl_combo_info.classes(remove='text-amber-400 text-rose-400 bg-amber-950/40 bg-rose-950/40 border-amber-800/40 border-rose-800/40 text-purple-400 bg-purple-950/40 border-purple-800/40', add='text-emerald-400 bg-emerald-950/40 border-emerald-800/40')
+                    elif combo_count <= 3000:
+                        lbl_combo_info.set_text(f'⏱️ {combo_count:,} combinaciones (Moderado: ~{est_sec}s)')
+                        lbl_combo_info.classes(remove='text-emerald-400 text-rose-400 bg-emerald-950/40 bg-rose-950/40 border-emerald-800/40 border-rose-800/40 text-purple-400 bg-purple-950/40 border-purple-800/40', add='text-amber-400 bg-amber-950/40 border-amber-800/40')
+                    else:
+                        lbl_combo_info.set_text(f'⚠️ {combo_count:,} combinaciones (Extenso: ~{est_sec}s - se recomienda aumentar Paso)')
+                        lbl_combo_info.classes(remove='text-emerald-400 text-amber-400 bg-emerald-950/40 bg-amber-950/40 border-emerald-800/40 border-amber-800/40 text-purple-400 bg-purple-950/40 border-purple-800/40', add='text-rose-400 bg-rose-950/40 border-rose-800/40')
                 except Exception as ex:
                     lbl_combo_info.set_text(f'ℹ️  Combinaciones: {ex}')
 
@@ -349,9 +373,14 @@ def render_optimizer_page(on_go_to_analyzer=None):
                             except (ValueError, TypeError):
                                 continue  # Parámetro no numérico
 
-                            default_min = p_num
-                            default_max = p_num * 3 if p_num > 0 else 10.0
-                            default_step = max(1.0, p_num)
+                            if p_num == int(p_num):
+                                default_min = max(1.0, float(int(p_num * 0.5)))
+                                default_max = float(int(p_num * 2.0)) if p_num > 0 else 10.0
+                                default_step = max(1.0, float(max(1, int(round((default_max - default_min) / 4.0)))))
+                            else:
+                                default_min = max(0.01, round(p_num * 0.5, 4))
+                                default_max = round(p_num * 2.0, 4) if p_num > 0 else 10.0
+                                default_step = max(0.01, round((default_max - default_min) / 4.0, 4))
                             
                             opt_ranges[p_name] = {'min': default_min, 'max': default_max, 'step': default_step}
 
@@ -410,19 +439,31 @@ def render_optimizer_page(on_go_to_analyzer=None):
                         value=state['optimize_metric']
                     ).bind_value(state, 'optimize_metric').classes('w-64')
 
-                btn_run_opt = ui.button(
-                    '🚀 INICIAR OPTIMIZADOR (GRID SEARCH)',
-                    on_click=lambda: asyncio.create_task(_run_optimizer())
-                ).classes('bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold px-8 py-3 rounded-xl shadow-lg transition-all text-sm tracking-wide')
+                with ui.row().classes('items-center gap-2'):
+                    btn_run_opt = ui.button(
+                        '🚀 INICIAR OPTIMIZADOR (GRID SEARCH)',
+                        on_click=lambda: asyncio.create_task(_run_optimizer())
+                    ).classes('bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold px-8 py-3 rounded-xl shadow-lg transition-all text-sm tracking-wide')
 
-                btn_wf = ui.button(
-                    '\U0001f504 WALK-FORWARD',
-                    on_click=lambda: asyncio.create_task(_run_walk_forward_ui())
-                ).classes('bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold px-5 py-3 rounded-xl shadow transition-all text-sm')
+                    def _cancel_optimizer():
+                        if cancel_token['event']:
+                            cancel_token['event'].set()
+                            ui.notify('🛑 Cancelando optimización...', type='warning')
+
+                    btn_cancel_opt = ui.button(
+                        '🛑 DETENER',
+                        on_click=_cancel_optimizer
+                    ).classes('bg-rose-600 hover:bg-rose-500 text-white font-bold px-4 py-3 rounded-xl shadow text-sm')
+                    btn_cancel_opt.set_visibility(False)
+
+                    btn_wf = ui.button(
+                        '🔄 WALK-FORWARD',
+                        on_click=lambda: asyncio.create_task(_run_walk_forward_ui())
+                    ).classes('bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold px-5 py-3 rounded-xl shadow transition-all text-sm')
 
             # Barra de Progreso
             opt_progress = ui.linear_progress(value=0).classes('w-full mt-4').props('color=amber-8')
-            lbl_progress = ui.label('').classes('text-xs text-slate-400 mt-1')
+            lbl_progress = ui.label('').classes('text-xs text-slate-400 mt-1 font-mono')
 
             # Nota: ambiguedad SL/TP intrabarra
             with ui.row().classes('w-full items-start gap-2 mt-2 bg-slate-800/40 border border-slate-700/50 rounded-lg p-2.5'):
@@ -531,9 +572,16 @@ def render_optimizer_page(on_go_to_analyzer=None):
                 </q-td>
             ''')
 
-            def _on_apply_params(e):
-                row = e.args
-                raw_p = row.get('raw_params', {})
+            def _on_apply_params(e_or_params):
+                if isinstance(e_or_params, dict) and 'args' in e_or_params:
+                    raw_p = e_or_params['args'].get('raw_params', {})
+                elif isinstance(e_or_params, dict) and 'raw_params' in e_or_params:
+                    raw_p = e_or_params.get('raw_params', {})
+                elif isinstance(e_or_params, dict):
+                    raw_p = e_or_params
+                else:
+                    raw_p = {}
+
                 if on_go_to_analyzer:
                     on_go_to_analyzer(state.get('strategy_name'), state.get('symbol'), state.get('timeframe'), raw_p)
                 else:
@@ -717,14 +765,12 @@ def render_optimizer_page(on_go_to_analyzer=None):
                         ui.label('Interpretación Cuantitativa de los Gráficos').classes('text-xs font-bold text-amber-300 font-mono uppercase tracking-wider')
 
                     with ui.row().classes('w-full grid grid-cols-1 md:grid-cols-3 gap-3 text-xs'):
-                        # Guía 1: Por qué el parámetro es influyente
                         with ui.column().classes('gap-1 bg-slate-900/60 p-2.5 rounded border border-slate-800'):
                             ui.label('💡 ¿Por qué un Parámetro Domina la Influencia?').classes('font-bold text-purple-400')
                             lbl_param_insight = ui.label(
                                 'El Stop Loss (SL) suele ser el más influyente porque determina la asimetría de pérdidas y si la posición es sacada prematuramente por ruido de mercado.'
                             ).classes('text-[11px] text-slate-300 leading-relaxed')
 
-                        # Guía 2: Curva de Tendencia y Banda
                         with ui.column().classes('gap-1 bg-slate-900/60 p-2.5 rounded border border-slate-800'):
                             ui.label('📈 Banda de Dispersión (μ ± 1σ)').classes('font-bold text-blue-400')
                             ui.label(
@@ -732,7 +778,6 @@ def render_optimizer_page(on_go_to_analyzer=None):
                                 '• Banda Sombreada (±1σ): Mide la incertidumbre. Una banda estrecha indica alta consistencia y bajo riesgo de sobreajuste.'
                             ).classes('text-[11px] text-slate-300 leading-relaxed')
 
-                        # Guía 3: Diagrama de Caja
                         with ui.column().classes('gap-1 bg-slate-900/60 p-2.5 rounded border border-slate-800'):
                             ui.label('📦 Diagrama de Caja (Box Plot)').classes('font-bold text-emerald-400')
                             ui.label(
@@ -748,7 +793,6 @@ def render_optimizer_page(on_go_to_analyzer=None):
 
                 stats_list = rob['param_stats'][selected_p]
                 
-                # Actualizar Tabla
                 param_stats_table.rows = [
                     {
                         'val': s['val'],
@@ -764,7 +808,6 @@ def render_optimizer_page(on_go_to_analyzer=None):
                 ]
                 param_stats_table.update()
 
-                # Actualizar Explicación Contextual según el parámetro
                 p_upper = str(selected_p).upper()
                 imp_pct = dict(rob.get('param_importance_pct', [])).get(selected_p, 0)
                 if 'SL' in p_upper or 'STOP' in p_upper:
@@ -788,7 +831,6 @@ def render_optimizer_page(on_go_to_analyzer=None):
                         "Los valores con mayor PnL medio y menor dispersión (CV bajo) representan las opciones más confiables."
                     )
 
-                # Gráfico 1: Curva de Sensibilidad con Banda de Dispersión
                 x_vals = [s['val'] for s in stats_list]
                 y_means = [s['pnl_mean'] for s in stats_list]
                 y_stds = [s['pnl_std'] for s in stats_list]
@@ -825,7 +867,6 @@ def render_optimizer_page(on_go_to_analyzer=None):
                 )
                 sensitivity_band_plot.update_figure(fig_band)
 
-                # Gráfico 2: Box Plot de PnL
                 fig_box = go.Figure()
                 for s in stats_list:
                     fig_box.add_trace(go.Box(
@@ -927,295 +968,311 @@ def render_optimizer_page(on_go_to_analyzer=None):
         # FUNCIÓN PRINCIPAL DE EJECUCIÓN DEL OPTIMIZADOR
         # ════════════════════════════════════════════════════════
         async def _run_optimizer():
-            if not state['strategy_name']:
-                ui.notify('No hay estrategia seleccionada', type='warning')
+            if state.get('is_running'):
+                ui.notify('Ya hay una optimización en curso.', type='warning')
+                return
+
+            if not state.get('strategy_name'):
+                ui.notify('Por favor selecciona una estrategia para optimizar.', type='warning')
                 return
             if not opt_ranges:
-                ui.notify('No hay parámetros de rango definidos para optimizar', type='warning')
+                ui.notify('No hay parámetros de rango definidos para optimizar.', type='warning')
                 return
 
             file_path = strategies.get(state['strategy_name'])
-            if not file_path:
-                ui.notify('No se encontró el archivo de estrategia', type='warning')
+            if not file_path or not os.path.exists(file_path):
+                ui.notify('No se encontró el archivo de estrategia en disco.', type='warning')
                 return
 
             total_combos = count_combinations(opt_ranges)
-            if total_combos > 5000:
-                ui.notify(
-                    f'El grid tiene {total_combos:,} combinaciones. Se recomienda ajustar los pasos para optimizar el tiempo.',
-                    type='warning', timeout=5000
-                )
+            if total_combos == 0:
+                ui.notify('El rango configurado produce 0 combinaciones.', type='warning')
+                return
 
-            btn_run_opt.set_text(f'⏳ Optimizando... (0/{total_combos})')
+            # Preparar Token de Cancelación y UI
+            cancel_token['event'] = threading.Event()
+            state['is_running'] = True
+            btn_run_opt.set_text(f'⏳ Optimizando... (0/{total_combos:,})')
             btn_run_opt.props('disabled')
+            btn_cancel_opt.set_visibility(True)
             opt_progress.value = 0
-            lbl_progress.set_text(f'Iniciando simulación de {total_combos:,} combinaciones...')
+            lbl_progress.set_text(f'Iniciando: comprobando datos de mercado para {state["symbol"]} ({state["timeframe"]})...')
+            lbl_res_info.set_text('Ejecutando Grid Search en paralelo...')
             opt_result_table.rows = []
             opt_result_table.update()
             robustness_card.set_visibility(False)
             chart_card.set_visibility(False)
 
-            # 1. Cargar datos de mercado
             try:
-                start_dt = parse_flexible_date(state['start_date'], default=datetime(2020, 1, 1, tzinfo=timezone.utc))
-                end_dt = parse_flexible_date(state['end_date'], default=datetime.now(timezone.utc), is_end_of_day=True)
-                db = SessionLocal()
-                market_mgr = MarketDataManager(db)
-                df_opt = market_mgr.get_data(state['symbol'], state['timeframe'], start_dt, end_dt)
-                if df_opt.empty:
-                    market_mgr.update_historical_data(state['symbol'], state['timeframe'], start_dt, end_dt)
-                    df_opt = market_mgr.get_data(state['symbol'], state['timeframe'], start_dt, end_dt)
-                db.close()
-            except Exception as ex:
-                ui.notify(f'Error cargando datos: {ex}', type='negative')
-                btn_run_opt.set_text('🚀 INICIAR OPTIMIZADOR (GRID SEARCH)')
-                btn_run_opt.props(remove='disabled')
-                return
+                # 1. Cargar datos de mercado de forma asíncrona sin congelar la UI
+                start_dt = parse_flexible_date(state.get('start_date', '01/01/20'), default=datetime(2020, 1, 1, tzinfo=timezone.utc))
+                end_dt = parse_flexible_date(state.get('end_date', ''), default=datetime.now(timezone.utc), is_end_of_day=True)
+                
+                df_opt = await run.io_bound(
+                    lambda: _fetch_market_data_sync(state['symbol'], state['timeframe'], start_dt, end_dt)
+                )
 
-            if df_opt.empty:
-                ui.notify('No hay datos históricos disponibles para el activo/período seleccionado.', type='warning')
-                btn_run_opt.set_text('🚀 INICIAR OPTIMIZADOR (GRID SEARCH)')
-                btn_run_opt.props(remove='disabled')
-                return
+                if df_opt is None or df_opt.empty:
+                    ui.notify(f"No hay datos históricos disponibles para {state['symbol']} ({state['timeframe']}).", type='warning', timeout=4000)
+                    lbl_res_info.set_text(f"❌ Sin datos para {state['symbol']} en {state['timeframe']}. Descarga datos en Market Analyzer.")
+                    lbl_progress.set_text('Operación detenida: datos no disponibles.')
+                    return
 
-            # 2. Capital y sizing
-            start_price = df_opt.iloc[0]['open'] if not df_opt.empty else 1.0
-            cap_val = float(state.get('capital', 1.0) or 1.0)
-            if state.get('capital_type', 'QUOTE') == 'BASE':
-                initial_cap_quote = cap_val * start_price
-            else:
-                initial_cap_quote = cap_val
+                # 2. Capital y Sizing
+                start_price = float(df_opt.iloc[0]['open']) if not df_opt.empty and 'open' in df_opt.columns else 1.0
+                cap_val = float(state.get('capital', 1.0) or 1.0)
+                if state.get('capital_type', 'QUOTE') == 'BASE':
+                    initial_cap_quote = cap_val * start_price
+                else:
+                    initial_cap_quote = cap_val
 
-            # Sizing config
-            sizing_mode = state.get('sizing_mode', 'Interés Compuesto (100% Capital)')
-            if 'Riesgo Fijo' in str(sizing_mode):
-                sizing_cfg = {'method': 'fixed_fractional', 'risk_per_trade_pct': 1.0}
-            elif 'Monto Fijo' in str(sizing_mode):
-                raw_fixed = float(state.get('fixed_amount', cap_val) or cap_val)
-                fixed_val = raw_fixed * start_price if state.get('capital_type', 'QUOTE') == 'BASE' else raw_fixed
-                sizing_cfg = {'method': 'fixed_amount', 'value': fixed_val}
-            else:
-                sizing_cfg = {'method': 'compounding', 'value': 100.0}
+                sizing_mode = state.get('sizing_mode', 'Interés Compuesto (100% Capital)')
+                if 'Riesgo Fijo' in str(sizing_mode):
+                    sizing_cfg = {'method': 'fixed_fractional', 'risk_per_trade_pct': 1.0}
+                elif 'Monto Fijo' in str(sizing_mode):
+                    raw_fixed = float(state.get('fixed_amount', cap_val) or cap_val)
+                    fixed_val = raw_fixed * start_price if state.get('capital_type', 'QUOTE') == 'BASE' else raw_fixed
+                    sizing_cfg = {'method': 'fixed_amount', 'value': fixed_val}
+                else:
+                    sizing_cfg = {'method': 'compounding', 'value': 100.0}
 
-            # Equity curve filter config
-            ec_cfg = {
-                'enabled': bool(state.get('ec_enabled', False) or state.get('cl_enabled', False)),
-                'dd_enabled': bool(state.get('ec_enabled', False)),
-                'start_trading_at_dd_pct': float(state.get('ec_start_dd', 30.0)),
-                'stop_trading_at_dd_pct': float(state.get('ec_stop_dd', 0.0)),
-                'cl_enabled': bool(state.get('cl_enabled', False)),
-                'cl_start': int(state.get('cl_start', 3)),
-                'cl_stop': float(state.get('cl_stop', 0.0))
-            }
+                # 3. Equity Curve Filter
+                ec_cfg = {
+                    'enabled': bool(state.get('ec_enabled', False) or state.get('cl_enabled', False)),
+                    'dd_enabled': bool(state.get('ec_enabled', False)),
+                    'start_trading_at_dd_pct': float(state.get('ec_start_dd', 30.0)),
+                    'stop_trading_at_dd_pct': float(state.get('ec_stop_dd', 0.0)),
+                    'cl_enabled': bool(state.get('cl_enabled', False)),
+                    'cl_start': int(state.get('cl_start', 3)),
+                    'cl_stop': float(state.get('cl_stop', 0.0))
+                }
 
-            comm_pct = float(state.get('commission_pct', 0.1) or 0.1)
-            slip_pct = float(state.get('slippage_pct', 0.05) or 0.05)
-            metric_key = state.get('optimize_metric', 'sharpe_ratio')
+                comm_pct = float(state.get('commission_pct', 0.1) or 0.1)
+                slip_pct = float(state.get('slippage_pct', 0.05) or 0.05)
+                metric_key = state.get('optimize_metric', 'sharpe_ratio')
 
-            done_counter = [0]
-            def _progress_cb(done, total):
-                done_counter[0] = done
+                done_counter = [0]
+                def _progress_cb(done, total):
+                    done_counter[0] = done
 
-            import copy
-            param_ranges_copy = copy.deepcopy(opt_ranges)
+                import copy
+                param_ranges_copy = copy.deepcopy(opt_ranges)
 
-            # Ejecutar de forma asíncrona segura sin bloquear NiceGUI
-            opt_task = asyncio.create_task(
-                run.io_bound(
-                    lambda: run_grid_search(
-                        file_path,
-                        df_opt,
-                        initial_cap_quote,
-                        param_ranges_copy,
-                        metric_key,
-                        _progress_cb,
-                        comm_pct,
-                        slip_pct,
-                        ec_cfg,
-                        sizing_cfg
+                # 4. Lanzar Grid Search en pool de hilos
+                start_time = time.time()
+                opt_task = asyncio.create_task(
+                    run.io_bound(
+                        lambda: run_grid_search(
+                            file_path,
+                            df_opt,
+                            initial_cap_quote,
+                            param_ranges_copy,
+                            metric_key,
+                            _progress_cb,
+                            comm_pct,
+                            slip_pct,
+                            ec_cfg,
+                            sizing_cfg,
+                            cancel_event=cancel_token['event']
+                        )
                     )
                 )
-            )
 
-            # Loop de actualización en el hilo principal de NiceGUI (100% seguro)
-            while not opt_task.done():
-                current_done = done_counter[0]
-                pct = current_done / total_combos if total_combos > 0 else 0
-                opt_progress.value = pct
-                lbl_progress.set_text(f'{current_done} / {total_combos} combinaciones probadas ({pct*100:.1f}%)')
-                btn_run_opt.set_text(f'⏳ Optimizando... ({current_done}/{total_combos})')
-                await asyncio.sleep(0.2)
+                # Loop de monitoreo con ETA y velocidad en tiempo real
+                while not opt_task.done():
+                    current_done = done_counter[0]
+                    pct = current_done / total_combos if total_combos > 0 else 0
+                    opt_progress.value = pct
+                    
+                    elapsed = max(0.1, time.time() - start_time)
+                    speed = current_done / elapsed
+                    remaining = total_combos - current_done
+                    eta_sec = int(remaining / speed) if speed > 0 else 0
+                    eta_str = f"{eta_sec}s" if eta_sec < 60 else f"{eta_sec // 60}m {eta_sec % 60}s"
+                    
+                    lbl_progress.set_text(
+                        f'{current_done:,} / {total_combos:,} combos ({pct*100:.1f}%) '
+                        f'• {speed:.1f} combos/s • Restante: ~{eta_str}'
+                    )
+                    btn_run_opt.set_text(f'⏳ Optimizando... ({current_done}/{total_combos:,})')
+                    await asyncio.sleep(0.2)
 
-            try:
                 results = await opt_task
-            except Exception as task_ex:
-                ui.notify(f"Error durante la optimización: {task_ex}", type='negative')
-                btn_run_opt.set_text('🚀 INICIAR OPTIMIZADOR (GRID SEARCH)')
-                btn_run_opt.props(remove='disabled')
-                return
 
-            state['last_results'] = results
+                if cancel_token['event'] and cancel_token['event'].is_set():
+                    ui.notify(f"Optimización cancelada. Se procesaron {len(results)} combinaciones.", type='warning')
+                    lbl_res_info.set_text(f"⏹️ Optimización cancelada por el usuario ({len(results)} evaluadas).")
+                else:
+                    lbl_res_info.set_text(f"Total: {len(results):,} configuraciones evaluadas con éxito")
 
-            # Formatear y mostrar resultados (sin incluir equity_curve en la tabla para máxima velocidad)
-            rows = []
-            for i, r in enumerate(results, 1):
-                param_str = ' | '.join(f"{k}={v}" for k, v in r['params'].items())
-                rows.append({
-                    'rank': i,
-                    'params': param_str,
-                    'raw_params': r['params'],
-                    'sharpe': r['sharpe_ratio'],
-                    'cagr': r['cagr'],
-                    'maxdd': f"{r['max_drawdown_pct']:.2f}%",
-                    'profit_factor': r.get('profit_factor', 0),
-                    'trades': r['total_trades'],
-                    'win_rate': f"{r.get('percent_profitable', 0):.2f}%",
-                    'cons_losses': r.get('max_consecutive_losers', 0),
-                    'final_eq': f"{r.get('final_equity', 0):,.2f}",
-                    'pnl': r['net_pnl'],
-                })
+                state['last_results'] = results
 
-            opt_result_table.rows = rows
-            opt_result_table.update()
-            opt_progress.value = 1.0
-            lbl_progress.set_text(f'{len(rows)} combinaciones completadas')
-            lbl_res_info.set_text(f"Total: {len(rows)} configuraciones evaluadas con éxito")
-            btn_run_opt.set_text('🚀 INICIAR OPTIMIZADOR (GRID SEARCH)')
-            btn_run_opt.props(remove='disabled')
+                if not results:
+                    lbl_progress.set_text('No se obtuvieron resultados.')
+                    return
 
-            # Renderizar gráfico Plotly para el Top 5
-            top_5 = [r for r in results[:5] if r.get('equity_curve')]
-            if top_5:
-                fig = go.Figure()
-                colors = ['#f59e0b', '#10b981', '#3b82f6', '#ec4899', '#8b5cf6']
-                for idx, t in enumerate(top_5):
-                    p_label = f"#{idx+1}: " + ' '.join(f"{k}={v}" for k, v in t['params'].items())
-                    eq_data = t.get('equity_curve', [])
-                    fig.add_trace(go.Scatter(
-                        y=eq_data,
-                        mode='lines',
-                        name=p_label,
-                        line=dict(color=colors[idx % len(colors)], width=2.5 if idx == 0 else 1.5)
-                    ))
-                fig.update_layout(
-                    template='plotly_dark',
-                    paper_bgcolor='#0a0e17',
-                    plot_bgcolor='#111827',
-                    margin=dict(l=40, r=20, t=30, b=30),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                    xaxis=dict(gridcolor='#1e293b', title='Progreso de Simulación'),
-                    yaxis=dict(gridcolor='#1e293b', title='Capital de la Cuenta')
-                )
-                top_chart_plot.update_figure(fig)
-                chart_card.set_visibility(True)
+                # 5. Formatear y mostrar resultados en la tabla
+                rows = []
+                for i, r in enumerate(results, 1):
+                    param_str = ' | '.join(f"{k}={v}" for k, v in r.get('params', {}).items())
+                    rows.append({
+                        'rank': i,
+                        'params': param_str,
+                        'raw_params': r.get('params', {}),
+                        'sharpe': r.get('sharpe_ratio', 0),
+                        'cagr': r.get('cagr', 0),
+                        'maxdd': f"{r.get('max_drawdown_pct', 0):.2f}%",
+                        'profit_factor': r.get('profit_factor', 0),
+                        'trades': r.get('total_trades', 0),
+                        'win_rate': f"{r.get('percent_profitable', 0):.2f}%",
+                        'cons_losses': r.get('max_consecutive_losers', 0),
+                        'final_eq': f"{r.get('final_equity', 0):,.2f}",
+                        'pnl': r.get('net_pnl', 0),
+                    })
 
-            # ─────────────────────────────────────────────────────────────
-            # EJECUTAR Y RENDERIZAR ANÁLISIS DE ROBUSTEZ Y MESETA
-            # ─────────────────────────────────────────────────────────────
-            try:
-                rob = analyze_robustness(results, param_ranges_copy, metric_key)
-                if rob.get('status') == 'success':
-                    state['robustness_data'] = rob
-                    
-                    # 1. Rellenar Health Score
-                    lbl_robustness_score.set_text(f"{rob['global_score']} / 100")
-                    lbl_health_badge.set_text(rob['health_status'])
-                    lbl_health_desc.set_text(rob['health_desc'])
-                    lbl_profit_rate.set_text(f"{rob['profit_rate']}%")
-                    lbl_sharpe_rate.set_text(f"{rob['sharpe_positive_rate']}%")
-                    lbl_avg_dd.set_text(f"-{rob['mean_dd']}%")
+                opt_result_table.rows = rows
+                opt_result_table.update()
+                opt_progress.value = 1.0
+                total_duration = max(0.1, time.time() - start_time)
+                lbl_progress.set_text(f'✅ Completado: {len(rows):,} combinaciones en {total_duration:.1f}s ({len(rows)/total_duration:.1f} combos/s)')
 
-                    # 2. Rellenar Meseta Robusta (Recomendada)
-                    best_r = rob['best_robust']
-                    rob_param_str = ' | '.join(f"{k}={v}" for k, v in best_r['params'].items())
-                    lbl_rob_params.set_text(rob_param_str)
-                    lbl_rob_sharpe.set_text(str(best_r['self_sharpe']))
-                    lbl_rob_pnl.set_text(f"+{best_r['self_pnl']:,.2f}" if best_r['self_pnl'] >= 0 else f"{best_r['self_pnl']:,.2f}")
-                    lbl_rob_cagr.set_text(f"{best_r['self_cagr']:+.2f}%")
-                    lbl_rob_dd.set_text(f"{best_r['self_dd']:.2f}%")
-                    lbl_rob_neighborhood.set_text(
-                        f"📊 Vecindario ({best_r['neighbors_count']} combos): Sharpe Medio = {best_r['neigh_metric_mean']:.3f} (±{best_r['neigh_metric_std']:.3f}) | PnL Medio = {best_r['neigh_pnl_mean']:+,.2f}"
-                    )
-                    btn_apply_robust.on('click', lambda: _on_apply_params({'args': {'raw_params': best_r['params']}}))
-
-                    # 3. Rellenar Configuración Pico
-                    best_p = rob['best_peak']
-                    peak_param_str = ' | '.join(f"{k}={v}" for k, v in best_p['params'].items())
-                    lbl_peak_params.set_text(peak_param_str)
-                    lbl_peak_sharpe.set_text(str(best_p['sharpe']))
-                    lbl_peak_pnl.set_text(f"+{best_p['pnl']:,.2f}" if best_p['pnl'] >= 0 else f"{best_p['pnl']:,.2f}")
-                    lbl_peak_cagr.set_text(f"{best_p['cagr']:+.2f}%")
-                    lbl_peak_dd.set_text(f"{best_p['dd']:.2f}%")
-                    
-                    if rob['is_same_as_peak']:
-                        lbl_peak_desc.set_text("✅ La configuración pico coincide exactamente con el centro de la meseta más robusta. Excelente estabilidad.")
-                    else:
-                        lbl_peak_desc.set_text("⚠️ Es el pico con mayor métrica aislada, pero sus vecinos sufren mayor degradación. Mayor riesgo de sobreajuste.")
-                    btn_apply_peak.on('click', lambda: _on_apply_params({'args': {'raw_params': best_p['params']}}))
-
-                    # 4. Gráfico de Importancia de Parámetros (% ANOVA)
-                    imp_data = rob['param_importance_pct']
-                    imp_keys = [x[0] for x in imp_data][::-1]
-                    imp_vals = [x[1] for x in imp_data][::-1]
-
-                    fig_imp = go.Figure(go.Bar(
-                        x=imp_vals,
-                        y=imp_keys,
-                        orientation='h',
-                        marker=dict(
-                            color=imp_vals,
-                            colorscale='Viridis',
-                            showscale=False
-                        ),
-                        text=[f"{v}%" for v in imp_vals],
-                        textposition='auto',
-                        textfont=dict(color='white', size=11)
-                    ))
-                    fig_imp.update_layout(
+                # 6. Renderizar Gráfico Plotly Top 5
+                top_5 = [r for r in results[:5] if r.get('equity_curve')]
+                if top_5:
+                    fig = go.Figure()
+                    colors = ['#f59e0b', '#10b981', '#3b82f6', '#ec4899', '#8b5cf6']
+                    for idx, t in enumerate(top_5):
+                        p_label = f"#{idx+1}: " + ' '.join(f"{k}={v}" for k, v in t['params'].items())
+                        eq_data = t.get('equity_curve', [])
+                        fig.add_trace(go.Scatter(
+                            y=eq_data,
+                            mode='lines',
+                            name=p_label,
+                            line=dict(color=colors[idx % len(colors)], width=2.5 if idx == 0 else 1.5)
+                        ))
+                    fig.update_layout(
                         template='plotly_dark',
                         paper_bgcolor='#0a0e17',
                         plot_bgcolor='#111827',
-                        margin=dict(l=60, r=20, t=10, b=20),
-                        xaxis=dict(gridcolor='#1e293b', title='% Influencia sobre Rendimiento', range=[0, max(100, max(imp_vals)+10)]),
-                        yaxis=dict(gridcolor='#1e293b')
+                        margin=dict(l=40, r=20, t=30, b=30),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        xaxis=dict(gridcolor='#1e293b', title='Progreso de Simulación'),
+                        yaxis=dict(gridcolor='#1e293b', title='Capital de la Cuenta')
                     )
-                    param_importance_plot.update_figure(fig_imp)
-                    lbl_influential_summary.set_text(
-                        f"Parámetro Más Influyente: {rob['most_influential_param']} ({rob['most_influential_pct']}%) | Menos Influyente: {rob['least_influential_param']} ({rob['least_influential_pct']}%)"
-                    )
+                    top_chart_plot.update_figure(fig)
+                    chart_card.set_visibility(True)
 
-                    # 5. Selector y Gráficos de Parámetros Individuales
-                    p_keys = list(rob['param_stats'].keys())
-                    param_selector.options = p_keys
-                    param_selector.value = p_keys[0] if p_keys else ''
-                    param_selector.update()
-                    if p_keys:
-                        _update_param_stats_ui(p_keys[0])
+                # 7. Analizador de Robustez & Meseta Cuantitativa
+                try:
+                    rob = analyze_robustness(results, param_ranges_copy, metric_key)
+                    if rob.get('status') == 'success':
+                        state['robustness_data'] = rob
+                        
+                        lbl_robustness_score.set_text(f"{rob['global_score']} / 100")
+                        lbl_health_badge.set_text(rob['health_status'])
+                        lbl_health_desc.set_text(rob['health_desc'])
+                        lbl_profit_rate.set_text(f"{rob['profit_rate']}%")
+                        lbl_sharpe_rate.set_text(f"{rob['sharpe_positive_rate']}%")
+                        lbl_avg_dd.set_text(f"-{rob['mean_dd']}%")
 
-                    # 6. Actualizar Opciones del Mapa de Calor 2D / Superficie 3D
-                    if len(p_keys) >= 2:
-                        heatmap_x_select.options = p_keys
-                        heatmap_x_select.value = p_keys[0]
-                        heatmap_y_select.options = p_keys
-                        heatmap_y_select.value = p_keys[1]
-                        heatmap_x_select.update()
-                        heatmap_y_select.update()
-                        _update_heatmap_ui()
-                    elif len(p_keys) == 1:
-                        heatmap_x_select.options = p_keys
-                        heatmap_x_select.value = p_keys[0]
-                        heatmap_y_select.options = p_keys
-                        heatmap_y_select.value = p_keys[0]
-                        heatmap_x_select.update()
-                        heatmap_y_select.update()
-                        _update_heatmap_ui()
+                        best_r = rob['best_robust']
+                        rob_param_str = ' | '.join(f"{k}={v}" for k, v in best_r['params'].items())
+                        lbl_rob_params.set_text(rob_param_str)
+                        lbl_rob_sharpe.set_text(str(best_r['self_sharpe']))
+                        lbl_rob_pnl.set_text(f"+{best_r['self_pnl']:,.2f}" if best_r['self_pnl'] >= 0 else f"{best_r['self_pnl']:,.2f}")
+                        lbl_rob_cagr.set_text(f"{best_r['self_cagr']:+.2f}%")
+                        lbl_rob_dd.set_text(f"{best_r['self_dd']:.2f}%")
+                        lbl_rob_neighborhood.set_text(
+                            f"📊 Vecindario ({best_r['neighbors_count']} combos): Sharpe Medio = {best_r['neigh_metric_mean']:.3f} (±{best_r['neigh_metric_std']:.3f}) | PnL Medio = {best_r['neigh_pnl_mean']:+,.2f}"
+                        )
+                        btn_apply_robust.on_click(lambda: _on_apply_params(best_r['params']))
 
-                    robustness_card.set_visibility(True)
+                        best_p = rob['best_peak']
+                        peak_param_str = ' | '.join(f"{k}={v}" for k, v in best_p['params'].items())
+                        lbl_peak_params.set_text(peak_param_str)
+                        lbl_peak_sharpe.set_text(str(best_p['sharpe']))
+                        lbl_peak_pnl.set_text(f"+{best_p['pnl']:,.2f}" if best_p['pnl'] >= 0 else f"{best_p['pnl']:,.2f}")
+                        lbl_peak_cagr.set_text(f"{best_p['cagr']:+.2f}%")
+                        lbl_peak_dd.set_text(f"{best_p['dd']:.2f}%")
+                        
+                        if rob['is_same_as_peak']:
+                            lbl_peak_desc.set_text("✅ La configuración pico coincide exactamente con el centro de la meseta más robusta. Excelente estabilidad.")
+                        else:
+                            lbl_peak_desc.set_text("⚠️ Es el pico con mayor métrica aislada, pero sus vecinos sufren mayor degradación. Mayor riesgo de sobreajuste.")
+                        btn_apply_peak.on_click(lambda: _on_apply_params(best_p['params']))
 
-            except Exception as rob_ex:
-                ui.notify(f"Aviso de robustez: {rob_ex}", type='warning')
+                        # Gráfico ANOVA
+                        imp_data = rob['param_importance_pct']
+                        imp_keys = [x[0] for x in imp_data][::-1]
+                        imp_vals = [x[1] for x in imp_data][::-1]
 
-            ui.notify(f"✅ Optimización y Análisis de Robustez finalizados. {len(results)} combinaciones evaluadas.", type='positive', timeout=4.0)
+                        fig_imp = go.Figure(go.Bar(
+                            x=imp_vals,
+                            y=imp_keys,
+                            orientation='h',
+                            marker=dict(
+                                color=imp_vals,
+                                colorscale='Viridis',
+                                showscale=False
+                            ),
+                            text=[f"{v}%" for v in imp_vals],
+                            textposition='auto',
+                            textfont=dict(color='white', size=11)
+                        ))
+                        fig_imp.update_layout(
+                            template='plotly_dark',
+                            paper_bgcolor='#0a0e17',
+                            plot_bgcolor='#111827',
+                            margin=dict(l=60, r=20, t=10, b=20),
+                            xaxis=dict(gridcolor='#1e293b', title='% Influencia sobre Rendimiento', range=[0, max(100, max(imp_vals)+10)]),
+                            yaxis=dict(gridcolor='#1e293b')
+                        )
+                        param_importance_plot.update_figure(fig_imp)
+                        lbl_influential_summary.set_text(
+                            f"Parámetro Más Influyente: {rob['most_influential_param']} ({rob['most_influential_pct']}%) | Menos Influyente: {rob['least_influential_param']} ({rob['least_influential_pct']}%)"
+                        )
+
+                        p_keys = list(rob['param_stats'].keys())
+                        param_selector.options = p_keys
+                        param_selector.value = p_keys[0] if p_keys else ''
+                        param_selector.update()
+                        if p_keys:
+                            _update_param_stats_ui(p_keys[0])
+
+                        if len(p_keys) >= 2:
+                            heatmap_x_select.options = p_keys
+                            heatmap_x_select.value = p_keys[0]
+                            heatmap_y_select.options = p_keys
+                            heatmap_y_select.value = p_keys[1]
+                            heatmap_x_select.update()
+                            heatmap_y_select.update()
+                            _update_heatmap_ui()
+                        elif len(p_keys) == 1:
+                            heatmap_x_select.options = p_keys
+                            heatmap_x_select.value = p_keys[0]
+                            heatmap_y_select.options = p_keys
+                            heatmap_y_select.value = p_keys[0]
+                            heatmap_x_select.update()
+                            heatmap_y_select.update()
+                            _update_heatmap_ui()
+
+                        robustness_card.set_visibility(True)
+
+                except Exception as rob_ex:
+                    ui.notify(f"Aviso de robustez: {rob_ex}", type='warning')
+
+                ui.notify(f"✅ Optimización y Análisis de Robustez completados ({len(results):,} combinaciones).", type='positive', timeout=4000)
+
+            except Exception as task_ex:
+                ui.notify(f"Error durante la optimización: {task_ex}", type='negative')
+                lbl_res_info.set_text(f"❌ Error durante la optimización: {task_ex}")
+                lbl_progress.set_text('Error en la ejecución.')
+
+            finally:
+                state['is_running'] = False
+                btn_run_opt.set_text('🚀 INICIAR OPTIMIZADOR (GRID SEARCH)')
+                btn_run_opt.props(remove='disabled')
+                btn_cancel_opt.set_visibility(False)
 
         # ════════════════════════════════════════════════════════
         # WALK-FORWARD VALIDATION SECTION
@@ -1294,38 +1351,36 @@ def render_optimizer_page(on_go_to_analyzer=None):
         async def _run_walk_forward_ui():
             file_path = strategies.get(state['strategy_name'])
             if not file_path or not opt_ranges:
-                ui.notify('Primero ejecute el Optimizador para definir rangos de parámetros', type='warning')
+                ui.notify('Primero configure la estrategia y rangos de parámetros.', type='warning')
                 return
 
             n_splits_val = int(wf_n_splits.value or 5)
             is_pct_val = float((wf_is_pct.value or 70)) / 100.0
 
-            # Reutilizar datos ya descargados o volver a obtenerlos
             btn_wf.set_text('⏳ Ejecutando Walk-Forward...')
             btn_wf.props('disabled')
 
             try:
-                db_temp = SessionLocal()
-                start_dt = parse_flexible_date(state.get('start_date', '01/01/20'))
-                end_dt = parse_flexible_date(state.get('end_date', ''))
-                mgr = MarketDataManager(db_temp)
-                symbol = state.get('symbol', 'BTC/USDT')
-                timeframe = state.get('timeframe', '1d')
-                df_wf = mgr.get_data(symbol, timeframe, start_dt, end_dt)
-                db_temp.close()
+                start_dt = parse_flexible_date(state.get('start_date', '01/01/20'), default=datetime(2020, 1, 1, tzinfo=timezone.utc))
+                end_dt = parse_flexible_date(state.get('end_date', ''), default=datetime.now(timezone.utc), is_end_of_day=True)
+                
+                df_wf = await run.io_bound(
+                    lambda: _fetch_market_data_sync(state['symbol'], state['timeframe'], start_dt, end_dt)
+                )
 
-                if df_wf.empty:
-                    ui.notify('No hay datos disponibles para Walk-Forward', type='warning')
+                if df_wf is None or df_wf.empty:
+                    ui.notify('No hay datos históricos disponibles para Walk-Forward.', type='warning')
                     return
 
-                start_price = float(df_wf.iloc[0]['open']) if not df_wf.empty else 1.0
+                start_price = float(df_wf.iloc[0]['open']) if not df_wf.empty and 'open' in df_wf.columns else 1.0
                 cap_val = float(state.get('capital', 1.0) or 1.0)
                 initial_cap = cap_val * start_price if state.get('capital_type', 'QUOTE') == 'BASE' else cap_val
                 comm_pct = float(state.get('commission_pct', 0.1) or 0.1)
                 slip_pct = float(state.get('slippage_pct', 0.05) or 0.05)
                 metric_key = state.get('optimize_metric', 'sharpe_ratio')
 
-                opt_ranges_copy = dict(opt_ranges)
+                import copy
+                opt_ranges_copy = copy.deepcopy(opt_ranges)
 
                 wf_result = await run.io_bound(
                     lambda: run_walk_forward(
@@ -1342,7 +1397,6 @@ def render_optimizer_page(on_go_to_analyzer=None):
                     ui.notify(f"Walk-Forward error: {wf_result['error']}", type='negative')
                     return
 
-                # Actualizar métricas
                 eff = wf_result['wf_efficiency']
                 lbl_wf_efficiency.set_text(f"{eff:.2f}")
                 lbl_wf_is_mean.set_text(str(wf_result['is_mean']))
@@ -1356,11 +1410,9 @@ def render_optimizer_page(on_go_to_analyzer=None):
                     lbl_wf_verdict.set_text('✅ ESTRATEGIA ROBUSTA')
                     lbl_wf_verdict.classes(remove='text-red-400', add='text-green-400')
 
-                # Consenso
                 consensus = wf_result.get('consensus_params', {})
                 lbl_wf_consensus.set_text(' | '.join(f"{k}={v}" for k, v in consensus.items()) or '--')
 
-                # Tabla de folds
                 fold_rows = []
                 for f in wf_result['folds']:
                     fold_rows.append({
@@ -1388,7 +1440,7 @@ def render_optimizer_page(on_go_to_analyzer=None):
             except Exception as wf_ex:
                 ui.notify(f"Error en Walk-Forward: {wf_ex}", type='negative')
             finally:
-                btn_wf.set_text('🔄 EJECUTAR WALK-FORWARD VALIDATION')
+                btn_wf.set_text('🔄 WALK-FORWARD')
                 btn_wf.props(remove='disabled')
 
     return {

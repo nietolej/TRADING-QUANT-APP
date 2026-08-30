@@ -27,6 +27,23 @@ from strategy_engine.base_strategy import BaseStrategy
 # Helpers
 # ──────────────────────────────────────────────
 
+def _extract_range_tuple(cfg: Any) -> tuple[float, float, float]:
+    """Extrae (min, max, step) de un dict, tupla o lista."""
+    if isinstance(cfg, (list, tuple)):
+        min_v = cfg[0] if len(cfg) > 0 else 0
+        max_v = cfg[1] if len(cfg) > 1 else min_v
+        step_v = cfg[2] if len(cfg) > 2 else 1
+        return float(min_v), float(max_v), float(step_v)
+    elif isinstance(cfg, dict):
+        min_v = cfg.get('min', cfg.get('start', 0))
+        max_v = cfg.get('max', cfg.get('end', min_v))
+        step_v = cfg.get('step', cfg.get('increment', 1))
+        return float(min_v), float(max_v), float(step_v)
+    else:
+        v = float(cfg or 0)
+        return v, v, 1.0
+
+
 def _build_range(min_val: float, max_val: float, step: float) -> List[float]:
     """
     Genera una lista de valores desde min_val hasta max_val (inclusive) con
@@ -62,32 +79,39 @@ def _build_range(min_val: float, max_val: float, step: float) -> List[float]:
     return values
 
 
-def count_combinations(param_ranges: Dict[str, Dict[str, float]]) -> int:
+def count_combinations(param_ranges: Dict[str, Any]) -> int:
     """Devuelve el número total de combinaciones sin ejecutar el grid."""
     total = 1
     for cfg in param_ranges.values():
-        vals = _build_range(cfg.get('min', 0), cfg.get('max', 0), cfg.get('step', 1))
+        min_v, max_v, st = _extract_range_tuple(cfg)
+        vals = _build_range(min_v, max_v, st)
         total *= max(1, len(vals))
     return total
 
 
 def generate_param_grid(
-    param_ranges: Dict[str, Dict[str, float]]
+    param_ranges: Dict[str, Any]
 ) -> Generator[Dict[str, Any], None, None]:
     """
     Genera todas las combinaciones de parámetros del grid.
     """
     keys = list(param_ranges.keys())
-    ranges = [
-        _build_range(
-            param_ranges[k].get('min', 0),
-            param_ranges[k].get('max', 0),
-            param_ranges[k].get('step', 1),
-        )
-        for k in keys
-    ]
+    ranges = []
+    for k in keys:
+        min_v, max_v, st = _extract_range_tuple(param_ranges[k])
+        ranges.append(_build_range(min_v, max_v, st))
+
     for combo in itertools.product(*ranges):
         yield dict(zip(keys, combo))
+
+
+def _create_strategy_instance(config: Dict[str, Any], params: Dict[str, Any]) -> BaseStrategy:
+    """Instancia la clase de estrategia adecuada según 'class_name'."""
+    class_name = config.get("class_name")
+    if class_name == "OnChainFlowStrategy":
+        from strategy_engine.onchain_flow_strategy import OnChainFlowStrategy
+        return OnChainFlowStrategy(config, custom_parameters=params)
+    return BaseStrategy(config, custom_parameters=params)
 
 
 # ──────────────────────────────────────────────
@@ -120,7 +144,7 @@ def _optimizer_worker(
         if ec_config:
             config_copy['equity_curve_management'] = ec_config
 
-        strategy = BaseStrategy(config_copy, custom_parameters=params)
+        strategy = _create_strategy_instance(config_copy, params)
 
         if ec_config and ec_config.get('enabled', False):
             from backtest_engine.equity_curve_backtester import EquityCurveBacktester
@@ -220,11 +244,13 @@ def run_grid_search(
     commission_pct: float = 0.1,
     slippage_pct: float = 0.05,
     ec_config: Optional[Dict[str, Any]] = None,
-    sizing_config: Optional[Dict[str, Any]] = None
+    sizing_config: Optional[Dict[str, Any]] = None,
+    cancel_event: Optional[Any] = None
 ) -> List[Dict[str, Any]]:
     """
     Ejecuta Grid Search de forma segura y multihilo.
     Retorna una lista de resultados ordenados de mejor a peor según `optimize_metric`.
+    Soporta cancelación inmediata mediante `cancel_event`.
     """
     results: List[Dict[str, Any]] = []
     total = count_combinations(param_ranges)
@@ -254,6 +280,11 @@ def run_grid_search(
         }
         
         for future in concurrent.futures.as_completed(futures):
+            if cancel_event and getattr(cancel_event, 'is_set', lambda: False)():
+                for f in futures:
+                    f.cancel()
+                break
+
             try:
                 res = future.result()
                 results.append(res)
@@ -314,6 +345,7 @@ def run_walk_forward(
     slippage_pct: float = 0.05,
     sizing_config: Optional[Dict[str, Any]] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    cancel_event: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Validación Walk-Forward para detectar overfitting en Grid Search.
@@ -340,6 +372,9 @@ def run_walk_forward(
     done = 0
 
     for fold_idx in range(n_splits):
+        if cancel_event and getattr(cancel_event, 'is_set', lambda: False)():
+            break
+
         fold_start = fold_idx * window_size
         fold_end = fold_start + window_size if fold_idx < n_splits - 1 else n
         fold_df = df.iloc[fold_start:fold_end].copy()
@@ -364,6 +399,7 @@ def run_walk_forward(
             commission_pct=commission_pct,
             slippage_pct=slippage_pct,
             sizing_config=sizing_config,
+            cancel_event=cancel_event,
         )
 
         if not is_results or is_results[0].get('error'):

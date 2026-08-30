@@ -8,9 +8,12 @@ venv/
 env/
 .venv/
 
-# Databases
+# Databases & Data Cache
 *.db
 *.sqlite3
+*.parquet
+data/
+!data/.gitkeep
 
 # Logs
 logs/
