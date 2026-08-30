@@ -249,7 +249,7 @@ def build_tradingview_plotly_figure(
         'SMA_20': '#3b82f6', 'SMA_50': '#8b5cf6', 'SMA_200': '#ec4899',
         'EMA_9': '#f59e0b', 'EMA_21': '#10b981', 'EMA_50': '#06b6d4', 'EMA_200': '#6366f1',
         'EMA_1': '#f43f5e', 'EMA_5': '#fb7185', 'EMA_10': '#38bdf8', 'EMA_12': '#f59e0b',
-        'EMA_26': '#a855f7', 'EMA_30': '#10b981'
+        'EMA_15': '#06b6d4', 'EMA_26': '#a855f7', 'EMA_30': '#10b981'
     }
     color_palette = [
         '#3b82f6', '#f59e0b', '#10b981', '#a855f7', '#06b6d4',

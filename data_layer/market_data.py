@@ -96,7 +96,14 @@ class MarketDataManager:
         since_ms = int(since.timestamp() * 1000) if since else None
         
         try:
-            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
+            ccxt_symbol = symbol
+            if '/' not in ccxt_symbol:
+                for q in ['USDT', 'BTC', 'ETH', 'BNB', 'BUSD', 'USDC']:
+                    if ccxt_symbol.endswith(q) and len(ccxt_symbol) > len(q):
+                        ccxt_symbol = f"{ccxt_symbol[:-len(q)]}/{q}"
+                        break
+
+            ohlcv = self.exchange.fetch_ohlcv(ccxt_symbol, timeframe, since=since_ms, limit=limit)
             
             if not ohlcv:
                 return pd.DataFrame()

@@ -1,7 +1,79 @@
 import pandas as pd
 import logging
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+
+def parse_flexible_date(dt_str, default=None, is_end_of_day=False) -> datetime:
+    """
+    Parsea una fecha en formatos dd/mm/aa, dd/mm/aaaa, yyyy-mm-dd, etc.
+    Devuelve un datetime con zona horaria UTC.
+    """
+    if not dt_str:
+        return default or datetime.now(timezone.utc)
+    if isinstance(dt_str, datetime):
+        res = dt_str
+        if res.tzinfo is None:
+            res = res.replace(tzinfo=timezone.utc)
+        return res
+
+    s = str(dt_str).strip()
+    formats = [
+        '%d/%m/%y', '%d/%m/%Y',
+        '%d-%m-%y', '%d-%m-%Y',
+        '%Y-%m-%d', '%y-%m-%d',
+        '%Y/%m/%d', '%y/%m/%d',
+        '%d/%m/%y %H:%M', '%d/%m/%Y %H:%M',
+        '%Y-%m-%d %H:%M', '%y-%m-%d %H:%M',
+        '%d/%m/%y %H:%M:%S', '%d/%m/%Y %H:%M:%S',
+        '%Y-%m-%d %H:%M:%S'
+    ]
+    parsed = None
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(s, fmt)
+            break
+        except ValueError:
+            pass
+
+    if parsed is None:
+        try:
+            parsed = pd.to_datetime(s, dayfirst=True).to_pydatetime()
+        except Exception:
+            parsed = default or datetime.now()
+
+    if is_end_of_day and parsed.hour == 0 and parsed.minute == 0 and parsed.second == 0:
+        parsed = parsed.replace(hour=23, minute=59, second=59)
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed
+
+
+def format_dt_display(v, include_time: bool = True) -> str:
+    """
+    Formatea cualquier timestamp/fecha al formato estándar de la plataforma dd/mm/aa (o dd/mm/aa HH:MM).
+    Ejemplo: 2020-10-09 00:00:00 -> 09/10/20 00:00
+    """
+    if v is None or v == '':
+        return ''
+    try:
+        dt = pd.to_datetime(v, dayfirst=True)
+        if pd.isna(dt):
+            return ''
+        if include_time:
+            return dt.strftime('%d/%m/%y %H:%M')
+        else:
+            return dt.strftime('%d/%m/%y')
+    except Exception:
+        return str(v)
+
+
+def format_date_display(v) -> str:
+    """Formatea al estándar dd/mm/aa (solo fecha)."""
+    return format_dt_display(v, include_time=False)
+
 
 def export_df_to_ninjatrader8(
     df: pd.DataFrame, 

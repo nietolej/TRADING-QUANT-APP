@@ -18,9 +18,196 @@ from data_layer.storage import SessionLocal, OHLCV, BacktestRun
 from backtest_engine.metrics import calculate_metrics, calculate_equity_curve_metrics
 import yaml
 from web_gui.components.tradingview_chart import build_tradingview_plotly_figure
+from data_layer.export_utils import export_df_to_ninjatrader8, format_dt_display, format_date_display, parse_flexible_date
 
 
-def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
+def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_dt, comm_pct, slip_pct):
+    db = SessionLocal()
+    try:
+        market_mgr = MarketDataManager(db)
+        equity_series_dict = {}
+        all_trades = []
+        strategy_breakdown = []
+
+        for idx, item in enumerate(portfolio_items):
+            strategy_path = item['strategy_path']
+            symbol = item['symbol']
+            timeframe = item['timeframe']
+            weight_pct = float(item.get('weight_pct', 0.0))
+            if weight_pct <= 0:
+                continue
+
+            allocated_cap = total_capital * (weight_pct / 100.0)
+
+            df = market_mgr.get_data(symbol, timeframe, start_dt, end_dt)
+            if df.empty:
+                market_mgr.update_historical_data(symbol, timeframe, start_dt, end_dt)
+                df = market_mgr.get_data(symbol, timeframe, start_dt, end_dt)
+
+            if df.empty:
+                continue
+
+            custom_params = item.get('custom_params', {})
+            strategy = BaseStrategy(strategy_path, custom_parameters=custom_params)
+            strategy.symbol = symbol
+            strategy.timeframe = timeframe
+
+            if 'risk_management' not in strategy.config:
+                strategy.config['risk_management'] = {}
+            strategy.config['risk_management']['position_sizing'] = {'method': 'compounding', 'value': 100.0}
+            strategy.risk_manager = RiskManager(strategy.config['risk_management'])
+
+            backtester = Backtester(strategy, initial_capital=allocated_cap, commission_pct=comm_pct, slippage_pct=slip_pct)
+            results = backtester.run(df)
+
+            eq_curve = results.get('equity_curve')
+            name_label = f"Strat {idx+1}: {os.path.basename(strategy_path)} ({symbol} {timeframe})"
+            
+            if eq_curve is not None and not eq_curve.empty:
+                if 'timestamp' in eq_curve.columns:
+                    eq_curve = eq_curve.set_index('timestamp')
+                eq_curve.index = pd.to_datetime(eq_curve.index)
+                equity_series_dict[name_label] = eq_curve['equity']
+
+            trades = results.get('trades')
+            if trades is not None and not trades.empty:
+                trades_copy = trades.copy()
+                trades_copy['strategy'] = name_label
+                all_trades.append(trades_copy)
+
+            strat_cagr = results.get('cagr', 0.0)
+            strat_max_dd = results.get('max_drawdown_pct', 0.0)
+            strat_final_eq = results.get('final_equity', allocated_cap)
+            strat_pnl_pct = ((strat_final_eq - allocated_cap) / allocated_cap * 100.0) if allocated_cap > 0 else 0.0
+
+            strategy_breakdown.append({
+                'name': name_label,
+                'weight_pct': weight_pct,
+                'allocated_cap': allocated_cap,
+                'final_cap': strat_final_eq,
+                'pnl_pct': strat_pnl_pct,
+                'cagr': strat_cagr,
+                'max_dd': strat_max_dd,
+                'trades_count': len(trades) if trades is not None else 0
+            })
+
+        if not equity_series_dict:
+            return {'error': "No se pudieron obtener datos o generar equidad para las estrategias del portafolio."}
+
+        combined_df = pd.DataFrame(equity_series_dict).ffill().bfill()
+        portfolio_equity = combined_df.sum(axis=1)
+
+        port_eq_metrics = calculate_equity_curve_metrics(portfolio_equity)
+
+        combined_trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+        port_trade_metrics = calculate_metrics(combined_trades, total_capital) if not combined_trades.empty else {}
+
+        # Calculate Drawdown series (%)
+        roll_max = portfolio_equity.cummax()
+        drawdown_series = (portfolio_equity - roll_max) / roll_max * 100.0
+
+        # Calculate individual drawdown series (%)
+        individual_drawdowns = {}
+        for col in combined_df.columns:
+            s_series = combined_df[col]
+            s_roll_max = s_series.cummax()
+            s_dd = (s_series - s_roll_max) / s_roll_max * 100.0
+            individual_drawdowns[col] = s_dd.round(2).tolist()
+
+        dates_str = [format_date_display(d) for d in portfolio_equity.index]
+
+        total_trades_count = len(combined_trades)
+        winning_trades_count = int(port_trade_metrics.get('winning_trades', 0))
+        losing_trades_count = int(port_trade_metrics.get('losing_trades', 0))
+        if winning_trades_count == 0 and losing_trades_count == 0 and not combined_trades.empty:
+            pnl_col = 'pnl' if 'pnl' in combined_trades.columns else 'net_pnl' if 'net_pnl' in combined_trades.columns else None
+            if pnl_col:
+                winning_trades_count = int((combined_trades[pnl_col] > 0).sum())
+                losing_trades_count = int((combined_trades[pnl_col] < 0).sum())
+
+        win_rate_val = port_trade_metrics.get('percent_profitable', 0.0)
+        if win_rate_val == 0.0 and total_trades_count > 0:
+            win_rate_val = (winning_trades_count / total_trades_count) * 100.0
+
+        # Formatear y ordenar operaciones cronológicamente
+        formatted_trades = []
+        if not combined_trades.empty:
+            sort_col = None
+            for candidate in ['entry_time', 'Entry Timestamp', 'timestamp', 'date', 'entry_date']:
+                if candidate in combined_trades.columns:
+                    sort_col = candidate
+                    break
+
+            if sort_col:
+                try:
+                    combined_trades[sort_col] = pd.to_datetime(combined_trades[sort_col])
+                    combined_trades = combined_trades.sort_values(by=sort_col, ascending=True)
+                except Exception:
+                    pass
+
+            for trade_idx, tr in combined_trades.iterrows():
+                e_time = tr.get('entry_time') or tr.get('Entry Timestamp') or tr.get('timestamp') or "N/A"
+                e_time_str = format_dt_display(e_time)
+
+                x_time = tr.get('exit_time') or tr.get('Exit Timestamp') or "N/A"
+                x_time_str = format_dt_display(x_time)
+
+                pnl_val = float(tr.get('pnl', 0.0) or 0.0)
+                entry_p = float(tr.get('entry_price', 0.0) or 0.0)
+                exit_p = float(tr.get('exit_price', 0.0) or 0.0)
+                side_val = str(tr.get('side', 'LONG')).upper()
+
+                if 'pnl_pct' in tr and pd.notna(tr['pnl_pct']):
+                    pnl_pct_val = float(tr['pnl_pct'])
+                elif entry_p > 0:
+                    if side_val == 'LONG':
+                        pnl_pct_val = ((exit_p - entry_p) / entry_p) * 100.0
+                    else:
+                        pnl_pct_val = ((entry_p - exit_p) / entry_p) * 100.0
+                else:
+                    pnl_pct_val = 0.0
+
+                pnl_pct_str = f"{'+' if pnl_pct_val > 0 else ''}{pnl_pct_val:.2f}%"
+
+                formatted_trades.append({
+                    'trade_id': trade_idx,
+                    'entry_time': e_time_str,
+                    'exit_time': x_time_str,
+                    'strategy': str(tr.get('strategy', 'N/A')),
+                    'side': side_val,
+                    'entry_price': f"${entry_p:,.4f}" if entry_p > 0 else "$0.00",
+                    'exit_price': f"${exit_p:,.4f}" if exit_p > 0 else "$0.00",
+                    'pnl_raw': pnl_val,
+                    'pnl_str': f"{'+' if pnl_val > 0 else ''}${pnl_val:,.2f}",
+                    'pnl_pct_raw': pnl_pct_val,
+                    'pnl_pct_str': pnl_pct_str,
+                    'reason': str(tr.get('exit_reason', 'Señal'))
+                })
+
+        return {
+            'portfolio_equity': portfolio_equity.round(2).tolist(),
+            'individual_equity': {col: combined_df[col].round(2).tolist() for col in combined_df.columns},
+            'drawdown_series': drawdown_series.round(2).tolist(),
+            'individual_drawdowns': individual_drawdowns,
+            'dates': [format_date_display(d) for d in portfolio_equity.index],
+            'cagr': port_eq_metrics.get('cagr', 0.0),
+            'max_drawdown_pct': port_eq_metrics.get('max_drawdown_pct', 0.0),
+            'sharpe_ratio': port_eq_metrics.get('sharpe_ratio', 0.0),
+            'profit_factor': port_trade_metrics.get('profit_factor', 0.0),
+            'total_trades': total_trades_count,
+            'winning_trades': winning_trades_count,
+            'losing_trades': losing_trades_count,
+            'win_rate': win_rate_val,
+            'chronological_trades': formatted_trades,
+            'strategy_breakdown': strategy_breakdown,
+            'initial_capital': total_capital,
+            'final_equity': float(portfolio_equity.iloc[-1]) if not portfolio_equity.empty else total_capital
+        }
+    finally:
+        db.close()
+
+
+def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_to_portfolio=None):
     with ui.column().classes('w-full q-pa-md'):
         with ui.row().classes('w-full justify-between items-center mb-4'):
             ui.label('Análisis de Estrategia y Backtesting').classes('text-2xl font-bold text-slate-200')
@@ -165,7 +352,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
 
                         rows.append({
                             'run_id': run.run_id,
-                            'created_at': run.created_at.strftime("%Y-%m-%d %H:%M") if run.created_at else "N/A",
+                            'created_at': format_dt_display(run.created_at) if run.created_at else "N/A",
                             'strategy_name': run.strategy_name or "",
                             'symbol': run.symbol or "",
                             'timeframe': run.timeframe or "",
@@ -176,8 +363,8 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                             'win_rate': f"{run.win_rate:.2f}%" if run.win_rate is not None else "0.00%",
                             'trades': run.total_trades or 0,
                             'config_snapshot': run.config_snapshot,
-                            'start_date': run.start_date.strftime("%Y-%m-%d") if run.start_date else "2024-01-01",
-                            'end_date': run.end_date.strftime("%Y-%m-%d") if run.end_date else datetime.now().strftime("%Y-%m-%d")
+                            'start_date': format_date_display(run.start_date) if run.start_date else "01/01/24",
+                            'end_date': format_date_display(run.end_date) if run.end_date else format_date_display(datetime.now())
                         })
                     history_table.rows = rows
                     history_table.update()
@@ -267,13 +454,18 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                     'capital': state.get('capital'),
                     'capital_type': state.get('capital_type')
                 })
+                start_val = metrics.get('start_dt') or state.get('start_date')
+                end_val = metrics.get('end_dt') or state.get('end_date')
+                s_dt = parse_flexible_date(start_val) if start_val else datetime(2020, 1, 1, tzinfo=timezone.utc)
+                e_dt = parse_flexible_date(end_val) if end_val else datetime.now(timezone.utc)
+
                 run_record = BacktestRun(
                     run_id=run_id,
                     strategy_name=state.get('strategy_name', 'Estrategia'),
                     symbol=state.get('symbol', 'BTC/USDT'),
                     timeframe=state.get('timeframe', '1d'),
-                    start_date=metrics.get('start_dt'),
-                    end_date=metrics.get('end_dt'),
+                    start_date=s_dt,
+                    end_date=e_dt,
                     created_at=datetime.now(timezone.utc),
                     config_snapshot=config_json,
                     cagr=metrics.get('cagr', 0.0),
@@ -332,14 +524,16 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
             'strategy_name': list(strategies.keys())[0] if strategies else '',
             'symbol': available_symbols[0],
             'timeframe': '1d',
-            'start_date': '2020-01-01',
-            'end_date': datetime.now().strftime('%Y-%m-%d'),
+            'start_date': '01/01/20',
+            'end_date': format_date_display(datetime.now()),
             'capital': 1.0,
             'capital_type': 'BASE',
             'sizing_mode': 'Interés Compuesto (100% Capital)',
             'fixed_amount': 1.0,
             'commission_pct': 0.1,
             'slippage_pct': 0.05,
+            'account_mode': 'spot_cash',
+            'leverage': 1.0,
             
             # Results
             'cagr': '-- %',
@@ -395,15 +589,8 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                 _logging.warning(f"run_backtest: could not show calc_notify: {_ne}")
             
             try:
-                try:
-                    start_dt = datetime.strptime(str(state['start_date']).strip(), '%Y-%m-%d').replace(tzinfo=timezone.utc)
-                except Exception:
-                    start_dt = datetime(2024, 1, 1, tzinfo=timezone.utc)
-
-                try:
-                    end_dt = datetime.strptime(str(state['end_date']).strip(), '%Y-%m-%d').replace(hour=23, minute=59, tzinfo=timezone.utc)
-                except Exception:
-                    end_dt = datetime.now(timezone.utc)
+                start_dt = parse_flexible_date(state.get('start_date'), default=datetime(2020, 1, 1, tzinfo=timezone.utc))
+                end_dt = parse_flexible_date(state.get('end_date'), default=datetime.now(timezone.utc), is_end_of_day=True)
                 
                 file_path = strategies[state['strategy_name']]
                 symbol = state['symbol']
@@ -443,6 +630,8 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                     fixed_quote_amt = raw_fixed_val
 
                 # Ejecutar descarga + simulación en hilo I/O secundario para NO congelar la UI
+                acct_mode = state.get('account_mode', 'spot_cash')
+                lev_val = float(state.get('leverage', 1.0) or 1.0)
                 results = await run.io_bound(
                     _sync_load_and_run,
                     file_path,
@@ -455,7 +644,11 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                     sizing_mode,
                     comm_pct,
                     slip_pct,
-                    fixed_quote_amt
+                    fixed_quote_amt,
+                    acct_mode,
+                    lev_val,
+                    initial_cap_base,
+                    bool(state.get('entry_on_next_open', False))
                 )
                 
                 with client:
@@ -468,15 +661,22 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                         drawdown    = pd.Series(dtype=float)
     
                         if equity_curve is not None and not equity_curve.empty:
-                            if 'strategy_indicators' in results:
-                                # Desactivar medias previas
+                            if 'strategy_indicators' in results and results['strategy_indicators']:
+                                # Desactivar medias previas fijas
                                 for k in list(chart_config.keys()):
                                     if k.startswith('sma_') or k.startswith('ema_'):
                                         chart_config[k] = False
                                 # Activar dinámicamente las calculadas en la estrategia
                                 for ind, p in results['strategy_indicators']:
-                                    key = f"{ind}_{p}"
-                                    chart_config[key] = True
+                                    if ind in ['sma', 'ema']:
+                                        key = f"{ind}_{p}"
+                                        chart_config[key] = True
+                                    elif ind == 'rsi':
+                                        chart_config['rsi'] = True
+                                        chart_config['rsi_period'] = p
+                                    elif ind == 'atr':
+                                        chart_config['atr'] = True
+                                        chart_config['atr_period'] = p
                                 
                                 try:
                                     render_price_overlays.refresh()
@@ -550,27 +750,31 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                                                      add='text-green-600' if win_rate > 50 else 'text-red-600')
     
                                 import numpy as np
-                                roll_max = equity_curve['equity'].cummax()
-                                drawdown = ((equity_curve['equity'] - roll_max) / roll_max * 100).replace([np.inf, -np.inf], np.nan).fillna(0)
+                                roll_max_q = equity_curve['equity'].cummax()
+                                drawdown_q = ((equity_curve['equity'] - roll_max_q) / roll_max_q * 100).replace([np.inf, -np.inf], np.nan).fillna(0)
                                 
                                 # Downsample to prevent browser freeze and WebSocket disconnects on large datasets
                                 MAX_POINTS = 1000
                                 if len(equity_curve) > MAX_POINTS:
                                     step = len(equity_curve) // MAX_POINTS
-                                    dates_eq = equity_curve.index[::step].strftime('%Y-%m-%d %H:%M').tolist()
+                                    dates_eq = [x.strftime('%d/%m/%y %H:%M') for x in equity_curve.index[::step]]
                                     eq_vals = equity_curve['equity'].iloc[::step].replace([np.inf, -np.inf], np.nan).fillna(0)
-                                    drawdown_sampled = drawdown.iloc[::step]
+                                    dd_q_sampled = drawdown_q.iloc[::step]
                                 else:
-                                    dates_eq = equity_curve.index.strftime('%Y-%m-%d %H:%M').tolist()
+                                    dates_eq = [x.strftime('%d/%m/%y %H:%M') for x in equity_curve.index]
                                     eq_vals = equity_curve['equity'].replace([np.inf, -np.inf], np.nan).fillna(0)
-                                    drawdown_sampled = drawdown
+                                    dd_q_sampled = drawdown_q
 
                                 close_aln = df['close'].reindex(eq_vals.index).ffill()
                                 eq_base   = (eq_vals / close_aln).replace([np.inf, -np.inf], np.nan).fillna(0)
+                                roll_max_b = eq_base.cummax()
+                                dd_b_sampled = ((eq_base - roll_max_b) / roll_max_b * 100).replace([np.inf, -np.inf], np.nan).fillna(0)
     
-                                state['equity_dates']      = dates_eq
-                                state['equity_quote_data'] = eq_vals.round(6).tolist()
-                                state['equity_base_data']  = eq_base.round(6).tolist()
+                                state['equity_dates']        = dates_eq
+                                state['equity_quote_data']   = eq_vals.round(6).tolist()
+                                state['equity_base_data']    = eq_base.round(6).tolist()
+                                state['drawdown_quote_data'] = dd_q_sampled.round(4).tolist()
+                                state['drawdown_base_data']  = dd_b_sampled.round(4).tolist()
     
                                 is_quote = (equity_toggle.value == 'QUOTE')
                                 chart.options['xAxis']['data'] = dates_eq
@@ -582,7 +786,8 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                                 chart.options['series'][0]['name'] = f"Equity (Real {quote_a if is_quote else base_a})"
                                 
                                 drawdown_chart.options['xAxis']['data'] = dates_eq
-                                drawdown_chart.options['series'][0]['data'] = drawdown_sampled.round(4).tolist()
+                                drawdown_chart.options['series'][0]['data'] = state['drawdown_quote_data'] if is_quote else state['drawdown_base_data']
+                                drawdown_chart.options['series'][0]['name'] = f"Drawdown ({quote_a if is_quote else base_a})"
 
                                 # Procesar curva virtual si existe
                                 v_equity_curve = results.get("virtual_equity_curve")
@@ -636,7 +841,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                             # Downsample empty chart
                             MAX_POINTS = 1000
                             df_sampled = df.iloc[::max(1, len(df)//MAX_POINTS)] if len(df) > MAX_POINTS else df
-                            dates_empty = df_sampled.index.strftime('%Y-%m-%d %H:%M').tolist()
+                            dates_empty = [x.strftime('%d/%m/%y %H:%M') for x in df_sampled.index]
                             
                             chart.options['xAxis']['data'] = dates_empty
                             chart.options['series'][0]['data'] = [round(initial_cap_quote, 6)] * len(df_sampled)
@@ -702,14 +907,60 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
     
                         def fmt_dt(v):
                             if not v: return ''
-                            s = str(v).replace('T', ' ')
-                            return s[2:16] if len(s) >= 16 else s
+                            try:
+                                dt = pd.to_datetime(v)
+                                return dt.strftime('%d/%m/%y %H:%M')
+                            except:
+                                s = str(v).replace('T', ' ')
+                                return s[:16]
     
                         async def _process_trades_df(t_df, dd_series):
                             t_rows = []
                             c_q, c_b = 0.0, 0.0
                             b_q, b_b = initial_cap_quote, initial_cap_base
                             max_closed_b_q = initial_cap_quote
+
+                            price_lookup = {}
+                            if df is not None and not df.empty:
+                                for ts_idx, r_ohlcv in df.iterrows():
+                                    o_val = float(r_ohlcv.get('open', 0.0) or 0.0)
+                                    h_val = float(r_ohlcv.get('high', 0.0) or 0.0)
+                                    l_val = float(r_ohlcv.get('low', 0.0) or 0.0)
+                                    c_val = float(r_ohlcv.get('close', 0.0) or 0.0)
+                                    v_val = float(r_ohlcv.get('volume', 0.0) or 0.0)
+                                    d_val = {
+                                        'open': o_val,
+                                        'high': h_val,
+                                        'low': l_val,
+                                        'close': c_val,
+                                        'volume': v_val
+                                    }
+                                    price_lookup[ts_idx] = d_val
+                                    try:
+                                        ts_p = pd.to_datetime(ts_idx)
+                                        price_lookup[ts_p] = d_val
+                                        price_lookup[ts_p.strftime('%Y-%m-%d %H:%M:%S')] = d_val
+                                        price_lookup[ts_p.strftime('%Y-%m-%d %H:%M')] = d_val
+                                        price_lookup[ts_p.strftime('%Y-%m-%d')] = d_val
+                                        price_lookup[format_dt_display(ts_p)] = d_val
+                                        price_lookup[format_date_display(ts_p)] = d_val
+                                    except:
+                                        pass
+
+                            def _get_ohlc(raw_t):
+                                if raw_t is None: return {}
+                                if raw_t in price_lookup: return price_lookup[raw_t]
+                                try:
+                                    p_ts = pd.to_datetime(raw_t)
+                                    if p_ts in price_lookup: return price_lookup[p_ts]
+                                    if hasattr(p_ts, 'tz_localize') and p_ts.tz is not None:
+                                        p_ts_naive = p_ts.tz_localize(None)
+                                        if p_ts_naive in price_lookup: return price_lookup[p_ts_naive]
+                                except:
+                                    pass
+                                s = str(raw_t)[:19]
+                                return price_lookup.get(s, {})
+
                             if t_df is not None and not t_df.empty:
                                 import asyncio
                                 t_df_clean = t_df.replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -739,10 +990,18 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                                     if pnl_pct != pnl_pct:
                                         pnl_pct = 0.0
         
-                                    c_q        += pnl_quote
-                                    b_q         = initial_cap_quote + c_q
-                                    b_b         = b_q / exit_price if exit_price > 0 else 0
-                                    c_b         = b_b - initial_cap_base
+                                    is_coin_m = (state.get('account_mode', 'spot_cash') == 'coin_margined_hold')
+                                    if is_coin_m:
+                                        pnl_base_val = float(trow.get('pnl_base', pnl_base))
+                                        c_b += pnl_base_val
+                                        b_b = initial_cap_base + c_b
+                                        b_q = b_b * exit_price
+                                        c_q = b_q - initial_cap_quote
+                                    else:
+                                        c_q += pnl_quote
+                                        b_q = initial_cap_quote + c_q
+                                        b_b = b_q / exit_price if exit_price > 0 else 0
+                                        c_b = b_b - initial_cap_base
         
                                     if b_q > max_closed_b_q:
                                         max_closed_b_q = b_q
@@ -750,6 +1009,9 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                                     dd_val = (b_q - max_closed_b_q) / max_closed_b_q * 100 if max_closed_b_q > 0 else 0.0
                                     
                                     acc_growth_pct = (b_q - initial_cap_quote) / initial_cap_quote * 100 if initial_cap_quote > 0 else 0.0
+
+                                    e_ohlc = _get_ohlc(trow.get('entry_time'))
+                                    x_ohlc = _get_ohlc(trow.get('exit_time'))
         
                                     t_rows.append({
                                         'id':           idx_counter + 1,
@@ -758,6 +1020,16 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                                         'side':         side,
                                         'entry_price':  fmt_price(entry_price),
                                         'exit_price':   fmt_price(exit_price),
+                                        'entry_open':   e_ohlc.get('open'),
+                                        'entry_high':   e_ohlc.get('high'),
+                                        'entry_low':    e_ohlc.get('low'),
+                                        'entry_close':  e_ohlc.get('close'),
+                                        'entry_volume': e_ohlc.get('volume', 0.0),
+                                        'exit_open':    x_ohlc.get('open'),
+                                        'exit_high':    x_ohlc.get('high'),
+                                        'exit_low':     x_ohlc.get('low'),
+                                        'exit_close':   x_ohlc.get('close'),
+                                        'exit_volume':  x_ohlc.get('volume', 0.0),
                                         'pnl_pct':      float(pnl_pct),
                                         'pnl_quote':    fmt_pnl(pnl_quote),
                                         'pnl_base':     fmt_pnl(pnl_base),
@@ -984,14 +1256,14 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                 min_ts = db.query(func.min(OHLCV.timestamp)).filter(OHLCV.symbol == sym).scalar()
                 max_ts = db.query(func.max(OHLCV.timestamp)).filter(OHLCV.symbol == sym).scalar()
                 if min_ts:
-                    state['start_date'] = min_ts.strftime('%Y-%m-%d')
+                    state['start_date'] = format_date_display(min_ts)
                     start_date.value = state['start_date']
                 else:
-                    state['start_date'] = '2020-01-01'
-                    start_date.value = '2020-01-01'
+                    state['start_date'] = '01/01/20'
+                    start_date.value = '01/01/20'
                     
                 if max_ts:
-                    state['end_date'] = max_ts.strftime('%Y-%m-%d')
+                    state['end_date'] = format_date_display(max_ts)
                     end_date.value = state['end_date']
             except Exception as ex:
                 logger.warning(f"Error auto-detectando rango: {ex}")
@@ -1001,11 +1273,11 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
         with ui.row().classes('w-full gap-3 items-end mt-2'):
             with ui.column().classes('flex-1 gap-0'):
                 with ui.row().classes('w-full justify-between items-center mb-1'):
-                    ui.label('Fecha de inicio (AAAA-MM-DD)').classes('text-xs text-gray-500')
+                    ui.label('Fecha de inicio (DD/MM/AA)').classes('text-xs text-gray-500')
                     ui.button('Rango Máximo BD', on_click=lambda: _auto_detect_range_for_symbol()).props('dense flat size=xs color=cyan').tooltip('Detectar rango completo guardado en BD')
                 start_date = ui.input('Fecha de inicio', value=state['start_date']).bind_value(state, 'start_date').classes('w-full')
             with ui.column().classes('flex-1 gap-0'):
-                ui.label('Fecha de finalización (AAAA-MM-DD)').classes('text-xs text-gray-500 mb-1')
+                ui.label('Fecha de finalización (DD/MM/AA)').classes('text-xs text-gray-500 mb-1')
                 end_date = ui.input('Fecha de finalización', value=state['end_date']).bind_value(state, 'end_date').classes('w-full')
             with ui.column().classes('flex-1 gap-0'):
                 ui.label('Capital inicial').classes('text-xs text-gray-500 mb-1')
@@ -1051,6 +1323,15 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                     lbl_asset_hdr.set_text(f'Activo inicial ({b}/{q})')
                     capital_type.update()
                     _update_sizing_ui()
+                    try:
+                        if 'equity_toggle' in locals() or 'equity_toggle' in globals():
+                            equity_toggle.options = {
+                                'QUOTE': f'💵 {q} (Dólares / Quote)',
+                                'BASE': f'🪙 {b} (Satoshis / Base)'
+                            }
+                            equity_toggle.update()
+                    except Exception:
+                        pass
 
                 sym_combo.on('update:model-value', _update_asset_combo)
 
@@ -1086,6 +1367,38 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
             with ui.column().classes('flex-1 gap-0'):
                 ui.label('Deslizamiento / Slippage (%)').classes('text-xs text-gray-500 mb-1')
                 slip_input = ui.number('Slippage (%)', value=state['slippage_pct'], step=0.01, min=0.0).bind_value(state, 'slippage_pct').classes('w-full')
+
+        # ── Fila 3.5: Modo de Cuenta (Spot Efectivo vs Hold Colateral Coin-M) ──
+        if 'account_mode' not in state: state['account_mode'] = 'spot_cash'
+        if 'leverage' not in state: state['leverage'] = 1.0
+
+        with ui.row().classes('w-full gap-3 items-center mt-2 bg-slate-900/70 p-2.5 rounded-xl border border-slate-800 flex-wrap'):
+            with ui.row().classes('items-center gap-2 min-w-[240px]'):
+                ui.icon('account_balance_wallet', size='1.3rem').classes('text-amber-400')
+                with ui.column().classes('gap-0'):
+                    ui.label('Modo de Cuenta & Colateral').classes('text-xs font-bold text-slate-200')
+                    ui.label('¿Salidas a USDT o 100% HOLD del activo Base?').classes('text-[10px] text-slate-400')
+            
+            with ui.column().classes('flex-1 min-w-[260px] gap-0'):
+                acct_mode_select = ui.select(
+                    {
+                        'spot_cash': '💵 Spot Efectivo (Salidas a CITA / USDT)',
+                        'coin_margined_hold': '🪙 Hold Colateral + Trading (Coin-M)'
+                    },
+                    label='Modo de Operativa',
+                    value=state['account_mode']
+                ).bind_value(state, 'account_mode').classes('w-full')
+
+            with ui.column().classes('w-44 gap-0') as col_leverage:
+                ui.label('Apalancamiento Señal (x)').classes('text-xs text-gray-400 mb-1')
+                leverage_input = ui.number('Apalancamiento', value=state['leverage'], min=0.1, max=20.0, step=0.5).bind_value(state, 'leverage').classes('w-full')
+
+            def _update_acct_mode_ui(e=None):
+                is_coin = (state.get('account_mode') == 'coin_margined_hold')
+                col_leverage.set_visibility(is_coin)
+
+            acct_mode_select.on_value_change(_update_acct_mode_ui)
+            _update_acct_mode_ui()
 
         # ── Fila 4: Filtro de Equity Curve (Backtest Virtual vs Real) ──
         if 'ec_enabled' not in state: state['ec_enabled'] = False
@@ -1131,6 +1444,28 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                 ui.label('Detener Operaciones (Ganancia >= %)').classes('text-xs text-gray-400 mb-1')
                 cl_stop_input = ui.number('Stop Gain %', value=state['cl_stop'], step=1.0, min=0.0).bind_value(state, 'cl_stop').classes('w-full')
 
+
+        # -- Modo de entrada: Close actual vs Open siguiente --
+        if 'entry_on_next_open' not in state: state['entry_on_next_open'] = False
+        with ui.row().classes('w-full gap-3 items-center mt-2 bg-slate-900/50 p-2.5 rounded-xl border border-slate-800 flex-wrap'):
+            ui.icon('schedule', size='1.2rem').classes('text-sky-400')
+            with ui.column().classes('gap-0 flex-1'):
+                ui.label('Modo de Entrada al Mercado').classes('text-xs font-bold text-slate-200')
+                ui.label('Close Actual: entrada al cierre de la vela de la senal (optimista). Open Siguiente: entrada al open de la proxima vela (mas realista).').classes('text-[10px] text-slate-400')
+            entry_mode_select = ui.select(
+                {False: 'Close de la Vela (Predeterminado)', True: 'Open de la Vela Siguiente (Conservador)'},
+                label='Modo de Entrada',
+                value=state.get('entry_on_next_open', False)
+            ).bind_value(state, 'entry_on_next_open').classes('flex-1 min-w-[280px]')
+
+        # -- Nota informativa SL/TP intrabarra --
+        with ui.row().classes('w-full items-start gap-2 mt-2 bg-blue-950/30 border border-blue-900/40 rounded-lg p-2.5'):
+            ui.icon('info_outline', size='1rem').classes('text-sky-400 mt-0.5 flex-shrink-0')
+            ui.label(
+                'Nota de confiabilidad: Cuando en la misma vela el Low toca el SL y el High el TP, el motor prioriza el SL '
+                '(escenario conservador). Esta limitacion es inherente a datos OHLC y es identica a TradingView Pine Script. '
+                'Los resultados reales deben ser iguales o mejores.'
+            ).classes('text-[11px] text-slate-400 leading-relaxed')
         # ── Fila 3: Botones ──
         with ui.row().classes('w-full mt-4 gap-3 items-center'):
             btn_run = ui.button(
@@ -1458,9 +1793,30 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
         ui.timer(0.1, lambda: asyncio.create_task(render_tradingview_plotly()), once=True)
 
 
-        with ui.row().classes('w-full items-center justify-between mt-6'):
-            ui.label('Equity Curve').classes('text-lg font-bold')
-            equity_toggle = ui.toggle(['QUOTE', 'BASE'], value='QUOTE').props('color=blue size=sm')
+        _b_init, _q_init = _parse_assets(state.get('symbol', 'BTC/USDT'))
+        
+        # Panel destacado para seleccionar en qué moneda medir Equity y Drawdown
+        with ui.card().classes('w-full bg-slate-900/90 border border-slate-800 p-4 rounded-xl mt-6 shadow-lg'):
+            with ui.row().classes('w-full justify-between items-center flex-wrap gap-3'):
+                with ui.row().classes('items-center gap-3'):
+                    with ui.row().classes('w-10 h-10 rounded-xl bg-indigo-500/20 border border-indigo-500/40 items-center justify-center text-indigo-400'):
+                        ui.icon('currency_exchange', size='1.5rem')
+                    with ui.column().classes('gap-0'):
+                        ui.label('Moneda de Medición de Gráficos (Equity & Drawdown)').classes('text-base font-bold text-white')
+                        ui.label('Selecciona en qué divisa se calculan conjuntamente la curva de capital y el porcentaje de Drawdown').classes('text-xs text-slate-400')
+                
+                with ui.row().classes('items-center gap-2'):
+                    ui.label('Medir ambos gráficos en:').classes('text-xs font-bold text-slate-300')
+                    equity_toggle = ui.toggle(
+                        {
+                            'QUOTE': f'💵 {_q_init} (Dólares / Quote)',
+                            'BASE': f'🪙 {_b_init} (Satoshis / Base)'
+                        },
+                        value='QUOTE'
+                    ).props('color=indigo-7 text-color=grey-4 toggle-color=indigo-6 toggle-text-color=white no-caps size=sm rounded')
+
+        with ui.row().classes('w-full items-center justify-between mt-4 mb-1'):
+            lbl_equity_title = ui.label(f'📈 Curva de Equity (en {_q_init})').classes('text-base font-bold text-slate-200')
 
         chart = ui.echart({
             'tooltip': {'trigger': 'axis'},
@@ -1504,24 +1860,34 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
             }],
         }).classes('w-full h-[420px] border border-slate-700/60 rounded-xl p-2 bg-slate-950 mt-2 shadow-xl')
 
+        with ui.row().classes('w-full items-center justify-between mt-6 mb-1'):
+            lbl_drawdown_title = ui.label(f'📉 Gráfico de Drawdown (en {_q_init})').classes('text-base font-bold text-slate-200')
+
         def _on_equity_toggle_change(e):
             if not state.get('equity_dates'): return
-            is_quote = (e.value == 'QUOTE')
+            is_quote = (equity_toggle.value == 'QUOTE')
             chart.options['series'][0]['data'] = state['equity_quote_data'] if is_quote else state['equity_base_data']
             
             base_a = state['symbol'].split('/')[0] if '/' in state['symbol'] else 'BASE'
             quote_a = state['symbol'].split('/')[1] if '/' in state['symbol'] else 'QUOTE'
-            chart.options['series'][0]['name'] = f"Equity (Real {quote_a if is_quote else base_a})"
+            sel_asset = quote_a if is_quote else base_a
+            
+            chart.options['series'][0]['name'] = f"Equity (Real {sel_asset})"
+            lbl_equity_title.set_text(f"📈 Curva de Equity (en {sel_asset})")
             
             if state.get('has_virtual'):
                 chart.options['series'][1]['data'] = state['v_equity_quote_data'] if is_quote else state['v_equity_base_data']
-                chart.options['series'][1]['name'] = f"Equity (Virtual {quote_a if is_quote else base_a})"
+                chart.options['series'][1]['name'] = f"Equity (Virtual {sel_asset})"
                 
             chart.update()
             
+            if state.get('drawdown_quote_data'):
+                drawdown_chart.options['series'][0]['data'] = state['drawdown_quote_data'] if is_quote else state['drawdown_base_data']
+                drawdown_chart.options['series'][0]['name'] = f"Drawdown ({sel_asset})"
+                lbl_drawdown_title.set_text(f"📉 Gráfico de Drawdown (en {sel_asset}{' - Volatilidad en Dólares' if is_quote else ' - Pérdida de Satoshis'})")
+                drawdown_chart.update()
+            
         equity_toggle.on_value_change(_on_equity_toggle_change)
-
-        ui.label('Drawdown Chart').classes('text-lg font-bold mt-6')
         drawdown_chart = ui.echart({
             'tooltip': {
                 'trigger': 'axis',
@@ -1569,33 +1935,73 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
 
         with ui.row().classes('w-full items-center justify-between mt-6 mb-2 flex-wrap gap-2'):
             ui.label('Ejecuciones Reales (Con Filtro)').classes('text-lg font-bold text-blue-500')
-            with ui.row().classes('gap-2 items-center'):
-                def export_trades_csv():
-                    if not trades_table.rows:
-                        ui.notify('No hay ejecuciones registradas para exportar.', type='warning')
+            with ui.row().classes('gap-2 items-center flex-wrap'):
+                def export_trades_csv(is_virtual=False):
+                    target_table = v_trades_table if is_virtual else trades_table
+                    table_name = "virtuales" if is_virtual else "reales"
+                    if not target_table.rows:
+                        ui.notify(f'No hay ejecuciones {table_name} registradas para exportar.', type='warning')
                         return
-                    df_exp = pd.DataFrame(trades_table.rows)
+                    
+                    quote_a = state.get('quote_asset', 'USDT')
+                    base_a = state.get('base_asset', 'BTC')
+                    rows_data = []
+                    
+                    for r in target_table.rows:
+                        rows_data.append({
+                            'ID': r.get('id'),
+                            'Fecha_Entrada': r.get('entry_time'),
+                            'Lado': r.get('side'),
+                            'Precio_Ejecucion_Entrada': r.get('entry_price'),
+                            'Open_Dia_Entrada': r.get('entry_open') if r.get('entry_open') is not None else '',
+                            'High_Dia_Entrada': r.get('entry_high') if r.get('entry_high') is not None else '',
+                            'Low_Dia_Entrada': r.get('entry_low') if r.get('entry_low') is not None else '',
+                            'Close_Dia_Entrada': r.get('entry_close') if r.get('entry_close') is not None else '',
+                            'Volumen_Entrada': r.get('entry_volume') if r.get('entry_volume') is not None else '',
+                            'Fecha_Salida': r.get('exit_time'),
+                            'Razon_Salida': r.get('exit_reason'),
+                            'Precio_Ejecucion_Salida': r.get('exit_price'),
+                            'Open_Dia_Salida': r.get('exit_open') if r.get('exit_open') is not None else '',
+                            'High_Dia_Salida': r.get('exit_high') if r.get('exit_high') is not None else '',
+                            'Low_Dia_Salida': r.get('exit_low') if r.get('exit_low') is not None else '',
+                            'Close_Dia_Salida': r.get('exit_close') if r.get('exit_close') is not None else '',
+                            'Volumen_Salida': r.get('exit_volume') if r.get('exit_volume') is not None else '',
+                            'PnL_Pct': r.get('pnl_pct'),
+                            f'PnL_{quote_a}': r.get('pnl_quote'),
+                            f'PnL_{base_a}': r.get('pnl_base'),
+                            f'Acumulado_{quote_a}': r.get('cum_pnl_quote'),
+                            f'Acumulado_{base_a}': r.get('cum_pnl_base'),
+                            'Crecimiento_Cuenta_Pct': r.get('pnl_account_pct'),
+                            f'Saldo_{quote_a}': r.get('balance_quote'),
+                            f'Saldo_{base_a}': r.get('balance_base'),
+                            'Drawdown': r.get('drawdown'),
+                            'Fase_Real': r.get('real_status_marker', '')
+                        })
+                        
+                    df_exp = pd.DataFrame(rows_data)
                     csv_bytes = df_exp.to_csv(index=False).encode('utf-8')
                     sym_clean = state.get('symbol', 'BTCUSDT').replace('/', '')
                     strat_clean = state.get('strategy_name', 'Strategy').replace(' ', '_')
-                    filename = f"trades_{strat_clean}_{sym_clean}.csv"
+                    filename = f"trades_{table_name}_{strat_clean}_{sym_clean}.csv"
                     ui.download(csv_bytes, filename=filename)
-                    ui.notify(f"¡Exportación exitosa! {len(trades_table.rows)} ejecuciones en {filename}", type='positive')
+                    ui.notify(f"¡Exportación exitosa con precios de auditoría! {len(target_table.rows)} operaciones en {filename}", type='positive')
 
-                def export_trades_nt8():
-                    if not trades_table.rows:
-                        ui.notify('No hay ejecuciones registradas para exportar.', type='warning')
+                def export_trades_nt8(is_virtual=False):
+                    target_table = v_trades_table if is_virtual else trades_table
+                    table_name = "virtuales" if is_virtual else "reales"
+                    if not target_table.rows:
+                        ui.notify(f'No hay ejecuciones {table_name} registradas para exportar.', type='warning')
                         return
                     sym = state.get('symbol', 'BTCUSDT')
                     sym_clean = sym.replace('/', '').replace(':', '')
                     lines = ["Entry Time;Exit Time;Instrument;Market Position;Entry Price;Exit Price;Profit"]
-                    for r in trades_table.rows:
+                    for r in target_table.rows:
                         try:
-                            entry_dt = pd.to_datetime(r.get('entry_time')).strftime('%Y%m%d %H%M%S')
+                            entry_dt = pd.to_datetime(r.get('entry_time'), dayfirst=True).strftime('%Y%m%d %H%M%S')
                         except Exception:
                             entry_dt = str(r.get('entry_time', ''))
                         try:
-                            exit_dt = pd.to_datetime(r.get('exit_time')).strftime('%Y%m%d %H%M%S')
+                            exit_dt = pd.to_datetime(r.get('exit_time'), dayfirst=True).strftime('%Y%m%d %H%M%S')
                         except Exception:
                             exit_dt = str(r.get('exit_time', ''))
                         pos = "Long" if str(r.get('side', '')).upper() == 'LONG' else "Short"
@@ -1606,12 +2012,49 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                     
                     nt8_bytes = "\n".join(lines).encode('utf-8')
                     strat_clean = state.get('strategy_name', 'Strategy').replace(' ', '_')
-                    filename = f"trades_nt8_{strat_clean}_{sym_clean}.txt"
+                    filename = f"trades_nt8_{table_name}_{strat_clean}_{sym_clean}.txt"
                     ui.download(nt8_bytes, filename=filename)
-                    ui.notify(f"¡Exportación NinjaTrader 8 exitosa! {len(trades_table.rows)} trades en {filename}", type='positive')
+                    ui.notify(f"¡Exportación NinjaTrader 8 exitosa! {len(target_table.rows)} trades en {filename}", type='positive')
 
-                ui.button('Exportar CSV', icon='file_download', on_click=export_trades_csv).props('outline size=sm color=cyan').classes('hover:bg-cyan-900/40 text-cyan-400 font-semibold px-3')
-                ui.button('Exportar NinjaTrader 8', icon='sim_card_download', on_click=export_trades_nt8).props('outline size=sm color=emerald').classes('hover:bg-emerald-900/40 text-emerald-400 font-semibold px-3')
+                def export_chart_prices_csv():
+                    df_chart = state.get('last_df')
+                    if df_chart is None or df_chart.empty:
+                        ui.notify('No hay datos de precios de la gráfica disponibles. Ejecuta un backtest primero.', type='warning')
+                        return
+                    df_exp = df_chart.copy()
+                    if 'timestamp' not in df_exp.columns and isinstance(df_exp.index, pd.DatetimeIndex):
+                        df_exp = df_exp.reset_index()
+                    csv_bytes = df_exp.to_csv(index=False).encode('utf-8')
+                    sym_clean = state.get('symbol', 'BTCUSDT').replace('/', '')
+                    tf_clean = state.get('timeframe', '1h')
+                    filename = f"precios_grafica_{sym_clean}_{tf_clean}.csv"
+                    ui.download(csv_bytes, filename=filename)
+                    ui.notify(f"¡Exportación de precios exitosa! {len(df_exp)} barras en {filename}", type='positive')
+
+                def export_chart_prices_nt8():
+                    df_chart = state.get('last_df')
+                    if df_chart is None or df_chart.empty:
+                        ui.notify('No hay datos de precios de la gráfica disponibles. Ejecuta un backtest primero.', type='warning')
+                        return
+                    tf_val = state.get('timeframe', '1h')
+                    sym = state.get('symbol', 'BTCUSDT')
+                    clean_sym = sym.replace('/', '').replace(':', '_').replace(' ', '_')
+                    txt_content = export_df_to_ninjatrader8(
+                        df=df_chart,
+                        timeframe=tf_val,
+                        timestamp_mode='end_of_bar',
+                        delimiter=';',
+                        date_format_mode='auto',
+                        volume_as_int=True
+                    )
+                    filename = f"precios_nt8_{clean_sym}_{tf_val}.txt"
+                    ui.download(bytes(txt_content, 'utf-8'), filename=filename)
+                    ui.notify(f"¡Exportación de precios NinjaTrader 8 exitosa! {len(df_chart)} barras en {filename}", type='positive')
+
+                ui.button('Exportar CSV', icon='file_download', on_click=lambda: export_trades_csv(is_virtual=False)).props('outline size=sm color=cyan').classes('hover:bg-cyan-900/40 text-cyan-400 font-semibold px-3').tooltip('Exportar tabla de operaciones ejecutadas a CSV con precios OHLCV del día')
+                ui.button('Exportar NinjaTrader 8', icon='sim_card_download', on_click=lambda: export_trades_nt8(is_virtual=False)).props('outline size=sm color=emerald').classes('hover:bg-emerald-900/40 text-emerald-400 font-semibold px-3').tooltip('Exportar operaciones en formato de ejecuciones NinjaTrader 8')
+                ui.button('Precios Gráfica (CSV)', icon='table_chart', on_click=export_chart_prices_csv).props('outline size=sm color=amber').classes('hover:bg-amber-900/40 text-amber-400 font-semibold px-3').tooltip('Exportar todas las velas y precios OHLCV de la gráfica a CSV')
+                ui.button('Precios Gráfica (NT8)', icon='bar_chart', on_click=export_chart_prices_nt8).props('outline size=sm color=purple').classes('hover:bg-purple-900/40 text-purple-400 font-semibold px-3').tooltip('Exportar velas históricas de la gráfica en formato NinjaTrader 8 (.txt)')
 
             lbl_trades_info = ui.label('').classes('text-sm text-gray-400 font-mono italic mt-1')
 
@@ -1627,6 +2070,9 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
 
         with ui.row().classes('w-full items-center justify-between mt-6 mb-2 flex-wrap gap-2').bind_visibility_from(state, 'has_virtual'):
             ui.label('Ejecuciones Virtuales (Sin Filtro)').classes('text-lg font-bold text-amber-500')
+            with ui.row().classes('gap-2 items-center flex-wrap'):
+                ui.button('Exportar CSV', icon='file_download', on_click=lambda: export_trades_csv(is_virtual=True)).props('outline size=sm color=amber').classes('hover:bg-amber-900/40 text-amber-400 font-semibold px-3').tooltip('Exportar tabla de operaciones virtuales a CSV con precios OHLCV del día')
+                ui.button('Exportar NinjaTrader 8', icon='sim_card_download', on_click=lambda: export_trades_nt8(is_virtual=True)).props('outline size=sm color=emerald').classes('hover:bg-emerald-900/40 text-emerald-400 font-semibold px-3').tooltip('Exportar operaciones virtuales en formato NinjaTrader 8')
             v_lbl_trades_info = ui.label('').classes('text-sm text-gray-400 font-mono italic')
         
         with ui.card().classes('w-full p-2 bg-slate-900/50 rounded-xl shadow-lg border border-slate-700/50 mt-2').bind_visibility_from(state, 'has_virtual'):
@@ -1728,7 +2174,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                 </q-tr>
             ''')
 
-        def _sync_load_and_run(strategy_path, custom_params, symbol, timeframe, start_dt, end_dt, initial_capital, sizing_mode, comm_pct, slip_pct, fixed_quote_amt=None):
+        def _sync_load_and_run(strategy_path, custom_params, symbol, timeframe, start_dt, end_dt, initial_capital, sizing_mode, comm_pct, slip_pct, fixed_quote_amt=None, account_mode="spot_cash", leverage=1.0, initial_base_capital=None, entry_on_next_open=False):
             db = SessionLocal()
             try:
                 market_mgr = MarketDataManager(db)
@@ -1784,25 +2230,41 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
                 if ec_config.get('enabled', False):
                     backtester = EquityCurveBacktester(strategy, initial_capital=initial_capital, commission_pct=comm_pct, slippage_pct=slip_pct)
                 else:
-                    backtester = Backtester(strategy, initial_capital=initial_capital, commission_pct=comm_pct, slippage_pct=slip_pct)
+                    backtester = Backtester(
+                        strategy,
+                        initial_capital=initial_capital,
+                        commission_pct=comm_pct,
+                        slippage_pct=slip_pct,
+                        account_mode=account_mode,
+                        leverage=leverage,
+                        initial_base_capital=initial_base_capital,
+                        entry_on_next_open=entry_on_next_open
+                    )
                     
                 results = backtester.run(df)
                 results['df'] = df
                 
                 # Extraer indicadores de la estrategia para graficarlos dinámicamente
                 strategy_indicators = []
+                params_dict = getattr(strategy, 'parameters', {}) or strategy.config.get('parameters', {})
                 for rule_type in ['entry_conditions', 'exit_conditions']:
                     rules = strategy.config.get(rule_type, {}).get('rules', [])
                     for rule in rules:
                         if rule.get('type') == 'technical_indicator':
-                            for prefix in ['1', '2']:
-                                ind = rule.get(f'indicator{prefix}')
-                                per = rule.get(f'period{prefix}')
-                                if ind and per:
+                            for prefix in ['1', '2', '_1', '_2']:
+                                ind_data = rule.get(f'indicator{prefix}')
+                                if isinstance(ind_data, dict):
+                                    ind = ind_data.get('name')
+                                    per = ind_data.get('period')
+                                else:
+                                    ind = ind_data
+                                    per = rule.get(f'period{prefix}')
+                                
+                                if ind and str(ind).upper() not in ['PRICE', 'VOLUME', 'CLOSE', 'OPEN', 'HIGH', 'LOW'] and per is not None:
                                     try:
-                                        period_val = strategy.config.get('parameters', {}).get(per, per)
-                                        strategy_indicators.append((ind.lower(), int(period_val)))
-                                    except ValueError:
+                                        period_val = params_dict.get(per, per)
+                                        strategy_indicators.append((str(ind).lower(), int(float(period_val))))
+                                    except (ValueError, TypeError):
                                         pass
                 results['strategy_indicators'] = list(set(strategy_indicators))
                 
@@ -1810,218 +2272,31 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None):
             finally:
                 db.close()
 
-def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_dt, comm_pct, slip_pct):
-    db = SessionLocal()
-    try:
-        market_mgr = MarketDataManager(db)
-        equity_series_dict = {}
-        all_trades = []
-        strategy_breakdown = []
-
-        for idx, item in enumerate(portfolio_items):
-            strategy_path = item['strategy_path']
-            symbol = item['symbol']
-            timeframe = item['timeframe']
-            weight_pct = float(item.get('weight_pct', 0.0))
-            if weight_pct <= 0:
-                continue
-
-            allocated_cap = total_capital * (weight_pct / 100.0)
-
-            df = market_mgr.get_data(symbol, timeframe, start_dt, end_dt)
-            if df.empty:
-                market_mgr.update_historical_data(symbol, timeframe, start_dt, end_dt)
-                df = market_mgr.get_data(symbol, timeframe, start_dt, end_dt)
-
-            if df.empty:
-                continue
-
-            custom_params = item.get('custom_params', {})
-            strategy = BaseStrategy(strategy_path, custom_parameters=custom_params)
-            strategy.symbol = symbol
-            strategy.timeframe = timeframe
-
-            if 'risk_management' not in strategy.config:
-                strategy.config['risk_management'] = {}
-            strategy.config['risk_management']['position_sizing'] = {'method': 'compounding', 'value': 100.0}
-            strategy.risk_manager = RiskManager(strategy.config['risk_management'])
-
-            backtester = Backtester(strategy, initial_capital=allocated_cap, commission_pct=comm_pct, slippage_pct=slip_pct)
-            results = backtester.run(df)
-
-            eq_curve = results.get('equity_curve')
-            name_label = f"Strat {idx+1}: {os.path.basename(strategy_path)} ({symbol} {timeframe})"
-            
-            if eq_curve is not None and not eq_curve.empty:
-                if 'timestamp' in eq_curve.columns:
-                    eq_curve = eq_curve.set_index('timestamp')
-                eq_curve.index = pd.to_datetime(eq_curve.index)
-                equity_series_dict[name_label] = eq_curve['equity']
-
-            trades = results.get('trades')
-            if trades is not None and not trades.empty:
-                trades_copy = trades.copy()
-                trades_copy['strategy'] = name_label
-                all_trades.append(trades_copy)
-
-            strat_cagr = results.get('cagr', 0.0)
-            strat_max_dd = results.get('max_drawdown_pct', 0.0)
-            strat_final_eq = results.get('final_equity', allocated_cap)
-            strat_pnl_pct = ((strat_final_eq - allocated_cap) / allocated_cap * 100.0) if allocated_cap > 0 else 0.0
-
-            strategy_breakdown.append({
-                'name': name_label,
-                'weight_pct': weight_pct,
-                'allocated_cap': allocated_cap,
-                'final_cap': strat_final_eq,
-                'pnl_pct': strat_pnl_pct,
-                'cagr': strat_cagr,
-                'max_dd': strat_max_dd,
-                'trades_count': len(trades) if trades is not None else 0
-            })
-
-        if not equity_series_dict:
-            return {'error': "No se pudieron obtener datos o generar equidad para las estrategias del portafolio."}
-
-        combined_df = pd.DataFrame(equity_series_dict).ffill().bfill()
-        portfolio_equity = combined_df.sum(axis=1)
-
-        port_eq_metrics = calculate_equity_curve_metrics(portfolio_equity)
-
-        combined_trades = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
-        port_trade_metrics = calculate_metrics(combined_trades, total_capital) if not combined_trades.empty else {}
-
-        # Calculate Drawdown series (%)
-        roll_max = portfolio_equity.cummax()
-        drawdown_series = (portfolio_equity - roll_max) / roll_max * 100.0
-
-        # Calculate individual drawdown series (%)
-        individual_drawdowns = {}
-        for col in combined_df.columns:
-            s_series = combined_df[col]
-            s_roll_max = s_series.cummax()
-            s_dd = (s_series - s_roll_max) / s_roll_max * 100.0
-            individual_drawdowns[col] = s_dd.round(2).tolist()
-
-        dates_str = portfolio_equity.index.strftime('%Y-%m-%d').tolist()
-
-        total_trades_count = len(combined_trades)
-        winning_trades_count = int(port_trade_metrics.get('winning_trades', 0))
-        losing_trades_count = int(port_trade_metrics.get('losing_trades', 0))
-        if winning_trades_count == 0 and losing_trades_count == 0 and not combined_trades.empty:
-            pnl_col = 'pnl' if 'pnl' in combined_trades.columns else 'net_pnl' if 'net_pnl' in combined_trades.columns else None
-            if pnl_col:
-                winning_trades_count = int((combined_trades[pnl_col] > 0).sum())
-                losing_trades_count = int((combined_trades[pnl_col] < 0).sum())
-
-        win_rate_val = port_trade_metrics.get('percent_profitable', 0.0)
-        if win_rate_val == 0.0 and total_trades_count > 0:
-            win_rate_val = (winning_trades_count / total_trades_count) * 100.0
-
-        # Formatear y ordenar operaciones cronológicamente
-        formatted_trades = []
-        if not combined_trades.empty:
-            sort_col = None
-            for candidate in ['entry_time', 'Entry Timestamp', 'timestamp', 'date', 'entry_date']:
-                if candidate in combined_trades.columns:
-                    sort_col = candidate
-                    break
-
-            if sort_col:
-                try:
-                    combined_trades[sort_col] = pd.to_datetime(combined_trades[sort_col])
-                    combined_trades = combined_trades.sort_values(by=sort_col, ascending=True)
-                except Exception:
-                    pass
-
-            for trade_idx, tr in combined_trades.iterrows():
-                e_time = tr.get('entry_time') or tr.get('Entry Timestamp') or tr.get('timestamp') or "N/A"
-                if isinstance(e_time, (pd.Timestamp, datetime)):
-                    e_time_str = e_time.strftime("%Y-%m-%d %H:%M")
-                else:
-                    e_time_str = str(e_time)[:16]
-
-                x_time = tr.get('exit_time') or tr.get('Exit Timestamp') or "N/A"
-                if isinstance(x_time, (pd.Timestamp, datetime)):
-                    x_time_str = x_time.strftime("%Y-%m-%d %H:%M")
-                else:
-                    x_time_str = str(x_time)[:16]
-
-                pnl_val = float(tr.get('pnl', 0.0) or 0.0)
-                entry_p = float(tr.get('entry_price', 0.0) or 0.0)
-                exit_p = float(tr.get('exit_price', 0.0) or 0.0)
-                side_val = str(tr.get('side', 'LONG')).upper()
-
-                if 'pnl_pct' in tr and pd.notna(tr['pnl_pct']):
-                    pnl_pct_val = float(tr['pnl_pct'])
-                elif entry_p > 0:
-                    if side_val == 'LONG':
-                        pnl_pct_val = ((exit_p - entry_p) / entry_p) * 100.0
-                    else:
-                        pnl_pct_val = ((entry_p - exit_p) / entry_p) * 100.0
-                else:
-                    pnl_pct_val = 0.0
-
-                pnl_pct_str = f"{'+' if pnl_pct_val > 0 else ''}{pnl_pct_val:.2f}%"
-
-                formatted_trades.append({
-                    'trade_id': trade_idx,
-                    'entry_time': e_time_str,
-                    'exit_time': x_time_str,
-                    'strategy': str(tr.get('strategy', 'N/A')),
-                    'side': side_val,
-                    'entry_price': f"${entry_p:,.4f}" if entry_p > 0 else "$0.00",
-                    'exit_price': f"${exit_p:,.4f}" if exit_p > 0 else "$0.00",
-                    'pnl_raw': pnl_val,
-                    'pnl_str': f"{'+' if pnl_val > 0 else ''}${pnl_val:,.2f}",
-                    'pnl_pct_raw': pnl_pct_val,
-                    'pnl_pct_str': pnl_pct_str,
-                    'reason': str(tr.get('exit_reason', 'Señal'))
-                })
-
-        return {
-            'portfolio_equity': portfolio_equity.round(2).tolist(),
-            'individual_equity': {col: combined_df[col].round(2).tolist() for col in combined_df.columns},
-            'drawdown_series': drawdown_series.round(2).tolist(),
-            'individual_drawdowns': individual_drawdowns,
-            'dates': dates_str,
-            'cagr': port_eq_metrics.get('cagr', 0.0),
-            'max_drawdown_pct': port_eq_metrics.get('max_drawdown_pct', 0.0),
-            'sharpe_ratio': port_eq_metrics.get('sharpe_ratio', 0.0),
-            'profit_factor': port_trade_metrics.get('profit_factor', 0.0),
-            'total_trades': total_trades_count,
-            'winning_trades': winning_trades_count,
-            'losing_trades': losing_trades_count,
-            'win_rate': win_rate_val,
-            'chronological_trades': formatted_trades,
-            'strategy_breakdown': strategy_breakdown,
-            'initial_capital': total_capital,
-            'final_equity': float(portfolio_equity.iloc[-1]) if not portfolio_equity.empty else total_capital
-        }
-    finally:
-        db.close()
-
     # ════════════════════════════════════════════════════════
     # DIALOG DEL SIMULADOR DE PORTAFOLIO Y COMBINACIÓN
     # ════════════════════════════════════════════════════════
     with ui.dialog().props('maximized') as portfolio_dialog, \
-         ui.card().classes('w-full h-full q-pa-md overflow-auto bg-slate-50'):
+         ui.card().classes('w-full h-full q-pa-md overflow-auto bg-[#0a0e17] text-slate-100 border border-slate-800'):
 
-        with ui.row().classes('w-full justify-between items-center mb-4 bg-slate-900 text-white p-4 rounded-xl shadow'):
+        with ui.row().classes('w-full justify-between items-center mb-4 bg-slate-900/90 text-white p-4 rounded-2xl border border-slate-800 shadow-xl'):
             with ui.row().classes('items-center gap-3'):
-                ui.icon('pie_chart', size='2.5rem').classes('text-emerald-400')
+                with ui.row().classes('items-center justify-center w-12 h-12 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-400'):
+                    ui.icon('pie_chart', size='2rem')
                 with ui.column().classes('gap-0'):
-                    ui.label('Simulador de Portafolio & Combinación de Estrategias').classes('text-2xl font-bold')
-                    ui.label('Asigna porcentajes de tu capital a múltiples estrategias para evaluar el rendimiento consolidado.').classes('text-xs text-slate-300')
-            ui.button(icon='close', on_click=portfolio_dialog.close).props('flat round text-color=white')
+                    ui.label('Simulador de Portafolio & Combinación de Estrategias').classes('text-2xl font-black text-white tracking-tight')
+                    ui.label('Asigna pesos (%) a múltiples estrategias con sus parámetros individuales para simular una curva de capital conjunta.').classes('text-xs text-slate-400')
+            ui.button(icon='close', on_click=portfolio_dialog.close).props('flat round text-color=white size=md').classes('hover:bg-slate-800')
 
         # Global inputs for Portfolio
-        with ui.card().classes('w-full p-4 mb-4 rounded-xl border border-slate-700/50 shadow-lg'):
-            ui.label('Configuración Global del Portafolio').classes('font-bold text-slate-200 mb-2')
-            with ui.row().classes('w-full gap-4 items-center'):
-                port_capital_input = ui.number('Capital Total Inicial ($)', value=10000.0, step=500.0, min=10.0).classes('flex-1')
-                port_start_input = ui.input('Fecha Inicio', value='2020-01-01').classes('flex-1')
-                port_end_input = ui.input('Fecha Fin', value=datetime.now().strftime('%Y-%m-%d')).classes('flex-1')
+        with ui.card().classes('w-full p-5 mb-4 rounded-2xl border border-slate-800 bg-slate-900/80 shadow-xl backdrop-blur'):
+            with ui.row().classes('items-center gap-2 mb-3'):
+                ui.icon('tune', size='1.2rem').classes('text-amber-400')
+                ui.label('Configuración Global del Portafolio').classes('font-bold text-sm text-slate-200 uppercase tracking-wider')
+
+            with ui.row().classes('w-full gap-4 items-center flex-wrap'):
+                port_capital_input = ui.number('Capital Total Inicial ($)', value=10000.0, step=500.0, min=10.0).classes('flex-1 min-w-[200px]')
+                port_start_input = ui.input('Fecha Inicio (DD/MM/AA)', value='01/01/20').classes('flex-1 min-w-[170px]')
+                port_end_input = ui.input('Fecha Fin (DD/MM/AA)', value=format_date_display(datetime.now())).classes('flex-1 min-w-[170px]')
                 port_comm_input = ui.number('Comisión (%)', value=0.1, step=0.01).classes('w-32')
                 port_slip_input = ui.number('Slippage (%)', value=0.05, step=0.01).classes('w-32')
 
@@ -2042,8 +2317,15 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
             try:
                 import yaml
                 with open(file_path, 'r', encoding='utf-8') as f:
-                    cfg = yaml.safe_load(f)
-                return cfg.get('parameters', {}) or {}
+                    cfg = yaml.safe_load(f) or {}
+                raw_params = cfg.get('parameters', {}) or {}
+                params = {}
+                for k, v in raw_params.items():
+                    try:
+                        params[k] = float(v) if '.' in str(v) else int(v)
+                    except (ValueError, TypeError):
+                        params[k] = v
+                return params
             except Exception:
                 return {}
 
@@ -2054,9 +2336,9 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                 opts = {}
                 runs_map = {}
                 for r in runs:
-                    dt_s = r.created_at.strftime('%Y-%m-%d %H:%M') if r.created_at else ''
+                    dt_s = format_dt_display(r.created_at) if r.created_at else ''
                     cagr_s = f"CAGR: {r.cagr:.1f}%" if r.cagr is not None else ""
-                    lbl = f"[#{r.run_id}] {r.strategy_name} ({r.symbol} {r.timeframe}) {cagr_s} | {dt_s}"
+                    lbl = f"[#{r.run_id[:8]}] {r.strategy_name} ({r.symbol} {r.timeframe}) {cagr_s} | {dt_s}"
                     opts[r.run_id] = lbl
                     runs_map[r.run_id] = r
                 return opts, runs_map
@@ -2074,11 +2356,18 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                     if 'custom_params' not in item or not item['custom_params']:
                         item['custom_params'] = get_strategy_default_params(item['strategy']).copy()
 
-                    with ui.card().classes('w-full p-4 rounded-xl border border-slate-700/50 shadow-xs bg-slate-900/50 mb-2'):
+                    with ui.card().classes('w-full p-5 rounded-2xl border border-slate-800 bg-slate-900/90 shadow-xl mb-3'):
+                        # 1. Selector de Backtest Guardado (Opcional)
                         if saved_opts:
-                            with ui.row().classes('w-full mb-2 items-center gap-2 bg-slate-50 p-2 rounded-lg border border-slate-700/50'):
-                                ui.icon('cloud_download', size='1.2rem').classes('text-blue-600')
-                                saved_sel = ui.select(saved_opts, label='📥 Cargar Parámetros desde Backtest Guardado', value=item.get('saved_run_id')).classes('flex-1')
+                            with ui.row().classes('w-full mb-3 items-center gap-3 bg-slate-800/80 p-3 rounded-xl border border-slate-700/60'):
+                                ui.icon('cloud_download', size='1.3rem').classes('text-blue-400')
+                                with ui.column().classes('gap-0 flex-1'):
+                                    ui.label('Cargar desde Backtest Guardado').classes('text-xs text-blue-300 font-bold')
+                                    saved_sel = ui.select(
+                                        saved_opts,
+                                        label='Seleccionar corrida guardada',
+                                        value=item.get('saved_run_id')
+                                    ).classes('w-full text-xs')
 
                                 def make_saved_load_handler(idx=i, s_map=saved_map):
                                     def on_saved_change(e):
@@ -2101,14 +2390,18 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                                                 except Exception:
                                                     pass
                                             refresh_portfolio_items_ui()
-                                            ui.notify(f"✅ Estrategia #{idx+1} cargada desde Historial #{run_id}", type="positive")
+                                            ui.notify(f"✅ Estrategia #{idx+1} cargada desde Historial (#{run_id[:8]})", type="positive")
                                     return on_saved_change
 
                                 saved_sel.on_value_change(make_saved_load_handler(i, saved_map))
 
-                        with ui.row().classes('w-full gap-3 items-center mb-2'):
-                            ui.label(f"Estrategia #{i+1}").classes('font-bold text-slate-300 w-24')
-                            strat_sel = ui.select(list(strategies.keys()), label='Estrategia', value=item['strategy']).classes('flex-1')
+                        # 2. Configuración Principal de la Estrategia
+                        with ui.row().classes('w-full gap-4 items-center mb-3 flex-wrap'):
+                            with ui.row().classes('items-center gap-2 min-w-[130px]'):
+                                ui.icon('memory', size='1.2rem').classes('text-emerald-400')
+                                ui.label(f"Estrategia #{i+1}").classes('font-extrabold text-white text-base')
+
+                            strat_sel = ui.select(list(strategies.keys()), label='Estrategia Base', value=item['strategy']).classes('flex-1 min-w-[220px]')
                             sym_sel = ui.select(available_symbols, label='Símbolo', value=item['symbol']).classes('w-44')
                             tf_sel = ui.select(['1m', '5m', '15m', '1h', '4h', '1d'], label='TF', value=item['timeframe']).classes('w-28')
                             weight_num = ui.number('Peso (%)', value=item['weight_pct'], min=0.0, max=100.0, step=5.0).classes('w-28')
@@ -2120,52 +2413,69 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                                 portfolio_state['items'].pop(idx_to_remove)
                                 refresh_portfolio_items_ui()
 
-                            ui.button(icon='delete', on_click=lambda idx=i: remove_item(idx)).props('flat round color=negative')
+                            ui.button(icon='delete', on_click=lambda idx=i: remove_item(idx)).props('flat round color=negative size=md').tooltip('Eliminar esta estrategia del portafolio')
 
-                        # Expansion panel for Strategy Parameters
-                        with ui.expansion('⚙️ Parámetros de la Estrategia', icon='tune').classes('w-full bg-slate-50 border border-slate-700/50 rounded-lg p-2'):
-                            params_row = ui.row().classes('w-full gap-3 flex-wrap items-center')
-                            with params_row:
-                                cur_params = item['custom_params']
-                                if not cur_params:
-                                    ui.label('No hay parámetros configurables para esta estrategia.').classes('text-xs text-slate-400 italic')
-                                else:
+                        # 3. Resumen visual de parámetros actuales
+                        cur_params = item.get('custom_params', {})
+                        params_summary_str = ' | '.join(f"{k}: {v}" for k, v in cur_params.items()) if cur_params else "Parámetros predeterminados"
+
+                        with ui.row().classes('w-full items-center justify-between mb-2 bg-slate-950/60 p-2.5 rounded-xl border border-slate-800 text-xs'):
+                            with ui.row().classes('items-center gap-2 flex-1 overflow-hidden'):
+                                ui.icon('tune', size='1rem').classes('text-purple-400')
+                                ui.label('Parámetros configurados:').classes('text-slate-400 font-semibold flex-shrink-0')
+                                ui.label(params_summary_str).classes('text-purple-300 font-mono truncate')
+
+                            def reset_default_params(idx=i, s_name=item['strategy']):
+                                portfolio_state['items'][idx]['custom_params'] = get_strategy_default_params(s_name).copy()
+                                refresh_portfolio_items_ui()
+                                ui.notify(f"Parámetros de Estrategia #{idx+1} restablecidos", type="info")
+
+                            ui.button('🔄 Reset', on_click=lambda idx=i, sn=item['strategy']: reset_default_params(idx, sn)).props('flat dense size=sm color=grey-5').tooltip('Restablecer a valores por defecto del archivo YAML')
+
+                        # 4. Panel desplegable para editar CADA parámetro individualmente
+                        with ui.expansion('⚙️ Configurar / Editar Parámetros de esta Estrategia', icon='edit').classes('w-full bg-slate-800/40 border border-slate-700/50 rounded-xl p-2 text-slate-200'):
+                            if not cur_params:
+                                ui.label('No hay parámetros configurables para esta estrategia.').classes('text-xs text-slate-400 italic p-2')
+                            else:
+                                with ui.row().classes('w-full gap-4 flex-wrap items-center p-2'):
                                     for p_key, p_val in cur_params.items():
-                                        if isinstance(p_val, (int, float)):
-                                            p_num = ui.number(f"{p_key}", value=p_val).classes('w-32')
-                                            def make_change_handler(idx=i, pk=p_key):
-                                                def on_p_change(e):
-                                                    portfolio_state['items'][idx]['custom_params'][pk] = float(e.value or 0.0)
-                                                return on_p_change
-                                            p_num.on_value_change(make_change_handler(i, p_key))
-                                        else:
-                                            p_inp = ui.input(f"{p_key}", value=str(p_val)).classes('w-32')
-                                            def make_change_str_handler(idx=i, pk=p_key):
-                                                def on_p_str_change(e):
-                                                    portfolio_state['items'][idx]['custom_params'][pk] = e.value
-                                                return on_p_str_change
-                                            p_inp.on_value_change(make_change_str_handler(i, p_key))
+                                        with ui.column().classes('gap-0 min-w-[140px]'):
+                                            ui.label(p_key).classes('text-xs font-bold text-slate-300 mb-1')
+                                            if isinstance(p_val, (int, float)):
+                                                p_num = ui.number(value=p_val, format='%.4g', step=1.0).classes('w-full')
+                                                def make_change_handler(idx=i, pk=p_key):
+                                                    def on_p_change(e):
+                                                        try:
+                                                            if e.value is not None:
+                                                                portfolio_state['items'][idx]['custom_params'][pk] = float(e.value)
+                                                        except Exception:
+                                                            pass
+                                                    return on_p_change
+                                                p_num.on_value_change(make_change_handler(i, p_key))
+                                            else:
+                                                p_inp = ui.input(value=str(p_val)).classes('w-full')
+                                                def make_change_str_handler(idx=i, pk=p_key):
+                                                    def on_p_str_change(e):
+                                                        portfolio_state['items'][idx]['custom_params'][pk] = e.value
+                                                    return on_p_str_change
+                                                p_inp.on_value_change(make_change_str_handler(i, p_key))
 
-                        def update_item_val(val_idx=i, s_sel=strat_sel, sym_s=sym_sel, t_s=tf_sel, w_n=weight_num):
-                            old_strat = portfolio_state['items'][val_idx]['strategy']
-                            new_strat = s_sel.value
-                            portfolio_state['items'][val_idx]['strategy'] = new_strat
-                            portfolio_state['items'][val_idx]['symbol'] = sym_s.value
-                            portfolio_state['items'][val_idx]['timeframe'] = t_s.value
-                            portfolio_state['items'][val_idx]['weight_pct'] = float(w_n.value or 0.0)
-
-                            if old_strat != new_strat:
-                                portfolio_state['items'][val_idx]['custom_params'] = get_strategy_default_params(new_strat).copy()
+                        def on_strat_change(e, idx=i):
+                            new_s = e.value
+                            if new_s and new_s != portfolio_state['items'][idx]['strategy']:
+                                portfolio_state['items'][idx]['strategy'] = new_s
+                                portfolio_state['items'][idx]['saved_run_id'] = None
+                                portfolio_state['items'][idx]['custom_params'] = get_strategy_default_params(new_s).copy()
                                 refresh_portfolio_items_ui()
 
-                        strat_sel.on_value_change(lambda e, idx=i: update_item_val(idx))
-                        sym_sel.on_value_change(lambda e, idx=i: update_item_val(idx))
-                        tf_sel.on_value_change(lambda e, idx=i: update_item_val(idx))
-                        weight_num.on_value_change(lambda e, idx=i: update_item_val(idx))
+                        strat_sel.on_value_change(lambda e, idx=i: on_strat_change(e, idx))
+                        sym_sel.on_value_change(lambda e, idx=i: portfolio_state['items'][idx].update({'symbol': e.value}))
+                        tf_sel.on_value_change(lambda e, idx=i: portfolio_state['items'][idx].update({'timeframe': e.value}))
+                        weight_num.on_value_change(lambda e, idx=i: portfolio_state['items'][idx].update({'weight_pct': float(e.value or 0.0)}))
 
         refresh_portfolio_items_ui()
 
-        with ui.row().classes('w-full gap-3 mb-6 items-center'):
+        with ui.row().classes('w-full gap-3 mb-6 items-center flex-wrap'):
             def add_portfolio_item():
                 default_strat = list(strategies.keys())[0] if strategies else ''
                 portfolio_state['items'].append({
@@ -2186,11 +2496,11 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                     refresh_portfolio_items_ui()
                     ui.notify(f"Pesos distribuidos equitativamente ({eq_w}% por estrategia)", type="info")
 
-            ui.button('➕ Agregar Estrategia al Portafolio', on_click=add_portfolio_item).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-xl')
-            ui.button('⚖️ Distribuir Capital Equitativamente', on_click=rebalance_equal_weights).classes('bg-slate-700 hover:bg-slate-800 text-white font-bold py-2 px-4 rounded-xl')
+            ui.button('➕ Agregar Otra Estrategia al Portafolio', on_click=add_portfolio_item).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 px-5 rounded-xl shadow')
+            ui.button('⚖️ Distribuir Capital Equitativamente (100%)', on_click=rebalance_equal_weights).classes('bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-2.5 px-5 rounded-xl border border-slate-700 shadow')
 
         # Action Button
-        btn_run_portfolio = ui.button('⚡ EJECUTAR SIMULACIÓN DE PORTAFOLIO COMBINADO').classes('w-full bg-emerald-700 hover:bg-emerald-800 text-white font-extrabold py-4 text-lg rounded-xl shadow-lg')
+        btn_run_portfolio = ui.button('⚡ EJECUTAR SIMULACIÓN DE PORTAFOLIO COMBINADO').classes('w-full bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold py-4 text-lg rounded-2xl shadow-2xl transition-all')
 
         # Results Section
         port_results_container = ui.column().classes('w-full mt-6 gap-4')
@@ -2206,8 +2516,8 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
             notify_p = ui.notify("⚡ Calculando simulación combinada del portafolio... Por favor espera", type="info", spinner=True, timeout=3.0)
 
             try:
-                p_start = datetime.strptime(port_start_input.value, '%Y-%m-%d').replace(tzinfo=timezone.utc)
-                p_end = datetime.strptime(port_end_input.value, '%Y-%m-%d').replace(hour=23, minute=59, tzinfo=timezone.utc)
+                p_start = parse_flexible_date(port_start_input.value, default=datetime(2020, 1, 1, tzinfo=timezone.utc))
+                p_end = parse_flexible_date(port_end_input.value, default=datetime.now(timezone.utc), is_end_of_day=True)
                 tot_cap = float(port_capital_input.value or 10000.0)
                 c_pct = float(port_comm_input.value or 0.1)
                 s_pct = float(port_slip_input.value or 0.05)
@@ -2242,32 +2552,32 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
                     with port_results_container:
                         # 1. Summary Cards
                         with ui.row().classes('w-full gap-4 flex-wrap'):
-                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
-                                ui.label('CAGR del Portafolio').classes('text-xs text-slate-500 uppercase font-bold')
-                                ui.label(f"{res['cagr']:.2f}%").classes('text-2xl font-black text-emerald-600')
+                            with ui.card().classes('flex-1 min-w-[150px] bg-slate-900/80 p-4 rounded-xl border border-slate-800 shadow-lg'):
+                                ui.label('CAGR del Portafolio').classes('text-xs text-slate-400 uppercase font-bold')
+                                ui.label(f"{res['cagr']:.2f}%").classes('text-2xl font-black text-emerald-400')
 
-                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
-                                ui.label('Max Drawdown Combinado').classes('text-xs text-slate-500 uppercase font-bold')
-                                ui.label(f"{res['max_drawdown_pct']:.2f}%").classes('text-2xl font-black text-red-600')
+                            with ui.card().classes('flex-1 min-w-[150px] bg-slate-900/80 p-4 rounded-xl border border-slate-800 shadow-lg'):
+                                ui.label('Max Drawdown Combinado').classes('text-xs text-slate-400 uppercase font-bold')
+                                ui.label(f"{res['max_drawdown_pct']:.2f}%").classes('text-2xl font-black text-rose-400')
 
-                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
-                                ui.label('Profit Factor (PF)').classes('text-xs text-slate-500 uppercase font-bold')
-                                ui.label(f"{res['profit_factor']:.2f}").classes('text-2xl font-black text-purple-600')
+                            with ui.card().classes('flex-1 min-w-[150px] bg-slate-900/80 p-4 rounded-xl border border-slate-800 shadow-lg'):
+                                ui.label('Profit Factor (PF)').classes('text-xs text-slate-400 uppercase font-bold')
+                                ui.label(f"{res['profit_factor']:.2f}").classes('text-2xl font-black text-purple-400')
 
-                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
-                                ui.label('Trades Totales').classes('text-xs text-slate-500 uppercase font-bold')
-                                ui.label(f"{res['total_trades']}").classes('text-2xl font-black text-blue-600')
+                            with ui.card().classes('flex-1 min-w-[150px] bg-slate-900/80 p-4 rounded-xl border border-slate-800 shadow-lg'):
+                                ui.label('Trades Totales').classes('text-xs text-slate-400 uppercase font-bold')
+                                ui.label(f"{res['total_trades']}").classes('text-2xl font-black text-sky-400')
 
-                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
-                                ui.label('Ganadoras / Perdedoras').classes('text-xs text-slate-500 uppercase font-bold')
+                            with ui.card().classes('flex-1 min-w-[150px] bg-slate-900/80 p-4 rounded-xl border border-slate-800 shadow-lg'):
+                                ui.label('Ganadoras / Perdedoras').classes('text-xs text-slate-400 uppercase font-bold')
                                 with ui.row().classes('items-center gap-2 mt-1'):
-                                    ui.label(f"🟢 {res['winning_trades']}").classes('text-lg font-bold text-emerald-600')
-                                    ui.label(f"/ 🔴 {res['losing_trades']}").classes('text-lg font-bold text-red-600')
-                                    ui.label(f"({res['win_rate']:.1f}%)").classes('text-xs font-semibold text-slate-500')
+                                    ui.label(f"🟢 {res['winning_trades']}").classes('text-lg font-bold text-emerald-400')
+                                    ui.label(f"/ 🔴 {res['losing_trades']}").classes('text-lg font-bold text-rose-400')
+                                    ui.label(f"({res['win_rate']:.1f}%)").classes('text-xs font-semibold text-slate-400')
 
-                            with ui.card().classes('flex-1 bg-slate-900/50 p-4 rounded-xl border border-slate-700/50 shadow-lg'):
-                                ui.label('Capital Final Portafolio').classes('text-xs text-slate-500 uppercase font-bold')
-                                ui.label(f"${res['final_equity']:,.2f}").classes('text-2xl font-black text-slate-900')
+                            with ui.card().classes('flex-1 min-w-[150px] bg-slate-900/80 p-4 rounded-xl border border-slate-800 shadow-lg'):
+                                ui.label('Capital Final Portafolio').classes('text-xs text-slate-400 uppercase font-bold')
+                                ui.label(f"${res['final_equity']:,.2f}").classes('text-2xl font-black text-white')
 
                         # 2. Curva de Capital Combinada Chart
                         palette_colors = ['#2563eb', '#9333ea', '#d97706', '#0891b2', '#e11d48', '#65a30d', '#0284c7']
@@ -2445,30 +2755,37 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
         btn_run_portfolio.on_click(run_portfolio_simulation)
 
         def open_portfolio_modal():
-            with ui.context.client:
-                if state.get('start_date'):
-                    port_start_input.value = state['start_date']
-                if state.get('end_date'):
-                    port_end_input.value = state['end_date']
-                if state.get('commission_pct') is not None:
-                    port_comm_input.value = float(state['commission_pct'])
-                if state.get('slippage_pct') is not None:
-                    port_slip_input.value = float(state['slippage_pct'])
+            if state.get('start_date'):
+                port_start_input.value = state['start_date']
+            if state.get('end_date'):
+                port_end_input.value = state['end_date']
+            if state.get('commission_pct') is not None:
+                port_comm_input.value = float(state['commission_pct'])
+            if state.get('slippage_pct') is not None:
+                port_slip_input.value = float(state['slippage_pct'])
 
-                if portfolio_state['items']:
-                    if state.get('strategy_name'):
-                        portfolio_state['items'][0]['strategy'] = state['strategy_name']
-                    if state.get('symbol'):
-                        portfolio_state['items'][0]['symbol'] = state['symbol']
-                    if state.get('timeframe'):
-                        portfolio_state['items'][0]['timeframe'] = state['timeframe']
-                    if state.get('custom_parameters'):
-                        portfolio_state['items'][0]['custom_params'] = state['custom_parameters'].copy()
+            if portfolio_state['items']:
+                current_strat = state.get('strategy_name')
+                if current_strat:
+                    portfolio_state['items'][0]['strategy'] = current_strat
+                    strat_defaults = get_strategy_default_params(current_strat)
+                    main_params = state.get('custom_parameters') or {}
+                    if main_params and all(k in strat_defaults for k in main_params.keys()):
+                        merged = strat_defaults.copy()
+                        merged.update(main_params)
+                        portfolio_state['items'][0]['custom_params'] = merged
+                    else:
+                        portfolio_state['items'][0]['custom_params'] = strat_defaults.copy()
 
-                refresh_portfolio_items_ui()
-                portfolio_dialog.open()
+                if state.get('symbol'):
+                    portfolio_state['items'][0]['symbol'] = state['symbol']
+                if state.get('timeframe'):
+                    portfolio_state['items'][0]['timeframe'] = state['timeframe']
 
-        btn_portfolio.on_click(open_portfolio_modal)
+            refresh_portfolio_items_ui()
+            portfolio_dialog.open()
+
+        btn_portfolio.on_click(on_go_to_portfolio if on_go_to_portfolio else open_portfolio_modal)
 
     def select_strategy(filename):
         if filename in strategies:

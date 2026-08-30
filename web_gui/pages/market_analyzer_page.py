@@ -8,7 +8,7 @@ import logging
 import asyncio
 from web_gui.components.cards import glass_card
 
-from data_layer.export_utils import export_df_to_ninjatrader8
+from data_layer.export_utils import export_df_to_ninjatrader8, format_dt_display, format_date_display, parse_flexible_date
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +64,8 @@ def render_market_analyzer():
             with ui.row().classes('w-full gap-4 items-end mb-4 flex-wrap'):
                 viewer_symbol_select = ui.select([], label='Symbol', value=None).classes('flex-1 min-w-[180px]')
                 viewer_tf_select = ui.select([], label='Timeframe', value=None).classes('flex-1 min-w-[120px]')
-                viewer_start_input = ui.input(label='Start (YYYY-MM-DD)', value=(datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')).classes('flex-1 min-w-[150px]')
-                viewer_end_input = ui.input(label='End (YYYY-MM-DD)', value=datetime.now().strftime('%Y-%m-%d')).classes('flex-1 min-w-[150px]')
+                viewer_start_input = ui.input(label='Inicio (DD/MM/AA)', value=format_date_display(datetime.now() - timedelta(days=30))).classes('flex-1 min-w-[150px]')
+                viewer_end_input = ui.input(label='Fin (DD/MM/AA)', value=format_date_display(datetime.now())).classes('flex-1 min-w-[150px]')
                 ui.button('Cargar Data', on_click=lambda: load_viewer_data(), icon='search').props('rounded').classes('bg-cyan-600 hover:bg-cyan-500 text-white font-bold h-12 shadow-xl transition-all shadow-cyan-500/20 px-6')
                 ui.button('Exportar NinjaTrader 8', on_click=lambda: open_nt8_dialog(), icon='file_download').props('rounded').classes('bg-emerald-600 hover:bg-emerald-500 text-white font-bold h-12 shadow-xl transition-all shadow-emerald-500/20 px-6')
 
@@ -118,10 +118,10 @@ def render_market_analyzer():
                 return
                 
             try:
-                start_dt = datetime.strptime(viewer_start_input.value, '%Y-%m-%d').replace(tzinfo=timezone.utc)
-                end_dt = datetime.strptime(viewer_end_input.value, '%Y-%m-%d').replace(hour=23, minute=59, tzinfo=timezone.utc)
+                start_dt = parse_flexible_date(viewer_start_input.value, default=datetime.now(timezone.utc) - timedelta(days=30))
+                end_dt = parse_flexible_date(viewer_end_input.value, default=datetime.now(timezone.utc), is_end_of_day=True)
             except Exception:
-                ui.notify('Invalid dates. Use YYYY-MM-DD', type='negative')
+                ui.notify('Fechas inválidas. Usa DD/MM/AA', type='negative')
                 return
                 
             db = SessionLocal()
@@ -180,7 +180,7 @@ def render_market_analyzer():
                 ]
                 for _, r in df_reset.iterrows():
                     rows.append({
-                        'timestamp': str(r['timestamp'])[:19],
+                        'timestamp': format_dt_display(r['timestamp']),
                         'open': f"{r['open']:.4f}",
                         'high': f"{r['high']:.4f}",
                         'low': f"{r['low']:.4f}",
@@ -195,7 +195,7 @@ def render_market_analyzer():
                 ]
                 for _, r in df_reset.iterrows():
                     rows.append({
-                        'timestamp': str(r['timestamp'])[:19],
+                        'timestamp': format_dt_display(r['timestamp']),
                         'value': f"{r['value']:.4f}",
                     })
                 viewer_chart.options['series'][0] = {'name': metric_name, 'type': 'line', 'data': df['value'].values.tolist(), 'showSymbol': False}
@@ -203,7 +203,7 @@ def render_market_analyzer():
             viewer_table.rows = rows
             viewer_table.update()
             
-            viewer_chart.options['xAxis']['data'] = df.index.strftime('%Y-%m-%d %H:%M').tolist()
+            viewer_chart.options['xAxis']['data'] = [format_dt_display(x) for x in df.index]
             viewer_chart.update()
             
             ui.notify(f"Loaded {len(rows)} records!", type='positive')
@@ -226,8 +226,8 @@ def render_market_analyzer():
                     'type': 'Market (OHLCV)',
                     'metric': row.timeframe,
                     'source': 'Binance / CCXT',
-                    'start': str(row.start)[:10] if row.start else 'N/A',
-                    'end': str(row.end)[:10] if row.end else 'N/A'
+                    'start': format_date_display(row.start) if row.start else 'N/A',
+                    'end': format_date_display(row.end) if row.end else 'N/A'
                 })
                 
             # OnChain data
@@ -245,8 +245,8 @@ def render_market_analyzer():
                     'type': 'On-Chain',
                     'metric': row.metric_name,
                     'source': row.source if row.source else 'N/A',
-                    'start': str(row.start)[:10] if row.start else 'N/A',
-                    'end': str(row.end)[:10] if row.end else 'N/A'
+                    'start': format_date_display(row.start) if row.start else 'N/A',
+                    'end': format_date_display(row.end) if row.end else 'N/A'
                 })
                 
             table.rows = rows
@@ -352,8 +352,8 @@ def render_market_analyzer():
             source_combo.on_value_change(on_source_change)
             
             with ui.row().classes('w-full gap-4 mt-2'):
-                start_date_input = ui.input(label='Start (YYYY-MM-DD)', value=(datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')).classes('flex-1')
-                end_date_input = ui.input(label='End (YYYY-MM-DD)', value=datetime.now().strftime('%Y-%m-%d')).classes('flex-1')
+                start_date_input = ui.input(label='Inicio (DD/MM/AA)', value=format_date_display(datetime.now() - timedelta(days=365))).classes('flex-1')
+                end_date_input = ui.input(label='Fin (DD/MM/AA)', value=format_date_display(datetime.now())).classes('flex-1')
             
             log_container = ui.log(max_lines=100).classes('w-full h-80 mt-4 bg-gray-900 text-green-400 font-mono text-sm')
             
@@ -377,10 +377,10 @@ def render_market_analyzer():
                     symbols = onchain_select.value
                 
                 try:
-                    start_dt = datetime.strptime(start_date_input.value, '%Y-%m-%d').replace(tzinfo=timezone.utc)
-                    end_dt = datetime.strptime(end_date_input.value, '%Y-%m-%d').replace(hour=23, minute=59, tzinfo=timezone.utc)
+                    start_dt = parse_flexible_date(start_date_input.value, default=datetime.now(timezone.utc) - timedelta(days=365))
+                    end_dt = parse_flexible_date(end_date_input.value, default=datetime.now(timezone.utc), is_end_of_day=True)
                 except Exception:
-                    ui.notify('Invalid dates. Use YYYY-MM-DD', type='negative')
+                    ui.notify('Fechas inválidas. Usa DD/MM/AA', type='negative')
                     return
                 
                 log_container.push(f"Starting download for {len(symbols)} items...")
@@ -464,10 +464,10 @@ def render_market_analyzer():
                     ui.notify('Por favor selecciona primero un Símbolo y Timeframe', type='warning')
                     return
                 try:
-                    start_dt = datetime.strptime(viewer_start_input.value, '%Y-%m-%d').replace(tzinfo=timezone.utc)
-                    end_dt = datetime.strptime(viewer_end_input.value, '%Y-%m-%d').replace(hour=23, minute=59, tzinfo=timezone.utc)
+                    start_dt = parse_flexible_date(viewer_start_input.value, default=datetime.now(timezone.utc) - timedelta(days=30))
+                    end_dt = parse_flexible_date(viewer_end_input.value, default=datetime.now(timezone.utc), is_end_of_day=True)
                 except Exception:
-                    ui.notify('Fechas inválidas. Usa YYYY-MM-DD', type='negative')
+                    ui.notify('Fechas inválidas. Usa DD/MM/AA', type='negative')
                     return
 
                 db = SessionLocal()

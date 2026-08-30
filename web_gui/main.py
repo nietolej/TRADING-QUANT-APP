@@ -14,6 +14,7 @@ from .pages.strategy_builder_page import render_strategy_builder
 from .pages.strategy_catalog_page import render_strategy_catalog
 from .pages.market_analyzer_page import render_market_analyzer
 from .pages.strategy_analyzer_page import render_strategy_analyzer
+from .pages.portfolio_page import render_portfolio_page
 from .pages.optimizer_page import render_optimizer_page
 from .pages.backtest_history_page import render_backtest_history_page
 from .pages.ml_page import render_ml_page
@@ -260,6 +261,7 @@ def create_gui(app):
                 menu_item('Strategy Builder', 'build', 'builder')
                 menu_item('Estrategias Guardadas', 'list', 'catalog')
                 menu_item('Strategy Analyzer', 'analytics', 'analyzer')
+                menu_item('Simulador Portafolio', 'pie_chart', 'portfolio')
                 menu_item('Optimizador (Grid)', 'tune', 'optimizer')
                 menu_item('Historial Backtests', 'history', 'history')
 
@@ -309,8 +311,18 @@ def create_gui(app):
                         live_page.selected_strategy = strategy_filename
                         live_page.strat_select.value = strategy_filename
                     show_page('live')
+
+                def on_go_to_portfolio_page():
+                    show_page('portfolio')
                     
-                analyzer_state = render_strategy_analyzer(on_back_to_builder=on_back_to_builder, on_go_to_live=on_go_to_live)
+                analyzer_state = render_strategy_analyzer(
+                    on_back_to_builder=on_back_to_builder,
+                    on_go_to_live=on_go_to_live,
+                    on_go_to_portfolio=on_go_to_portfolio_page
+                )
+
+            with ui.column().classes('w-full h-full') as pages['portfolio']:
+                portfolio_state = render_portfolio_page()
 
             with ui.column().classes('w-full h-full') as pages['optimizer']:
                 def on_opt_go_to_analyzer(strat_name=None, symbol=None, timeframe=None, custom_params=None):
@@ -328,12 +340,21 @@ def create_gui(app):
                     show_page('analyzer')
 
                 def on_open_portfolio(row=None):
-                    if analyzer_state:
-                        if row and 'load_from_history' in analyzer_state:
-                            analyzer_state['load_from_history'](row)
-                        if 'open_portfolio_modal' in analyzer_state:
-                            analyzer_state['open_portfolio_modal']()
-                    show_page('analyzer')
+                    if row and portfolio_state and 'load_strategy' in portfolio_state:
+                        cfg_custom = None
+                        if row.get('config_snapshot'):
+                            try:
+                                cfg = json.loads(row['config_snapshot'])
+                                cfg_custom = cfg.get('custom_parameters')
+                            except Exception:
+                                pass
+                        portfolio_state['load_strategy'](
+                            row.get('strategy_name'),
+                            symbol=row.get('symbol'),
+                            timeframe=row.get('timeframe'),
+                            custom_params=cfg_custom
+                        )
+                    show_page('portfolio')
 
                 render_backtest_history_page(on_load_in_analyzer=on_load_to_analyzer, on_open_portfolio=on_open_portfolio)
                 

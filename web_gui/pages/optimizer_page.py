@@ -10,9 +10,10 @@ import plotly.graph_objects as go
 
 from data_layer.storage import SessionLocal, OHLCV
 from data_layer.market_data import MarketDataManager, normalize_timeframe
-from backtest_engine.optimizer import run_grid_search, count_combinations, _build_range
+from backtest_engine.optimizer import run_grid_search, count_combinations, _build_range, run_walk_forward
 from backtest_engine.robustness_analyzer import analyze_robustness
 from sqlalchemy import func
+from data_layer.export_utils import format_date_display, parse_flexible_date
 
 
 def _parse_assets(symbol: str) -> tuple[str, str]:
@@ -34,12 +35,35 @@ def render_optimizer_page(on_go_to_analyzer=None):
     strategies = {os.path.basename(f): f for f in strategy_files}
     default_strategy = list(strategies.keys())[0] if strategies else ''
     
+    POPULAR_CRYPTO_SYMBOLS = [
+        'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'BNB/BTC', 'ETH/BTC',
+        'XRP/USDT', 'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT',
+        'NEAR/USDT', 'MATIC/USDT', 'SUI/USDT', 'APT/USDT', 'PEPE/USDT', 'SHIB/USDT',
+        'LTC/USDT', 'TRX/USDT', 'ATOM/USDT', 'UNI/USDT', 'ICP/USDT', 'FIL/USDT',
+        'XMR/USDT', 'ETC/USDT', 'BCH/USDT', 'INJ/USDT', 'TIA/USDT', 'RENDER/USDT',
+        'FET/USDT', 'TAO/USDT', 'RUNE/USDT', 'FTM/USDT', 'KAS/USDT', 'AR/USDT',
+        'STX/USDT', 'OP/USDT', 'ARB/USDT', 'IMX/USDT', 'GRT/USDT', 'GALA/USDT',
+        'WIF/USDT', 'FLOKI/USDT', 'BONK/USDT', 'JUP/USDT', 'PENDLE/USDT', 'SEI/USDT'
+    ]
+
+    def _get_initial_symbols():
+        db = SessionLocal()
+        try:
+            db_symbols = [r[0] for r in db.query(OHLCV.symbol).distinct().all()]
+        except Exception:
+            db_symbols = []
+        finally:
+            db.close()
+        return sorted(list(set(POPULAR_CRYPTO_SYMBOLS + db_symbols)))
+
+    available_symbols = _get_initial_symbols()
+
     state = {
         'strategy_name': default_strategy,
-        'symbol': 'BTC/USDT',
+        'symbol': available_symbols[0] if available_symbols else 'BTC/USDT',
         'timeframe': '1d',
-        'start_date': '2020-01-01',
-        'end_date': datetime.now().strftime('%Y-%m-%d'),
+        'start_date': '01/01/20',
+        'end_date': format_date_display(datetime.now()),
         'capital': 1.0,
         'capital_type': 'BASE',
         'capital_asset': 'BTC (BASE)',
@@ -98,11 +122,37 @@ def render_optimizer_page(on_go_to_analyzer=None):
                     strat_combo = ui.select(list(strategies.keys()), value=state['strategy_name'], on_change=_on_strat_change).classes('w-full')
 
                 # Selector de Símbolo
-                with ui.column().classes('flex-1 min-w-[160px] gap-0'):
-                    ui.label('Activo / Par').classes('text-xs text-gray-400 mb-1')
+                with ui.column().classes('flex-1 min-w-[200px] gap-0'):
+                    with ui.row().classes('w-full items-center justify-between'):
+                        ui.label('Activo / Par').classes('text-xs text-gray-400 mb-1')
+                        async def _reload_binance_symbols():
+                            ui.notify('Buscando pares en base de datos y Binance...', type='info', timeout=1500)
+                            db = SessionLocal()
+                            try:
+                                db_syms = sorted([r[0] for r in db.query(OHLCV.symbol).distinct().all()])
+                            except Exception:
+                                db_syms = []
+                            finally:
+                                db.close()
+                                
+                            try:
+                                from web_gui.pages.market_analyzer_page import _load_binance_symbols_sync
+                                binance_syms = await run.io_bound(_load_binance_symbols_sync)
+                            except Exception:
+                                binance_syms = []
+                                
+                            merged = sorted(list(set(available_symbols + db_syms + binance_syms)))
+                            sym_combo.options = merged
+                            sym_combo.update()
+                            ui.notify(f'✅ {len(merged)} pares cargados', type='positive', timeout=2000)
+
+                        ui.button(icon='refresh', on_click=_reload_binance_symbols).props('round dense flat size=xs color=purple-4').tooltip('Recargar catálogo completo de pares de Binance y BD')
+                    
                     sym_combo = ui.select(
-                        ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'BNB/BTC', 'XRP/USDT', 'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT'],
-                        value=state['symbol']
+                        available_symbols,
+                        value=state['symbol'],
+                        with_input=True,
+                        new_value_mode='add-unique'
                     ).bind_value(state, 'symbol').classes('w-full')
 
                 # Selector de Temporalidad
@@ -115,12 +165,12 @@ def render_optimizer_page(on_go_to_analyzer=None):
 
                 # Fecha Inicio
                 with ui.column().classes('flex-1 min-w-[140px] gap-0'):
-                    ui.label('Fecha de Inicio').classes('text-xs text-gray-400 mb-1')
+                    ui.label('Fecha de Inicio (DD/MM/AA)').classes('text-xs text-gray-400 mb-1')
                     start_date_input = ui.input('Inicio', value=state['start_date']).bind_value(state, 'start_date').classes('w-full')
 
                 # Fecha Fin
                 with ui.column().classes('flex-1 min-w-[140px] gap-0'):
-                    ui.label('Fecha de Fin').classes('text-xs text-gray-400 mb-1')
+                    ui.label('Fecha de Fin (DD/MM/AA)').classes('text-xs text-gray-400 mb-1')
                     end_date_input = ui.input('Fin', value=state['end_date']).bind_value(state, 'end_date').classes('w-full')
 
             # Fila 2: Capital + Activo de Inicio + Sizing + Fricción
@@ -365,17 +415,59 @@ def render_optimizer_page(on_go_to_analyzer=None):
                     on_click=lambda: asyncio.create_task(_run_optimizer())
                 ).classes('bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold px-8 py-3 rounded-xl shadow-lg transition-all text-sm tracking-wide')
 
+                btn_wf = ui.button(
+                    '\U0001f504 WALK-FORWARD',
+                    on_click=lambda: asyncio.create_task(_run_walk_forward_ui())
+                ).classes('bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold px-5 py-3 rounded-xl shadow transition-all text-sm')
+
             # Barra de Progreso
             opt_progress = ui.linear_progress(value=0).classes('w-full mt-4').props('color=amber-8')
             lbl_progress = ui.label('').classes('text-xs text-slate-400 mt-1')
+
+            # Nota: ambiguedad SL/TP intrabarra
+            with ui.row().classes('w-full items-start gap-2 mt-2 bg-slate-800/40 border border-slate-700/50 rounded-lg p-2.5'):
+                ui.icon('info_outline', size='1rem').classes('text-sky-400 mt-0.5 flex-shrink-0')
+                ui.label(
+                    'Nota de simulacion: Con datos OHLC, si en la misma vela el Low toca el SL y el High toca el TP, '
+                    'el motor prioriza el SL (escenario conservador). Los resultados reales pueden ser iguales o mejores.'
+                ).classes('text-[11px] text-slate-400 leading-relaxed')
 
         # ════════════════════════════════════════════════════════
         # 5. TABLA DE RESULTADOS DE LA OPTIMIZACIÓN
         # ════════════════════════════════════════════════════════
         with ui.card().classes('w-full bg-slate-900/60 border border-slate-800 rounded-xl p-4 shadow'):
-            with ui.row().classes('w-full justify-between items-center mb-2'):
-                ui.label('3. Clasificación de Resultados de Optimización').classes('text-sm font-bold text-slate-200 uppercase tracking-wider')
-                lbl_res_info = ui.label('Esperando ejecución...').classes('text-xs text-slate-400')
+            with ui.row().classes('w-full justify-between items-center mb-2 flex-wrap gap-2'):
+                with ui.column().classes('gap-0'):
+                    ui.label('3. Clasificación de Resultados de Optimización').classes('text-sm font-bold text-slate-200 uppercase tracking-wider')
+                    lbl_res_info = ui.label('Esperando ejecución...').classes('text-xs text-slate-400')
+                
+                with ui.row().classes('items-center gap-2'):
+                    opt_search_input = ui.input(placeholder='Buscar por parámetros o valores...').props('dense outlined clearable icon=search').classes('w-64')
+                    def _export_csv():
+                        res_list = state.get('last_results', [])
+                        if not res_list:
+                            ui.notify('No hay resultados para exportar', type='warning')
+                            return
+                        rows_exp = []
+                        for idx_exp, r in enumerate(res_list, 1):
+                            row_d = {'rank': idx_exp}
+                            row_d.update(r.get('params', {}))
+                            row_d['sharpe_ratio'] = r.get('sharpe_ratio')
+                            row_d['cagr'] = r.get('cagr')
+                            row_d['max_drawdown_pct'] = r.get('max_drawdown_pct')
+                            row_d['profit_factor'] = r.get('profit_factor')
+                            row_d['total_trades'] = r.get('total_trades')
+                            row_d['percent_profitable'] = r.get('percent_profitable')
+                            row_d['net_pnl'] = r.get('net_pnl')
+                            row_d['final_equity'] = r.get('final_equity')
+                            rows_exp.append(row_d)
+                        df_exp = pd.DataFrame(rows_exp)
+                        csv_str = df_exp.to_csv(index=False)
+                        strat_clean = state.get('strategy_name', 'grid').replace('.yaml', '')
+                        ui.download(csv_str.encode('utf-8'), f"optimizer_{strat_clean}_{state.get('symbol', 'asset').replace('/', '_')}.csv")
+                        ui.notify('✅ Archivo CSV generado para descarga', type='positive')
+
+                    ui.button('Exportar CSV', icon='file_download', on_click=_export_csv).props('dense size=sm rounded').classes('bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold px-3 py-1 text-xs shadow border border-slate-700')
 
             opt_result_cols = [
                 {'name': 'rank',          'label': '#',           'field': 'rank',         'sortable': True,  'align': 'center'},
@@ -393,8 +485,13 @@ def render_optimizer_page(on_go_to_analyzer=None):
             ]
 
             opt_result_table = ui.table(
-                columns=opt_result_cols, rows=[], row_key='rank'
+                columns=opt_result_cols,
+                rows=[],
+                row_key='rank',
+                pagination={'rowsPerPage': 20, 'sortBy': 'rank', 'descending': False}
             ).props('dense flat').classes('w-full mt-2 text-sm font-medium')
+            
+            opt_result_table.bind_filter(opt_search_input, 'value')
 
             opt_result_table.add_slot('body-cell-rank', '''
                 <q-td :props="props">
@@ -749,6 +846,83 @@ def render_optimizer_page(on_go_to_analyzer=None):
                 )
                 box_distribution_plot.update_figure(fig_box)
 
+            # ── Subpanel D: Mapa de Calor 2D & Superficie 3D del Espacio de Parámetros ──
+            with ui.card().classes('w-full bg-slate-950/70 border border-slate-800/80 rounded-xl p-3.5 mt-3'):
+                with ui.row().classes('w-full justify-between items-center mb-3 flex-wrap gap-2'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('grid_on', size='1.2rem').classes('text-cyan-400')
+                        ui.label('Paisaje del Espacio de Parámetros (Heatmap 2D / Superficie 3D)').classes('text-xs font-bold text-slate-200 uppercase tracking-wider font-mono')
+                    
+                    with ui.row().classes('items-center gap-3 flex-wrap'):
+                        heatmap_mode = ui.radio(['Mapa 2D (Heatmap)', 'Superficie 3D (Surface)'], value='Mapa 2D (Heatmap)', on_change=lambda e: _update_heatmap_ui()).props('dense inline').classes('text-xs text-slate-300')
+                        heatmap_x_select = ui.select([], label='Eje X (Parám 1)', on_change=lambda e: _update_heatmap_ui()).classes('w-36')
+                        heatmap_y_select = ui.select([], label='Eje Y (Parám 2)', on_change=lambda e: _update_heatmap_ui()).classes('w-36')
+                        heatmap_metric_select = ui.select(
+                            {'sharpe_ratio': 'Sharpe Ratio', 'cagr': 'CAGR (%)', 'net_pnl': 'PnL Neto ($)', 'max_drawdown_pct': 'Max Drawdown (%)', 'profit_factor': 'Profit Factor'},
+                            label='Métrica Z (Color)',
+                            value='sharpe_ratio',
+                            on_change=lambda e: _update_heatmap_ui()
+                        ).classes('w-44')
+
+                heatmap_plot = ui.plotly({}).classes('w-full h-80')
+
+            def _update_heatmap_ui():
+                res_data = state.get('last_results', [])
+                if not res_data or not heatmap_x_select.value or not heatmap_y_select.value:
+                    return
+                px = heatmap_x_select.value
+                py = heatmap_y_select.value
+                m = heatmap_metric_select.value or 'sharpe_ratio'
+                mode = heatmap_mode.value
+                
+                from backtest_engine.robustness_analyzer import generate_heatmap_matrix
+                matrix_data = generate_heatmap_matrix(res_data, px, py, m)
+                
+                if not matrix_data.get('z') or not matrix_data.get('x') or not matrix_data.get('y'):
+                    return
+                    
+                x_vals = matrix_data['x']
+                y_vals = matrix_data['y']
+                z_vals = matrix_data['z']
+                
+                fig = go.Figure()
+                if '3D' in str(mode):
+                    fig.add_trace(go.Surface(
+                        z=z_vals,
+                        x=x_vals,
+                        y=y_vals,
+                        colorscale='Viridis',
+                        colorbar=dict(title=dict(text=m.upper(), side='right'))
+                    ))
+                    fig.update_layout(
+                        template='plotly_dark',
+                        paper_bgcolor='#0a0e17',
+                        scene=dict(
+                            xaxis=dict(title=px, gridcolor='#1e293b', backgroundcolor='#111827'),
+                            yaxis=dict(title=py, gridcolor='#1e293b', backgroundcolor='#111827'),
+                            zaxis=dict(title=m, gridcolor='#1e293b', backgroundcolor='#111827'),
+                        ),
+                        margin=dict(l=10, r=10, t=20, b=10)
+                    )
+                else:
+                    fig.add_trace(go.Heatmap(
+                        z=z_vals,
+                        x=x_vals,
+                        y=y_vals,
+                        colorscale='Viridis',
+                        hoverongaps=False,
+                        colorbar=dict(title=dict(text=m.upper(), side='right'))
+                    ))
+                    fig.update_layout(
+                        template='plotly_dark',
+                        paper_bgcolor='#0a0e17',
+                        plot_bgcolor='#111827',
+                        xaxis=dict(title=px, gridcolor='#1e293b'),
+                        yaxis=dict(title=py, gridcolor='#1e293b'),
+                        margin=dict(l=50, r=20, t=20, b=40)
+                    )
+                heatmap_plot.update_figure(fig)
+
         # ════════════════════════════════════════════════════════
         # FUNCIÓN PRINCIPAL DE EJECUCIÓN DEL OPTIMIZADOR
         # ════════════════════════════════════════════════════════
@@ -783,8 +957,8 @@ def render_optimizer_page(on_go_to_analyzer=None):
 
             # 1. Cargar datos de mercado
             try:
-                start_dt = datetime.strptime(state['start_date'], '%Y-%m-%d').replace(tzinfo=timezone.utc)
-                end_dt = datetime.strptime(state['end_date'], '%Y-%m-%d').replace(hour=23, minute=59, tzinfo=timezone.utc)
+                start_dt = parse_flexible_date(state['start_date'], default=datetime(2020, 1, 1, tzinfo=timezone.utc))
+                end_dt = parse_flexible_date(state['end_date'], default=datetime.now(timezone.utc), is_end_of_day=True)
                 db = SessionLocal()
                 market_mgr = MarketDataManager(db)
                 df_opt = market_mgr.get_data(state['symbol'], state['timeframe'], start_dt, end_dt)
@@ -882,7 +1056,7 @@ def render_optimizer_page(on_go_to_analyzer=None):
 
             state['last_results'] = results
 
-            # Formatear y mostrar resultados
+            # Formatear y mostrar resultados (sin incluir equity_curve en la tabla para máxima velocidad)
             rows = []
             for i, r in enumerate(results, 1):
                 param_str = ' | '.join(f"{k}={v}" for k, v in r['params'].items())
@@ -899,7 +1073,6 @@ def render_optimizer_page(on_go_to_analyzer=None):
                     'cons_losses': r.get('max_consecutive_losers', 0),
                     'final_eq': f"{r.get('final_equity', 0):,.2f}",
                     'pnl': r['net_pnl'],
-                    'equity_curve': r.get('equity_curve', [])
                 })
 
             opt_result_table.rows = rows
@@ -1011,7 +1184,7 @@ def render_optimizer_page(on_go_to_analyzer=None):
                         f"Parámetro Más Influyente: {rob['most_influential_param']} ({rob['most_influential_pct']}%) | Menos Influyente: {rob['least_influential_param']} ({rob['least_influential_pct']}%)"
                     )
 
-                    # 5. Selector y Gráficos de Parámetros
+                    # 5. Selector y Gráficos de Parámetros Individuales
                     p_keys = list(rob['param_stats'].keys())
                     param_selector.options = p_keys
                     param_selector.value = p_keys[0] if p_keys else ''
@@ -1019,12 +1192,204 @@ def render_optimizer_page(on_go_to_analyzer=None):
                     if p_keys:
                         _update_param_stats_ui(p_keys[0])
 
+                    # 6. Actualizar Opciones del Mapa de Calor 2D / Superficie 3D
+                    if len(p_keys) >= 2:
+                        heatmap_x_select.options = p_keys
+                        heatmap_x_select.value = p_keys[0]
+                        heatmap_y_select.options = p_keys
+                        heatmap_y_select.value = p_keys[1]
+                        heatmap_x_select.update()
+                        heatmap_y_select.update()
+                        _update_heatmap_ui()
+                    elif len(p_keys) == 1:
+                        heatmap_x_select.options = p_keys
+                        heatmap_x_select.value = p_keys[0]
+                        heatmap_y_select.options = p_keys
+                        heatmap_y_select.value = p_keys[0]
+                        heatmap_x_select.update()
+                        heatmap_y_select.update()
+                        _update_heatmap_ui()
+
                     robustness_card.set_visibility(True)
 
             except Exception as rob_ex:
                 ui.notify(f"Aviso de robustez: {rob_ex}", type='warning')
 
             ui.notify(f"✅ Optimización y Análisis de Robustez finalizados. {len(results)} combinaciones evaluadas.", type='positive', timeout=4.0)
+
+        # ════════════════════════════════════════════════════════
+        # WALK-FORWARD VALIDATION SECTION
+        # ════════════════════════════════════════════════════════
+        wf_card = ui.card().classes('w-full bg-slate-900/80 border border-amber-900/40 rounded-xl p-4 shadow-xl')
+        wf_card.set_visibility(False)
+
+        with wf_card:
+            with ui.row().classes('w-full justify-between items-center mb-3'):
+                with ui.row().classes('items-center gap-2.5'):
+                    with ui.row().classes('items-center justify-center w-8 h-8 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-400'):
+                        ui.icon('timeline', size='1.25rem')
+                    with ui.column().classes('gap-0'):
+                        ui.label('6. Walk-Forward Validation — Detección de Overfitting').classes('text-base font-bold text-white tracking-tight leading-tight')
+                        ui.label(
+                            'Verifica si los parámetros óptimos del Grid Search funcionan en datos no vistos (Out-of-Sample). '
+                            'Eficiencia >0.7 = robusto. <0.5 = posible sobreajuste.'
+                        ).classes('text-slate-400 text-xs')
+
+                with ui.row().classes('items-center gap-2'):
+                    wf_n_splits = ui.number('Folds (N)', value=5, min=2, max=10, step=1).classes('w-24').props('dense')
+                    wf_is_pct = ui.number('IS %', value=70, min=50, max=85, step=5).classes('w-24').props('dense')
+
+            # Métricas resumen
+            with ui.row().classes('w-full gap-4 mb-3 flex-wrap'):
+                with ui.card().classes('flex-1 min-w-[140px] bg-slate-800/70 border border-slate-700 rounded-lg p-3 text-center'):
+                    ui.label('Eficiencia WF').classes('text-xs text-slate-400 mb-1')
+                    lbl_wf_efficiency = ui.label('--').classes('text-2xl font-bold text-amber-400')
+                    ui.label('OOS / IS metric ratio').classes('text-[10px] text-slate-500')
+
+                with ui.card().classes('flex-1 min-w-[140px] bg-slate-800/70 border border-slate-700 rounded-lg p-3 text-center'):
+                    ui.label('Sharpe IS medio').classes('text-xs text-slate-400 mb-1')
+                    lbl_wf_is_mean = ui.label('--').classes('text-2xl font-bold text-blue-400')
+
+                with ui.card().classes('flex-1 min-w-[140px] bg-slate-800/70 border border-slate-700 rounded-lg p-3 text-center'):
+                    ui.label('Sharpe OOS medio').classes('text-xs text-slate-400 mb-1')
+                    lbl_wf_oos_mean = ui.label('--').classes('text-2xl font-bold text-green-400')
+
+                with ui.card().classes('flex-1 min-w-[140px] bg-slate-800/70 border border-slate-700 rounded-lg p-3 text-center'):
+                    ui.label('CAGR OOS medio').classes('text-xs text-slate-400 mb-1')
+                    lbl_wf_oos_cagr = ui.label('--').classes('text-2xl font-bold text-emerald-400')
+
+                with ui.card().classes('flex-1 min-w-[140px] bg-slate-800/70 border border-slate-700 rounded-lg p-3 text-center'):
+                    ui.label('Veredicto').classes('text-xs text-slate-400 mb-1')
+                    lbl_wf_verdict = ui.label('--').classes('text-base font-bold text-white')
+
+            # Parámetros consenso
+            with ui.row().classes('w-full items-center gap-2 mb-3 bg-slate-800/50 rounded-lg p-2.5'):
+                ui.icon('auto_awesome', size='1rem').classes('text-amber-400')
+                ui.label('Parámetros Consenso (más frecuentes entre folds):').classes('text-xs text-slate-300 font-semibold')
+                lbl_wf_consensus = ui.label('--').classes('text-xs text-amber-300 font-mono')
+
+            # Tabla de folds
+            wf_table_cols = [
+                {'name': 'fold',       'label': 'Fold',      'field': 'fold',       'sortable': True},
+                {'name': 'is_start',   'label': 'IS Inicio', 'field': 'is_start',   'sortable': False},
+                {'name': 'is_end',     'label': 'IS Fin',    'field': 'is_end',     'sortable': False},
+                {'name': 'oos_start',  'label': 'OOS Inicio','field': 'oos_start',  'sortable': False},
+                {'name': 'oos_end',    'label': 'OOS Fin',   'field': 'oos_end',    'sortable': False},
+                {'name': 'params_str', 'label': 'Parámetros IS Óptimos', 'field': 'params_str', 'sortable': False},
+                {'name': 'is_metric',  'label': 'Métrica IS','field': 'is_metric',  'sortable': True},
+                {'name': 'oos_metric', 'label': 'Métrica OOS','field': 'oos_metric','sortable': True},
+                {'name': 'is_cagr',    'label': 'CAGR IS',   'field': 'is_cagr',    'sortable': True},
+                {'name': 'oos_cagr',   'label': 'CAGR OOS',  'field': 'oos_cagr',   'sortable': True},
+                {'name': 'fold_efficiency', 'label': 'Eficiencia', 'field': 'fold_efficiency', 'sortable': True},
+            ]
+            wf_folds_table = ui.table(columns=wf_table_cols, rows=[], row_key='fold').classes('w-full text-xs')
+            wf_folds_table.add_slot('body-cell-fold_efficiency', '''
+                <q-td :props="props">
+                    <q-badge :color="props.value >= 0.7 ? 'positive' : props.value >= 0.5 ? 'warning' : 'negative'" class="px-2 py-0.5 font-bold">
+                        {{ (props.value * 100).toFixed(0) }}%
+                    </q-badge>
+                </q-td>
+            ''')
+
+        async def _run_walk_forward_ui():
+            file_path = strategies.get(state['strategy_name'])
+            if not file_path or not opt_ranges:
+                ui.notify('Primero ejecute el Optimizador para definir rangos de parámetros', type='warning')
+                return
+
+            n_splits_val = int(wf_n_splits.value or 5)
+            is_pct_val = float((wf_is_pct.value or 70)) / 100.0
+
+            # Reutilizar datos ya descargados o volver a obtenerlos
+            btn_wf.set_text('⏳ Ejecutando Walk-Forward...')
+            btn_wf.props('disabled')
+
+            try:
+                db_temp = SessionLocal()
+                start_dt = parse_flexible_date(state.get('start_date', '01/01/20'))
+                end_dt = parse_flexible_date(state.get('end_date', ''))
+                mgr = MarketDataManager(db_temp)
+                symbol = state.get('symbol', 'BTC/USDT')
+                timeframe = state.get('timeframe', '1d')
+                df_wf = mgr.get_data(symbol, timeframe, start_dt, end_dt)
+                db_temp.close()
+
+                if df_wf.empty:
+                    ui.notify('No hay datos disponibles para Walk-Forward', type='warning')
+                    return
+
+                start_price = float(df_wf.iloc[0]['open']) if not df_wf.empty else 1.0
+                cap_val = float(state.get('capital', 1.0) or 1.0)
+                initial_cap = cap_val * start_price if state.get('capital_type', 'QUOTE') == 'BASE' else cap_val
+                comm_pct = float(state.get('commission_pct', 0.1) or 0.1)
+                slip_pct = float(state.get('slippage_pct', 0.05) or 0.05)
+                metric_key = state.get('optimize_metric', 'sharpe_ratio')
+
+                opt_ranges_copy = dict(opt_ranges)
+
+                wf_result = await run.io_bound(
+                    lambda: run_walk_forward(
+                        file_path, df_wf, initial_cap, opt_ranges_copy,
+                        n_splits=n_splits_val,
+                        in_sample_pct=is_pct_val,
+                        optimize_metric=metric_key,
+                        commission_pct=comm_pct,
+                        slippage_pct=slip_pct,
+                    )
+                )
+
+                if wf_result.get('error'):
+                    ui.notify(f"Walk-Forward error: {wf_result['error']}", type='negative')
+                    return
+
+                # Actualizar métricas
+                eff = wf_result['wf_efficiency']
+                lbl_wf_efficiency.set_text(f"{eff:.2f}")
+                lbl_wf_is_mean.set_text(str(wf_result['is_mean']))
+                lbl_wf_oos_mean.set_text(str(wf_result['oos_mean']))
+                lbl_wf_oos_cagr.set_text(f"{wf_result['oos_cagr_mean']:+.2f}%")
+
+                if wf_result['overfitting_detected']:
+                    lbl_wf_verdict.set_text('⚠️ POSIBLE SOBREAJUSTE')
+                    lbl_wf_verdict.classes(remove='text-green-400', add='text-red-400')
+                else:
+                    lbl_wf_verdict.set_text('✅ ESTRATEGIA ROBUSTA')
+                    lbl_wf_verdict.classes(remove='text-red-400', add='text-green-400')
+
+                # Consenso
+                consensus = wf_result.get('consensus_params', {})
+                lbl_wf_consensus.set_text(' | '.join(f"{k}={v}" for k, v in consensus.items()) or '--')
+
+                # Tabla de folds
+                fold_rows = []
+                for f in wf_result['folds']:
+                    fold_rows.append({
+                        'fold': f['fold'],
+                        'is_start': f['is_start'],
+                        'is_end': f['is_end'],
+                        'oos_start': f['oos_start'],
+                        'oos_end': f['oos_end'],
+                        'params_str': ' | '.join(f"{k}={v}" for k, v in f['best_params'].items()),
+                        'is_metric': f['is_metric'],
+                        'oos_metric': f['oos_metric'],
+                        'is_cagr': f'{f["is_cagr"]:+.2f}%',
+                        'oos_cagr': f'{f["oos_cagr"]:+.2f}%',
+                        'fold_efficiency': f['fold_efficiency'],
+                    })
+                wf_folds_table.rows = fold_rows
+                wf_folds_table.update()
+                wf_card.set_visibility(True)
+                ui.notify(
+                    f"✅ Walk-Forward completado: {wf_result['n_folds']} folds | "
+                    f"Eficiencia: {eff:.2f} | {'⚠️ Sobreajuste detectado' if wf_result['overfitting_detected'] else '✅ Robusto'}",
+                    type='positive', timeout=6000
+                )
+
+            except Exception as wf_ex:
+                ui.notify(f"Error en Walk-Forward: {wf_ex}", type='negative')
+            finally:
+                btn_wf.set_text('🔄 EJECUTAR WALK-FORWARD VALIDATION')
+                btn_wf.props(remove='disabled')
 
     return {
         'state': state,

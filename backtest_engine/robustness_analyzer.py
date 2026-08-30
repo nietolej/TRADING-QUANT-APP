@@ -1,11 +1,12 @@
 """
-robustness_analyzer.py — Motor Cuantitativo de Análisis de Robustez y Sensibilidad de Parámetros.
+robustness_analyzer.py — Motor Cuantitativo Vectorizado de Análisis de Robustez y Sensibilidad de Parámetros.
 
-Calcula:
+Calcula a ultra alta velocidad (Vectorizado con NumPy):
 1. Configuración Más Robusta (Meseta / Plateau Analysis de vecinos en el espacio de parámetros).
-2. Parámetro Más Influyente (% de importancia y sensibilidad mediante descomposición de varianza).
+2. Parámetro Más Influyente (% de importancia y sensibilidad mediante descomposición de varianza ANOVA).
 3. Media, Desviación Estándar, Coeficiente de Variación y Dispersión de cada parámetro (PnL, DD, Sharpe).
 4. Índice Global de Robustez (Robustness Score 0-100) y detección de Sobreajuste (Overfitting Risk).
+5. Generación de Matrices Pivote para Mapas de Calor 2D y Superficies 3D de Parámetros.
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ def analyze_robustness(
 ) -> Dict[str, Any]:
     """
     Analiza la robustez global del espacio de parámetros explorado en el Grid Search.
+    Implementación vectorizada de alto rendimiento para miles de combinaciones.
     """
     if not results or len(results) < 2:
         return {'status': 'insufficient_data'}
@@ -47,60 +49,72 @@ def analyze_robustness(
 
     df = pd.DataFrame(records)
     param_keys = list(param_ranges.keys())
+    N = len(df)
     
     # ─────────────────────────────────────────────────────────────
-    # A. CONFIGURACIÓN MÁS ROBUSTA (MESETA / NEIGHBORHOOD PLATEAU)
+    # A. CONFIGURACIÓN MÁS ROBUSTA (MESETA / VECTORIZED PLATEAU)
     # ─────────────────────────────────────────────────────────────
-    # Para cada configuración, encontramos sus vecinos a +-1 paso en el grid
-    # y calculamos la media y estabilidad del vecindario.
-    
     best_peak_idx = df[target_metric].idxmax() if target_metric != 'max_drawdown_pct' else df['max_drawdown_pct'].abs().idxmin()
     best_peak_row = df.loc[best_peak_idx]
 
-    # Calcular pasos para cada parámetro
     param_steps = {}
     for k in param_keys:
         st = float(param_ranges[k].get('step', 1.0))
         param_steps[k] = st if st > 0 else 1.0
 
+    param_vals = df[param_keys].to_numpy(dtype=np.float64)
+    steps = np.array([param_steps[k] for k in param_keys], dtype=np.float64)
+    norm_coords = param_vals / steps
+
+    metric_arr = df[target_metric].to_numpy(dtype=np.float64)
+    pnl_arr = df['net_pnl'].to_numpy(dtype=np.float64)
+    dd_arr = df['max_drawdown_pct'].abs().to_numpy(dtype=np.float64)
+
+    # Matriz booleana de vecindad vectorizada (alta velocidad)
+    if N <= 3000:
+        diff = np.abs(norm_coords[:, None, :] - norm_coords[None, :, :])
+        is_neigh = np.all(diff <= 1.05, axis=-1)
+    else:
+        is_neigh = np.zeros((N, N), dtype=bool)
+        chunk_size = 500
+        for i in range(0, N, chunk_size):
+            chunk = norm_coords[i:i+chunk_size]
+            diff_chunk = np.abs(chunk[:, None, :] - norm_coords[None, :, :])
+            is_neigh[i:i+chunk_size] = np.all(diff_chunk <= 1.05, axis=-1)
+
+    neigh_counts = is_neigh.sum(axis=1)
+    safe_counts = np.maximum(1, neigh_counts)
+    
+    neigh_metric_mean = (is_neigh @ metric_arr) / safe_counts
+    neigh_pnl_mean = (is_neigh @ pnl_arr) / safe_counts
+    neigh_dd_mean = (is_neigh @ dd_arr) / safe_counts
+
+    neigh_metric_sq_mean = (is_neigh @ (metric_arr ** 2)) / safe_counts
+    neigh_metric_std = np.sqrt(np.maximum(0.0, neigh_metric_sq_mean - (neigh_metric_mean ** 2)))
+    
+    neigh_pnl_sq_mean = (is_neigh @ (pnl_arr ** 2)) / safe_counts
+    neigh_pnl_std = np.sqrt(np.maximum(0.0, neigh_pnl_sq_mean - (neigh_pnl_mean ** 2)))
+
+    if target_metric == 'max_drawdown_pct':
+        robust_scores = -(neigh_dd_mean + 0.5 * neigh_metric_std)
+    else:
+        robust_scores = neigh_metric_mean - 0.5 * neigh_metric_std
+
+    coverage_factor = np.minimum(1.0, neigh_counts / (2 ** len(param_keys)))
+    adjusted_robust_scores = robust_scores * (0.7 + 0.3 * coverage_factor)
+
     plateau_scores = []
-    for idx, row in df.iterrows():
-        # Filtro de vecindad: distancias <= 1.05 * step en cada parámetro
-        mask = pd.Series(True, index=df.index)
-        for k in param_keys:
-            dist = (df[k] - row[k]).abs()
-            mask &= (dist <= param_steps[k] * 1.05)
-            
-        neighbors = df[mask]
-        n_count = len(neighbors)
-        
-        neigh_metric_mean = float(neighbors[target_metric].mean())
-        neigh_metric_std = float(neighbors[target_metric].std()) if n_count > 1 else 0.0
-        neigh_pnl_mean = float(neighbors['net_pnl'].mean())
-        neigh_pnl_std = float(neighbors['net_pnl'].std()) if n_count > 1 else 0.0
-        neigh_dd_mean = float(neighbors['max_drawdown_pct'].abs().mean())
-        
-        # Robustness Score de la meseta:
-        # Recompensa alta media de vecinos y penaliza alta dispersión/varianza
-        # Score = mean - 0.5 * std (para Sharpe)
-        if target_metric == 'max_drawdown_pct':
-            robust_score = -(neigh_dd_mean + 0.5 * neigh_metric_std)
-        else:
-            robust_score = neigh_metric_mean - 0.5 * neigh_metric_std
-
-        # Penalización si el vecindario tiene pocas simulaciones (ej. esquinas extremas del grid)
-        coverage_factor = min(1.0, n_count / (2 ** len(param_keys)))
-        adjusted_robust_score = robust_score * (0.7 + 0.3 * coverage_factor)
-
+    for idx in range(N):
+        row = df.iloc[idx]
         plateau_scores.append({
             'index': idx,
-            'robust_score': adjusted_robust_score,
-            'neigh_metric_mean': neigh_metric_mean,
-            'neigh_metric_std': neigh_metric_std,
-            'neigh_pnl_mean': neigh_pnl_mean,
-            'neigh_pnl_std': neigh_pnl_std,
-            'neigh_dd_mean': neigh_dd_mean,
-            'neighbors_count': n_count,
+            'robust_score': float(adjusted_robust_scores[idx]),
+            'neigh_metric_mean': float(neigh_metric_mean[idx]),
+            'neigh_metric_std': float(neigh_metric_std[idx]),
+            'neigh_pnl_mean': float(neigh_pnl_mean[idx]),
+            'neigh_pnl_std': float(neigh_pnl_std[idx]),
+            'neigh_dd_mean': float(neigh_dd_mean[idx]),
+            'neighbors_count': int(neigh_counts[idx]),
             'params': {k: row[k] for k in param_keys},
             'self_sharpe': float(row['sharpe_ratio']),
             'self_pnl': float(row['net_pnl']),
@@ -109,20 +123,17 @@ def analyze_robustness(
             'raw_result': row['_raw_result']
         })
 
-    # Seleccionar la mejor meseta
     plateau_scores.sort(key=lambda x: x['robust_score'], reverse=True)
     best_robust = plateau_scores[0]
 
     # ─────────────────────────────────────────────────────────────
     # B. SENSIBILIDAD E IMPORTANCIA DE CADA PARÁMETRO (% ANOVA)
     # ─────────────────────────────────────────────────────────────
-    # Cuánta de la varianza total de la métrica es explicada por cada parámetro
     total_var = float(df[target_metric].var()) if len(df) > 1 else 1e-6
     param_importance = {}
     
     if total_var > 1e-9:
         for k in param_keys:
-            # Varianza entre las medias de los grupos del parámetro k
             group_means = df.groupby(k)[target_metric].mean()
             between_group_var = float(group_means.var()) if len(group_means) > 1 else 0.0
             param_importance[k] = max(0.0, between_group_var)
@@ -135,7 +146,6 @@ def analyze_robustness(
     else:
         param_importance_pct = {k: round(100.0 / len(param_keys), 1) for k in param_keys}
 
-    # Ordenar por importancia descendente
     sorted_importance = sorted(param_importance_pct.items(), key=lambda x: x[1], reverse=True)
     most_influential_param = sorted_importance[0][0]
     least_influential_param = sorted_importance[-1][0]
@@ -157,8 +167,6 @@ def analyze_robustness(
             dd_worst = float(subset['max_drawdown_pct'].abs().max())
             win_rate_mean = float(subset['percent_profitable'].mean())
             profitable_pct = float((subset['net_pnl'] > 0).mean() * 100)
-            
-            # Coeficiente de variación: std / |mean|
             cv = (pnl_std / abs(pnl_mean)) if abs(pnl_mean) > 1e-4 else 0.0
 
             val_records.append({
@@ -181,21 +189,13 @@ def analyze_robustness(
     # ─────────────────────────────────────────────────────────────
     # D. ÍNDICE GLOBAL DE ROBUSTEZ (ROBUSTNESS SCORE 0 - 100)
     # ─────────────────────────────────────────────────────────────
-    # 1. Tasa de rentabilidad general (% de combinaciones con PnL > 0)
     profit_rate = float((df['net_pnl'] > 0).mean()) * 100
-    
-    # 2. Coeficiente de variación medio del PnL entre parámetros
     avg_cv = float(np.mean([np.mean([v['pnl_cv'] for v in vals]) for vals in param_stats.values()]))
     stability_factor = max(0.0, min(100.0, 100.0 - avg_cv * 20))
-    
-    # 3. Consistencia de Sharpe (> 0)
     sharpe_positive_rate = float((df['sharpe_ratio'] > 0).mean()) * 100
-
-    # 4. Drawdown control (penaliza si el max drawdown supera el 40%)
     mean_dd = float(df['max_drawdown_pct'].abs().mean())
     dd_score = max(0.0, min(100.0, (100.0 - mean_dd * 1.5)))
 
-    # Puntuación compuesta ponderada
     global_score = round(
         0.35 * profit_rate +
         0.25 * sharpe_positive_rate +
@@ -206,22 +206,21 @@ def analyze_robustness(
 
     if global_score >= 80:
         health_status = 'ALTA ROBUSTEZ (Excelente Tolerancia)'
-        health_color = '#10b981' # Emerald
-        health_desc = 'El espacio de parámetros forma mesetas amplias y estables. El riesgo de sobreajuste es muy bajo y la estrategia tolera cambios en las condiciones de mercado.'
+        health_color = '#10b981'
+        health_desc = 'El espacio de parámetros forma mesetas amplias y estables. El riesgo de sobreajuste es muy bajo y la estrategia tolera cambios en el mercado.'
     elif global_score >= 60:
         health_status = 'ROBUSTEZ MODERADA (Aceptable)'
-        health_color = '#f59e0b' # Amber
+        health_color = '#f59e0b'
         health_desc = 'La mayoría de configuraciones son rentables, pero existen zonas de caída. Se recomienda operar exclusivamente dentro de la meseta más robusta.'
     elif global_score >= 40:
         health_status = 'SENSIBILIDAD MEDIA-ALTA'
-        health_color = '#f97316' # Orange
+        health_color = '#f97316'
         health_desc = 'La estrategia depende fuertemente de valores precisos de sus parámetros. Requiere monitoreo continuo y filtros de curva de capital.'
     else:
         health_status = 'FRÁGIL / ALTO RIESGO DE OVERFITTING'
-        health_color = '#ef4444' # Red
+        health_color = '#ef4444'
         health_desc = 'Los mejores resultados corresponden a picos aislados (islas de suerte). Gran parte del espacio de parámetros es perdedor.'
 
-    # Comparación Pico vs Meseta
     peak_params = {k: (int(best_peak_row[k]) if float(best_peak_row[k]) == int(best_peak_row[k]) else float(best_peak_row[k])) for k in param_keys}
     robust_params = {k: (int(best_robust['params'][k]) if float(best_robust['params'][k]) == int(best_robust['params'][k]) else float(best_robust['params'][k])) for k in param_keys}
     is_same = (peak_params == robust_params)
@@ -253,5 +252,45 @@ def analyze_robustness(
             'raw_result': best_peak_row['_raw_result']
         },
         'is_same_as_peak': is_same,
-        'total_combinations': len(df)
+        'total_combinations': len(df),
+        'param_keys': param_keys
+    }
+
+
+def generate_heatmap_matrix(
+    results: List[Dict[str, Any]],
+    param_x: str,
+    param_y: str,
+    metric: str = 'sharpe_ratio'
+) -> Dict[str, Any]:
+    """
+    Genera la matriz pivote (Z, X, Y) para visualización en Mapa de Calor o Superficie 3D.
+    """
+    records = []
+    for r in results:
+        if r.get('error'):
+            continue
+        row = dict(r['params'])
+        row[metric] = float(r.get(metric, 0))
+        records.append(row)
+        
+    if not records:
+        return {'x': [], 'y': [], 'z': []}
+        
+    df = pd.DataFrame(records)
+    if param_x not in df.columns or param_y not in df.columns:
+        return {'x': [], 'y': [], 'z': []}
+        
+    pivot = df.pivot_table(index=param_y, columns=param_x, values=metric, aggfunc='mean')
+    x_vals = [int(v) if float(v) == int(v) else float(v) for v in pivot.columns]
+    y_vals = [int(v) if float(v) == int(v) else float(v) for v in pivot.index]
+    z_vals = pivot.fillna(0).values.tolist()
+    
+    return {
+        'x': x_vals,
+        'y': y_vals,
+        'z': z_vals,
+        'param_x': param_x,
+        'param_y': param_y,
+        'metric': metric
     }

@@ -1,0 +1,47 @@
+strategy_name: EMALONG TP TRALING STOP
+description: LONG  CON TP EN % Y TRAILING STOP
+trade_direction: Long
+parameters:
+  EMA FAST: 1
+  EMA LOW: 15
+  TP: 50.0
+  TRAILING: 1.0
+risk_management:
+  take_profit:
+    type: percentage
+    value: TP
+  stop_loss:
+    type: trailing_percent
+    value: TRAILING
+entry_conditions:
+  logic: AND
+  rules:
+  - name: Rule_1
+    type: technical_indicator
+    indicator_1:
+      name: EMA
+      period: EMA FAST
+    operator: crosses_above
+    indicator_2:
+      name: EMA
+      period: EMA LOW
+      value: 0
+    details: EMA(EMA FAST) crosses_above EMA(EMA LOW)
+exit_conditions:
+  logic: OR
+  rules:
+  - name: Rule_1
+    type: technical_indicator
+    indicator_1:
+      name: EMA
+      period: EMA FAST
+    operator: crosses_below
+    indicator_2:
+      name: EMA
+      period: EMA LOW
+      value: 0
+    details: EMA(EMA FAST) crosses_below EMA(EMA LOW)
+equity_curve_management:
+  enabled: false
+  start_trading_at_dd_pct: 30
+  stop_trading_at_dd_pct: 0

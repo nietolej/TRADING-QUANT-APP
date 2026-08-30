@@ -11,6 +11,7 @@ import itertools
 import math
 import os
 import concurrent.futures
+from collections import Counter
 from typing import Any, Callable, Dict, Generator, List, Optional
 
 import pandas as pd
@@ -156,11 +157,11 @@ def _optimizer_worker(
                 else {'total_trades': 0}
             )
             final_equity = float(equity_curve['equity'].iloc[-1])
-            # Submuestrear para transferencias ligeras
-            if len(equity_curve) <= 400:
+            # Submuestrear para transferencias ultra ligeras (100 puntos máx)
+            if len(equity_curve) <= 100:
                 eq_list = equity_curve['equity'].tolist()
             else:
-                step_s = max(1, len(equity_curve) // 400)
+                step_s = max(1, len(equity_curve) // 100)
                 eq_list = equity_curve['equity'].iloc[::step_s].tolist()
         else:
             eq_metrics = {'sharpe_ratio': -999.0, 'cagr': -999.0, 'max_drawdown_pct': 0.0}
@@ -295,3 +296,164 @@ def run_grid_search(
 
     results.sort(key=_sort_key, reverse=True)
     return results
+
+
+# ──────────────────────────────────────────────────────────────
+# Walk-Forward Validation
+# ──────────────────────────────────────────────────────────────
+
+def run_walk_forward(
+    strategy_path: str,
+    df: pd.DataFrame,
+    initial_capital: float,
+    param_ranges: Dict[str, Dict[str, float]],
+    n_splits: int = 5,
+    in_sample_pct: float = 0.7,
+    optimize_metric: str = 'sharpe_ratio',
+    commission_pct: float = 0.1,
+    slippage_pct: float = 0.05,
+    sizing_config: Optional[Dict[str, Any]] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Validación Walk-Forward para detectar overfitting en Grid Search.
+
+    Divide el dataset en `n_splits` ventanas. Para cada ventana:
+      1. In-Sample (IS, 70%): ejecuta Grid Search y elige los mejores parámetros.
+      2. Out-of-Sample (OOS, 30%): aplica esos parámetros en datos no vistos.
+
+    Métricas clave del resultado:
+      - wf_efficiency: OOS_metric / IS_metric. >0.7 = robusto, <0.5 = sobreajuste.
+      - overfitting_detected: True si la eficiencia es baja.
+      - consensus_params: los parámetros ganadores más frecuentes entre todos los folds.
+    """
+    if df.empty or len(df) < 40:
+        return {'error': 'DataFrame insuficiente para Walk-Forward (min 40 velas).'}
+
+    with open(strategy_path, 'r', encoding='utf-8') as fh:
+        base_config = yaml.safe_load(fh)
+
+    n = len(df)
+    window_size = n // n_splits
+    folds: List[Dict[str, Any]] = []
+    total_steps = n_splits
+    done = 0
+
+    for fold_idx in range(n_splits):
+        fold_start = fold_idx * window_size
+        fold_end = fold_start + window_size if fold_idx < n_splits - 1 else n
+        fold_df = df.iloc[fold_start:fold_end].copy()
+
+        if len(fold_df) < 20:
+            continue
+
+        split_point = int(len(fold_df) * in_sample_pct)
+        df_is = fold_df.iloc[:split_point].copy()
+        df_oos = fold_df.iloc[split_point:].copy()
+
+        if len(df_is) < 10 or len(df_oos) < 5:
+            continue
+
+        # ─── Fase 1: Grid Search sobre IS ───
+        is_results = run_grid_search(
+            strategy_path=strategy_path,
+            df=df_is,
+            initial_capital=initial_capital,
+            param_ranges=param_ranges,
+            optimize_metric=optimize_metric,
+            commission_pct=commission_pct,
+            slippage_pct=slippage_pct,
+            sizing_config=sizing_config,
+        )
+
+        if not is_results or is_results[0].get('error'):
+            continue
+
+        best_is = is_results[0]
+        best_params = best_is['params']
+        is_metric = float(best_is.get(optimize_metric, -999))
+
+        # ─── Fase 2: Aplicar mejores parámetros IS en OOS ───
+        oos_result = _optimizer_worker(
+            params=best_params,
+            base_config=base_config,
+            df=df_oos,
+            initial_capital=initial_capital,
+            commission_pct=commission_pct,
+            slippage_pct=slippage_pct,
+            sizing_config=sizing_config,
+        )
+        oos_metric = float(oos_result.get(optimize_metric, -999))
+
+        # Eficiencia del fold
+        if is_metric > 0 and is_metric != -999:
+            fold_efficiency = oos_metric / is_metric
+        elif is_metric <= 0 and oos_metric <= 0:
+            fold_efficiency = 1.0  # Ambos negativos: degradación proporcional
+        else:
+            fold_efficiency = 0.0  # IS positivo, OOS negativo = sobreajuste total
+
+        folds.append({
+            'fold': fold_idx + 1,
+            'is_start': str(df_is.index[0])[:10] if hasattr(df_is.index[0], 'strftime') else str(fold_start),
+            'is_end': str(df_is.index[-1])[:10] if hasattr(df_is.index[-1], 'strftime') else str(split_point),
+            'oos_start': str(df_oos.index[0])[:10] if hasattr(df_oos.index[0], 'strftime') else str(split_point),
+            'oos_end': str(df_oos.index[-1])[:10] if hasattr(df_oos.index[-1], 'strftime') else str(fold_end),
+            'best_params': best_params,
+            'is_metric': round(is_metric, 4),
+            'oos_metric': round(oos_metric, 4),
+            'is_trades': best_is.get('total_trades', 0),
+            'oos_trades': oos_result.get('total_trades', 0),
+            'is_cagr': round(float(best_is.get('cagr', 0)), 2),
+            'oos_cagr': round(float(oos_result.get('cagr', 0)), 2),
+            'is_dd': round(float(best_is.get('max_drawdown_pct', 0)), 2),
+            'oos_dd': round(float(oos_result.get('max_drawdown_pct', 0)), 2),
+            'fold_efficiency': round(fold_efficiency, 3),
+        })
+
+        done += 1
+        if progress_callback:
+            try:
+                progress_callback(done, total_steps)
+            except Exception:
+                pass
+
+    if not folds:
+        return {'error': 'Ningún fold generó resultados válidos.'}
+
+    # ─── Métricas Globales Walk-Forward ───
+    efficiencies = [f['fold_efficiency'] for f in folds]
+    is_metrics = [f['is_metric'] for f in folds if f['is_metric'] != -999]
+    oos_metrics = [f['oos_metric'] for f in folds if f['oos_metric'] != -999]
+    oos_cagrs = [f['oos_cagr'] for f in folds]
+
+    wf_efficiency = float(np.mean(efficiencies)) if efficiencies else 0.0
+    is_mean = float(np.mean(is_metrics)) if is_metrics else 0.0
+    oos_mean = float(np.mean(oos_metrics)) if oos_metrics else 0.0
+    oos_cagr_mean = float(np.mean(oos_cagrs)) if oos_cagrs else 0.0
+    oos_positive_folds = sum(1 for m in oos_metrics if m > 0)
+    overfitting_detected = wf_efficiency < 0.5 or oos_positive_folds < len(folds) // 2
+
+    # Parámetros más frecuentes en IS (consenso robusto entre folds)
+    all_param_keys = list(folds[0]['best_params'].keys()) if folds else []
+    consensus_params: Dict[str, Any] = {}
+    for key in all_param_keys:
+        values = [str(f['best_params'].get(key, '')) for f in folds]
+        most_common = Counter(values).most_common(1)
+        consensus_params[key] = most_common[0][0] if most_common else ''
+
+    return {
+        'status': 'success',
+        'n_folds': len(folds),
+        'folds': folds,
+        'wf_efficiency': round(wf_efficiency, 3),
+        'is_mean': round(is_mean, 4),
+        'oos_mean': round(oos_mean, 4),
+        'oos_cagr_mean': round(oos_cagr_mean, 2),
+        'oos_positive_folds': oos_positive_folds,
+        'overfitting_detected': overfitting_detected,
+        'consensus_params': consensus_params,
+        'optimize_metric': optimize_metric,
+        'in_sample_pct': in_sample_pct,
+        'n_splits': n_splits,
+    }

@@ -69,11 +69,16 @@ class ConditionEvaluator:
 
     @staticmethod
     def _eval_technical_indicator(df: pd.DataFrame, rule: dict) -> pd.Series:
-        ind1 = rule.get("indicator1", "EMA")
-        p1 = rule.get("period1", 20)
+        ind1_dict = rule.get("indicator_1", {})
+        ind2_dict = rule.get("indicator_2", {})
+        
+        ind1 = ind1_dict.get("name") if ind1_dict else rule.get("indicator1", "EMA")
+        p1 = ind1_dict.get("period") if ind1_dict else rule.get("period1", 20)
+        
         op = rule.get("operator", "crosses_above")
-        ind2 = rule.get("indicator2", "Price")
-        p2 = rule.get("period2", 50)
+        
+        ind2 = ind2_dict.get("name") if ind2_dict else rule.get("indicator2", "Price")
+        p2 = ind2_dict.get("period") if ind2_dict else rule.get("period2", 50)
         
         def get_series(ind, p):
             try:

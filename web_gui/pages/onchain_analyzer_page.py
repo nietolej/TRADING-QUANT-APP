@@ -294,7 +294,7 @@ def render_onchain_analyzer():
                 
             # Renderizar Tabla de los últimos 100 registros crudos
             df_table = df_onchain.reset_index().sort_values('timestamp', ascending=False).head(100)
-            df_table['timestamp'] = df_table['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            df_table['timestamp'] = df_table['timestamp'].dt.strftime('%d/%m/%y %H:%M:%S')
             
             columns = [
                 {'name': 'timestamp', 'label': 'Fecha', 'field': 'timestamp', 'align': 'left'},
