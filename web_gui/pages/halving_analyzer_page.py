@@ -107,12 +107,16 @@ def render_halving_analyzer():
 
         # --- PESTAÑAS DE ANÁLISIS CUANTITATIVO ---
         with ui.tabs().classes('w-full text-slate-300 border-b border-[#1e293b]') as tabs:
+            tab_growth = ui.tab('growth', label='Crecimiento / Decrecimiento por Temporalidad', icon='trending_up')
             tab_horizons = ui.tab('horizons', label='Rendimientos por Horizonte', icon='bar_chart')
             tab_corr = ui.tab('correlation', label='Matriz de Correlación y Similitud', icon='grid_view')
             tab_decay = ui.tab('decay', label='Decaimiento y Proyecciones', icon='auto_graph')
             tab_table = ui.tab('table', label='Tabla Cuantitativa Detallada', icon='table_chart')
 
-        with ui.tab_panels(tabs, value='horizons').classes('w-full bg-transparent p-0'):
+        with ui.tab_panels(tabs, value='growth').classes('w-full bg-transparent p-0'):
+            with ui.tab_panel('growth'):
+                growth_container = ui.column().classes('w-full')
+
             with ui.tab_panel('horizons'):
                 horizons_container = ui.column().classes('w-full')
 
@@ -390,6 +394,668 @@ def render_halving_analyzer():
                 fig = build_main_figure()
                 ui.plotly(fig).classes('w-full h-full')
 
+        # -------------------------------------------------------------
+        # PESTAÑA 1: CRECIMIENTO Y DECRECIMIENTO POR TEMPORALIDAD
+        # -------------------------------------------------------------
+        growth_state = {
+            "timeframe": "month",         # 'day', 'week', 'month', 'quarter', 'semester', 'year'
+            "step_size": 1,               # 1, 2, 3, 4, 6, 12...
+            "metric": "periodic_delta",   # 'periodic_delta', 'cumulative_pct', 'cumulative_mult', 'dual_view', 'heatmap'
+            "max_days": 1000,
+            "selected_cycles": ["H1", "H2", "H3", "H4", "bench"],
+            "y_scale": "linear"
+        }
+
+        cycle_meta_map = {
+            "H1": {"name": "Halving 1 (2012)", "color": "#38bdf8"},
+            "H2": {"name": "Halving 2 (2016)", "color": "#a855f7"},
+            "H3": {"name": "Halving 3 (2020)", "color": "#10b981"},
+            "H4": {"name": "Halving 4 (2024 Actual)", "color": "#f59e0b"},
+            "bench": {"name": "Promedio Histórico (H1-H3)", "color": "#94a3b8"}
+        }
+
+        def build_growth_figure(growth_data: dict, g_state: dict) -> go.Figure:
+            periods = growth_data.get("periods", [])
+            cycles = growth_data.get("cycles", {})
+            benchmark = growth_data.get("benchmark", [])
+            metric = g_state.get("metric", "periodic_delta")
+            sel_cycles = g_state.get("selected_cycles", ["H1", "H2", "H3", "H4", "bench"])
+            y_scale = g_state.get("y_scale", "linear")
+
+            x_labels = [p["label_short"] for p in periods]
+            x_full_labels = [p["label_full"] for p in periods]
+
+            if metric == "dual_view":
+                fig = make_subplots(
+                    rows=2, cols=1,
+                    shared_xaxes=True,
+                    vertical_spacing=0.10,
+                    row_heights=[0.55, 0.45],
+                    subplot_titles=[
+                        'Variación Periódica Δ% (Crecimiento / Decrecimiento por Intervalo)',
+                        'Crecimiento Acumulado (% sobre precio inicial del Halving)'
+                    ]
+                )
+
+                for cid in ["H1", "H2", "H3", "H4"]:
+                    if cid in sel_cycles and cid in cycles:
+                        c_list = cycles[cid]
+                        c_info = cycle_meta_map[cid]
+                        y_delta = [p["periodic_return_pct"] for p in c_list]
+                        y_cum = [p["cumulative_return_pct"] for p in c_list]
+                        
+                        customdata = [
+                            [p.get("start_price", 0), p.get("end_price", 0), p.get("cumulative_return_pct", 0), p.get("cumulative_multiplier", 1.0), x_full_labels[i] if i < len(x_full_labels) else ""]
+                            for i, p in enumerate(c_list)
+                        ]
+
+                        fig.add_trace(
+                            go.Bar(
+                                x=x_labels,
+                                y=y_delta,
+                                name=f"{c_info['name']} (Δ%)",
+                                marker_color=c_info["color"],
+                                customdata=customdata,
+                                hovertemplate=(
+                                    f"<b>{c_info['name']}</b><br>"
+                                    "Período: %{customdata[4]}<br>"
+                                    "Inicio: $%{customdata[0]:,.2f} | Fin: $%{customdata[1]:,.2f}<br>"
+                                    "Variación Período: <b>%{y:+.2f}%</b><extra></extra>"
+                                ),
+                                showlegend=True
+                            ),
+                            row=1, col=1
+                        )
+
+                        fig.add_trace(
+                            go.Scatter(
+                                x=x_labels,
+                                y=y_cum,
+                                mode='lines+markers',
+                                name=f"{c_info['name']} (Acumulado)",
+                                line=dict(color=c_info["color"], width=2.5),
+                                marker=dict(size=5),
+                                customdata=customdata,
+                                hovertemplate=(
+                                    f"<b>{c_info['name']} (Acumulado)</b><br>"
+                                    "Período: %{customdata[4]}<br>"
+                                    "Retorno Acumulado: <b>+%{y:,.1f}%</b> (%{customdata[3]:.2f}x)<extra></extra>"
+                                ),
+                                showlegend=False
+                            ),
+                            row=2, col=1
+                        )
+
+                if "bench" in sel_cycles and benchmark:
+                    y_b_delta = [b["mean_periodic_pct"] for b in benchmark]
+                    y_b_cum = [b["mean_cumulative_pct"] for b in benchmark]
+                    fig.add_trace(
+                        go.Bar(
+                            x=x_labels,
+                            y=y_b_delta,
+                            name="Promedio Histórico (Δ%)",
+                            marker_color="#64748b",
+                            opacity=0.8,
+                            hovertemplate="<b>Promedio Histórico</b><br>Variación Media: <b>%{y:+.2f}%</b><extra></extra>"
+                        ),
+                        row=1, col=1
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=x_labels,
+                            y=y_b_cum,
+                            mode='lines+markers',
+                            name="Promedio Acumulado",
+                            line=dict(color="#94a3b8", width=2, dash='dash'),
+                            marker=dict(size=4),
+                            hovertemplate="<b>Promedio Acumulado</b><br>Retorno: <b>+%{y:,.1f}%</b><extra></extra>",
+                            showlegend=False
+                        ),
+                        row=2, col=1
+                    )
+
+                fig.update_layout(
+                    paper_bgcolor='#111827',
+                    plot_bgcolor='#0a0e17',
+                    font=dict(family='Plus Jakarta Sans, sans-serif', color='#94a3b8', size=11),
+                    height=580,
+                    barmode='group',
+                    margin=dict(l=55, r=25, t=50, b=75),
+                    legend=dict(
+                        orientation='h',
+                        yanchor='top',
+                        y=-0.14,
+                        xanchor='center',
+                        x=0.5,
+                        bgcolor='rgba(15, 23, 42, 0.95)',
+                        bordercolor='#1e293b',
+                        borderwidth=1,
+                        font=dict(size=10, color='#e2e8f0', family='JetBrains Mono')
+                    )
+                )
+                fig.update_yaxes(gridcolor='#1e293b', zerolinecolor='#cbd5e1', zerolinewidth=1.5, tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10), row=1, col=1)
+                fig.update_yaxes(gridcolor='#1e293b', tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10), row=2, col=1)
+                fig.update_xaxes(gridcolor='#1e293b', tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10))
+                return fig
+
+            elif metric == "heatmap":
+                fig = go.Figure()
+                z_matrix = []
+                y_labels = []
+                for cid in ["H1", "H2", "H3", "H4"]:
+                    if cid in sel_cycles and cid in cycles:
+                        c_list = cycles[cid]
+                        c_info = cycle_meta_map[cid]
+                        y_labels.append(c_info["name"])
+                        z_matrix.append([p["periodic_return_pct"] if p["has_data"] else None for p in c_list])
+
+                if "bench" in sel_cycles and benchmark:
+                    y_labels.append("Promedio Histórico")
+                    z_matrix.append([b["mean_periodic_pct"] if b["has_data"] else None for b in benchmark])
+
+                fig.add_trace(go.Heatmap(
+                    z=z_matrix,
+                    x=x_labels,
+                    y=y_labels,
+                    colorscale='RdYlGn',
+                    zmid=0,
+                    text=[[f"{v:+.1f}%" if v is not None else "" for v in row] for row in z_matrix],
+                    texttemplate="%{text}",
+                    textfont=dict(family='JetBrains Mono', size=10, color='#ffffff'),
+                    colorbar=dict(
+                        title=dict(text='Variación Δ%', font=dict(color='#cbd5e1', size=10)),
+                        tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=9),
+                        ticksuffix='%'
+                    )
+                ))
+
+                fig.update_layout(
+                    paper_bgcolor='#111827',
+                    plot_bgcolor='#0a0e17',
+                    font=dict(family='Plus Jakarta Sans, sans-serif', color='#94a3b8', size=11),
+                    height=380,
+                    margin=dict(l=140, r=25, t=30, b=50),
+                    xaxis=dict(gridcolor='#1e293b', tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10)),
+                    yaxis=dict(gridcolor='#1e293b', tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10))
+                )
+                return fig
+
+            elif metric == "cumulative_pct":
+                fig = go.Figure()
+                for cid in ["H1", "H2", "H3", "H4"]:
+                    if cid in sel_cycles and cid in cycles:
+                        c_list = cycles[cid]
+                        c_info = cycle_meta_map[cid]
+                        y_vals = [p["cumulative_return_pct"] for p in c_list]
+                        customdata = [
+                            [p.get("end_price", 0), p.get("cumulative_multiplier", 1.0), x_full_labels[i] if i < len(x_full_labels) else ""]
+                            for i, p in enumerate(c_list)
+                        ]
+                        fig.add_trace(go.Scatter(
+                            x=x_labels,
+                            y=y_vals,
+                            mode='lines+markers',
+                            name=c_info["name"],
+                            line=dict(color=c_info["color"], width=2.5),
+                            marker=dict(size=6),
+                            customdata=customdata,
+                            hovertemplate=(
+                                f"<b>{c_info['name']}</b><br>"
+                                "Período: %{customdata[2]}<br>"
+                                "Precio: $%{customdata[0]:,.2f}<br>"
+                                "Crecimiento Acumulado: <b>+%{y:,.1f}%</b> (%{customdata[1]:.2f}x)<extra></extra>"
+                            )
+                        ))
+
+                if "bench" in sel_cycles and benchmark:
+                    y_b_cum = [b["mean_cumulative_pct"] for b in benchmark]
+                    fig.add_trace(go.Scatter(
+                        x=x_labels,
+                        y=y_b_cum,
+                        mode='lines+markers',
+                        name="Promedio Histórico (H1-H3)",
+                        line=dict(color="#94a3b8", width=2, dash='dash'),
+                        marker=dict(size=5),
+                        hovertemplate="<b>Promedio Histórico</b><br>Retorno Acumulado: <b>+%{y:,.1f}%</b><extra></extra>"
+                    ))
+
+                fig.update_layout(
+                    paper_bgcolor='#111827',
+                    plot_bgcolor='#0a0e17',
+                    font=dict(family='Plus Jakarta Sans, sans-serif', color='#94a3b8', size=11),
+                    height=520,
+                    margin=dict(l=55, r=25, t=35, b=75),
+                    hovermode='x unified',
+                    legend=dict(
+                        orientation='h',
+                        yanchor='top',
+                        y=-0.16,
+                        xanchor='center',
+                        x=0.5,
+                        bgcolor='rgba(15, 23, 42, 0.95)',
+                        bordercolor='#1e293b',
+                        borderwidth=1,
+                        font=dict(size=10, color='#e2e8f0', family='JetBrains Mono')
+                    ),
+                    xaxis=dict(gridcolor='#1e293b', tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10)),
+                    yaxis=dict(
+                        title='Retorno Acumulado (%)',
+                        type='log' if y_scale == 'log' else 'linear',
+                        gridcolor='#1e293b',
+                        ticksuffix='%',
+                        tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10)
+                    )
+                )
+                return fig
+
+            elif metric == "cumulative_mult":
+                fig = go.Figure()
+                for cid in ["H1", "H2", "H3", "H4"]:
+                    if cid in sel_cycles and cid in cycles:
+                        c_list = cycles[cid]
+                        c_info = cycle_meta_map[cid]
+                        y_vals = [p["cumulative_multiplier"] for p in c_list]
+                        customdata = [
+                            [p.get("end_price", 0), p.get("cumulative_return_pct", 0), x_full_labels[i] if i < len(x_full_labels) else ""]
+                            for i, p in enumerate(c_list)
+                        ]
+                        fig.add_trace(go.Scatter(
+                            x=x_labels,
+                            y=y_vals,
+                            mode='lines+markers',
+                            name=c_info["name"],
+                            line=dict(color=c_info["color"], width=2.5),
+                            marker=dict(size=6),
+                            customdata=customdata,
+                            hovertemplate=(
+                                f"<b>{c_info['name']}</b><br>"
+                                "Período: %{customdata[2]}<br>"
+                                "Precio: $%{customdata[0]:,.2f}<br>"
+                                "Múltiplo: <b>%{y:.2f}x</b> (+%{customdata[1]:,.1f}%)<extra></extra>"
+                            )
+                        ))
+
+                if "bench" in sel_cycles and benchmark:
+                    y_b_mult = [b["mean_cumulative_multiplier"] for b in benchmark]
+                    fig.add_trace(go.Scatter(
+                        x=x_labels,
+                        y=y_b_mult,
+                        mode='lines+markers',
+                        name="Promedio Histórico (H1-H3)",
+                        line=dict(color="#94a3b8", width=2, dash='dash'),
+                        marker=dict(size=5),
+                        hovertemplate="<b>Promedio Histórico</b><br>Múltiplo: <b>%{y:.2f}x</b><extra></extra>"
+                    ))
+
+                fig.update_layout(
+                    paper_bgcolor='#111827',
+                    plot_bgcolor='#0a0e17',
+                    font=dict(family='Plus Jakarta Sans, sans-serif', color='#94a3b8', size=11),
+                    height=520,
+                    margin=dict(l=55, r=25, t=35, b=75),
+                    hovermode='x unified',
+                    legend=dict(
+                        orientation='h',
+                        yanchor='top',
+                        y=-0.16,
+                        xanchor='center',
+                        x=0.5,
+                        bgcolor='rgba(15, 23, 42, 0.95)',
+                        bordercolor='#1e293b',
+                        borderwidth=1,
+                        font=dict(size=10, color='#e2e8f0', family='JetBrains Mono')
+                    ),
+                    xaxis=dict(gridcolor='#1e293b', tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10)),
+                    yaxis=dict(
+                        title='Múltiplo Normalizado (P_t / P_H0)',
+                        type='log' if y_scale == 'log' else 'linear',
+                        gridcolor='#1e293b',
+                        ticksuffix='x',
+                        tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10)
+                    )
+                )
+                return fig
+
+            else:
+                # Default: Periodic Delta (Variación Periódica Δ% en Barras Agrupadas)
+                fig = go.Figure()
+                for cid in ["H1", "H2", "H3", "H4"]:
+                    if cid in sel_cycles and cid in cycles:
+                        c_list = cycles[cid]
+                        c_info = cycle_meta_map[cid]
+                        y_vals = [p["periodic_return_pct"] for p in c_list]
+                        customdata = [
+                            [p.get("start_price", 0), p.get("end_price", 0), p.get("cumulative_return_pct", 0), p.get("cumulative_multiplier", 1.0), p.get("is_in_progress", False), x_full_labels[i] if i < len(x_full_labels) else ""]
+                            for i, p in enumerate(c_list)
+                        ]
+                        fig.add_trace(go.Bar(
+                            x=x_labels,
+                            y=y_vals,
+                            name=c_info["name"],
+                            marker_color=c_info["color"],
+                            customdata=customdata,
+                            hovertemplate=(
+                                f"<b>{c_info['name']}</b><br>"
+                                "Período: %{customdata[5]}<br>"
+                                "Inicio: $%{customdata[0]:,.2f} | Cierre: $%{customdata[1]:,.2f}<br>"
+                                "Variación Periódica: <b>%{y:+.2f}%</b><br>"
+                                "Crecimiento Acumulado: +%{customdata[2]:,.1f}% (%{customdata[3]:.2f}x)<extra></extra>"
+                            )
+                        ))
+
+                if "bench" in sel_cycles and benchmark:
+                    y_b_delta = [b["mean_periodic_pct"] for b in benchmark]
+                    fig.add_trace(go.Bar(
+                        x=x_labels,
+                        y=y_b_delta,
+                        name="Promedio Histórico (H1-H3)",
+                        marker_color="#64748b",
+                        opacity=0.85,
+                        hovertemplate="<b>Promedio Histórico</b><br>Variación Media: <b>%{y:+.2f}%</b><extra></extra>"
+                    ))
+
+                fig.update_layout(
+                    paper_bgcolor='#111827',
+                    plot_bgcolor='#0a0e17',
+                    font=dict(family='Plus Jakarta Sans, sans-serif', color='#94a3b8', size=11),
+                    height=520,
+                    barmode='group',
+                    margin=dict(l=55, r=25, t=35, b=75),
+                    legend=dict(
+                        orientation='h',
+                        yanchor='top',
+                        y=-0.16,
+                        xanchor='center',
+                        x=0.5,
+                        bgcolor='rgba(15, 23, 42, 0.95)',
+                        bordercolor='#1e293b',
+                        borderwidth=1,
+                        font=dict(size=10, color='#e2e8f0', family='JetBrains Mono')
+                    ),
+                    xaxis=dict(
+                        title=dict(text='Períodos Relativos Post-Halving', font=dict(color='#94a3b8', size=11)),
+                        gridcolor='#1e293b',
+                        tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10)
+                    ),
+                    yaxis=dict(
+                        title='Variación Periódica (Δ% Crecimiento / Decrecimiento)',
+                        gridcolor='#1e293b',
+                        zeroline=True,
+                        zerolinecolor='#cbd5e1',
+                        zerolinewidth=1.5,
+                        ticksuffix='%',
+                        tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10)
+                    )
+                )
+                return fig
+
+        def build_growth_table_html(growth_data: dict, g_state: dict) -> str:
+            periods = growth_data.get("periods", [])
+            cycles = growth_data.get("cycles", {})
+            benchmark = growth_data.get("benchmark", [])
+
+            html = '''
+            <table class="w-full text-left text-xs font-mono border-collapse">
+                <thead>
+                    <tr class="border-b border-[#1e293b] text-slate-400 text-[11px]">
+                        <th class="py-2 px-2.5">Período</th>
+                        <th class="py-2 px-2.5">Días Relativos</th>
+                        <th class="py-2 px-2 text-right text-sky-400">H1 (2012)</th>
+                        <th class="py-2 px-2 text-right text-purple-400">H2 (2016)</th>
+                        <th class="py-2 px-2 text-right text-emerald-400">H3 (2020)</th>
+                        <th class="py-2 px-2 text-right text-amber-400">H4 (Actual)</th>
+                        <th class="py-2 px-2.5 text-right text-slate-300">Promedio</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-[#1e293b]/60">
+            '''
+
+            for idx, p in enumerate(periods):
+                p_label = p["label_short"]
+                d_range = f"H+{p['start_day']} a H+{p['end_day']}d"
+
+                def format_cell(cid: str) -> str:
+                    if cid not in cycles or idx >= len(cycles[cid]):
+                        return "<span class='text-slate-600'>-</span>"
+                    c_period = cycles[cid][idx]
+                    if not c_period.get("has_data") or c_period.get("periodic_return_pct") is None:
+                        return "<span class='text-slate-600'>-</span>"
+                    val = c_period["periodic_return_pct"]
+                    in_prog = " <span class='text-amber-400 text-[9px]'>*</span>" if c_period.get("is_in_progress") else ""
+                    if val > 0:
+                        return f"<span class='text-emerald-400 font-bold'>+{val:.1f}%{in_prog}</span>"
+                    elif val < 0:
+                        return f"<span class='text-rose-400 font-bold'>{val:.1f}%{in_prog}</span>"
+                    else:
+                        return f"<span class='text-slate-400'>0.0%{in_prog}</span>"
+
+                b_val_str = "<span class='text-slate-600'>-</span>"
+                if idx < len(benchmark) and benchmark[idx].get("has_data") and benchmark[idx].get("mean_periodic_pct") is not None:
+                    b_val = benchmark[idx]["mean_periodic_pct"]
+                    if b_val > 0:
+                        b_val_str = f"<span class='text-emerald-400/90 font-medium'>+{b_val:.1f}%</span>"
+                    elif b_val < 0:
+                        b_val_str = f"<span class='text-rose-400/90 font-medium'>{b_val:.1f}%</span>"
+                    else:
+                        b_val_str = "<span class='text-slate-400'>0.0%</span>"
+
+                html += f'''
+                    <tr class="hover:bg-slate-800/40 transition-colors">
+                        <td class="py-2 px-2.5 font-bold text-white">{p_label}</td>
+                        <td class="py-2 px-2.5 text-slate-400 text-[11px]">{d_range}</td>
+                        <td class="py-2 px-2 text-right">{format_cell("H1")}</td>
+                        <td class="py-2 px-2 text-right">{format_cell("H2")}</td>
+                        <td class="py-2 px-2 text-right">{format_cell("H3")}</td>
+                        <td class="py-2 px-2 text-right font-bold">{format_cell("H4")}</td>
+                        <td class="py-2 px-2.5 text-right font-semibold">{b_val_str}</td>
+                    </tr>
+                '''
+
+            html += '</tbody></table>'
+            return html
+
+        def build_growth_insights_html(growth_data: dict, g_state: dict) -> str:
+            summary = growth_data.get("summary", {})
+            tf_name = summary.get("timeframe_label", "Mes")
+            step_name = summary.get("step_label", "1 Mes")
+            win_r = summary.get("global_positive_ratio", 0)
+            avg_r = summary.get("avg_period_return", 0)
+            max_r = summary.get("max_period_return", 0)
+            min_r = summary.get("min_period_return", 0)
+
+            # Extraer rendimiento más reciente de H4
+            h4_periods = growth_data.get("cycles", {}).get("H4", [])
+            h4_active = [p for p in h4_periods if p.get("has_data") and p.get("periodic_return_pct") is not None]
+            h4_last_ret = h4_active[-1]["periodic_return_pct"] if h4_active else 0
+            h4_last_label = growth_data.get("periods", [])[len(h4_active)-1]["label_short"] if h4_active else "-"
+
+            html = f'''
+            <div class="space-y-3 text-xs text-slate-300 leading-relaxed font-sans">
+                <div class="p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]">
+                    <div class="font-bold text-white font-mono text-[11px] mb-1">📊 Dinámica en {step_name}</div>
+                    <div>Evaluando los ciclos en bloques de <b>{step_name}</b>, el <b>{win_r:.1f}%</b> de los períodos históricos completados cerraron con rendimientos positivos (crecimiento neto).</div>
+                </div>
+
+                <div class="p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]">
+                    <div class="font-bold text-amber-400 font-mono text-[11px] mb-1">🚀 Impulsos y Volatilidad</div>
+                    <div>El retorno promedio por período asciende a <b class="text-emerald-400">{avg_r:+.2f}%</b>, con un rally máximo registrado de <b class="text-emerald-400">+{max_r:.1f}%</b> y una contracción máxima por período de <b class="text-rose-400">{min_r:.1f}%</b>.</div>
+                </div>
+
+                <div class="p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]">
+                    <div class="font-bold text-sky-400 font-mono text-[11px] mb-1">⚡ Estado Ciclo 4 (Actual)</div>
+                    <div>En su período más reciente evaluado (<b>{h4_last_label}</b>), el Ciclo 4 exhibe una variación de <b class="{'text-emerald-400' if h4_last_ret >= 0 else 'text-rose-400'}">{h4_last_ret:+.2f}%</b>, alineándose con las pautas de consolidación/expansión observadas en los Halvings 2 y 3.</div>
+                </div>
+            </div>
+            '''
+            return html
+
+        def render_growth_tab():
+            growth_container.clear()
+            growth_data = analyzer.calculate_periodic_growth_analysis(
+                timeframe=growth_state["timeframe"],
+                step_size=growth_state["step_size"],
+                max_days=growth_state["max_days"]
+            )
+
+            periods = growth_data.get("periods", [])
+            summary = growth_data.get("summary", {})
+
+            with growth_container:
+                # 1. Panel de Controles
+                with ui.card().classes('w-full bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md mt-3'):
+                    with ui.row().classes('w-full justify-between items-center flex-wrap gap-2 border-b border-[#1e293b] pb-3 mb-3'):
+                        with ui.column().classes('gap-0.5'):
+                            with ui.row().classes('items-center gap-2'):
+                                ui.icon('query_stats', size='1.3rem').classes('text-amber-400')
+                                ui.label('CRECIMIENTO / DECRECIMIENTO POR TEMPORALIDAD').classes('text-xs font-extrabold text-white font-mono tracking-wider')
+                            ui.label('Selecciona la temporalidad (Día, Semana, Mes, Trimestre, Semestre, Año) y cantidad de períodos para comparar la variación periódica (Δ%) o acumulada entre ciclos.').classes('text-[11px] text-slate-400')
+
+                    with ui.row().classes('w-full items-center justify-between flex-wrap gap-3'):
+                        # Selectores de Temporalidad y Cantidad
+                        with ui.row().classes('items-center flex-wrap gap-2.5'):
+                            ui.label('TEMPORALIDAD:').classes('text-[11px] font-bold text-slate-400 font-mono self-center')
+                            g_tf_select = ui.select(
+                                options={
+                                    'day': 'Día (1 día base)',
+                                    'week': 'Semana (7 días)',
+                                    'month': 'Mes (30 días)',
+                                    'quarter': 'Trimestre (90 días / 3M)',
+                                    'semester': 'Semestre (180 días / 6M)',
+                                    'year': 'Año (365 días / 12M)'
+                                },
+                                value=growth_state['timeframe']
+                            ).props('dense outlined dark options-dense').classes('w-56 text-xs')
+
+                            ui.label('CANTIDAD:').classes('text-[11px] font-bold text-slate-400 font-mono self-center ml-1')
+                            g_step_select = ui.select(
+                                options={
+                                    1: '1 Período (Base)',
+                                    2: '2 Períodos (x2)',
+                                    3: '3 Períodos (x3)',
+                                    4: '4 Períodos (x4)',
+                                    6: '6 Períodos (x6)',
+                                    12: '12 Períodos (x12)'
+                                },
+                                value=growth_state['step_size']
+                            ).props('dense outlined dark options-dense').classes('w-44 text-xs')
+
+                            ui.label('MÉTRICA:').classes('text-[11px] font-bold text-slate-400 font-mono self-center ml-1')
+                            g_metric_select = ui.select(
+                                options={
+                                    'periodic_delta': 'Variación Periódica Δ% (Crecimiento / Decrecimiento)',
+                                    'cumulative_pct': 'Crecimiento Acumulado (+% desde H0)',
+                                    'cumulative_mult': 'Múltiplo Acumulado (Nx)',
+                                    'dual_view': 'Vista Dual (Barras Δ% + Curva Acumulada)',
+                                    'heatmap': 'Mapa de Calor (Matriz de Retornos)'
+                                },
+                                value=growth_state['metric']
+                            ).props('dense outlined dark options-dense').classes('w-72 text-xs')
+
+                        # Ventana y Escala
+                        with ui.row().classes('items-center flex-wrap gap-2.5'):
+                            ui.label('VENTANA:').classes('text-[11px] font-bold text-slate-400 font-mono self-center')
+                            g_win_select = ui.select(
+                                options={
+                                    365: 'Primer Año (0 a +365d)',
+                                    730: '2 Años (0 a +730d)',
+                                    1000: 'Ciclo Estándar (0 a +1000d)',
+                                    1400: 'Ciclo Extendido (0 a +1400d)'
+                                },
+                                value=growth_state['max_days']
+                            ).props('dense outlined dark options-dense').classes('w-52 text-xs')
+
+                    # Fila de Filtro de Ciclos
+                    with ui.row().classes('w-full items-center justify-between flex-wrap gap-2 pt-2 border-t border-[#1e293b]/70 mt-1'):
+                        with ui.row().classes('items-center gap-3 flex-wrap'):
+                            ui.label('CICLOS:').classes('text-[11px] font-bold text-slate-400 font-mono self-center')
+                            g_chk_h1 = ui.checkbox('H1 (2012)', value=('H1' in growth_state['selected_cycles'])).props('dense dark color=cyan').classes('text-xs text-sky-400 font-semibold')
+                            g_chk_h2 = ui.checkbox('H2 (2016)', value=('H2' in growth_state['selected_cycles'])).props('dense dark color=purple').classes('text-xs text-purple-400 font-semibold')
+                            g_chk_h3 = ui.checkbox('H3 (2020)', value=('H3' in growth_state['selected_cycles'])).props('dense dark color=green').classes('text-xs text-emerald-400 font-semibold')
+                            g_chk_h4 = ui.checkbox('H4 (2024 Actual)', value=('H4' in growth_state['selected_cycles'])).props('dense dark color=amber').classes('text-xs text-amber-400 font-bold')
+                            g_chk_bench = ui.checkbox('Promedio Histórico', value=('bench' in growth_state['selected_cycles'])).props('dense dark color=grey').classes('text-xs text-slate-300 font-medium')
+
+                # 2. Tarjetas KPI
+                with ui.row().classes('w-full grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5 mt-2'):
+                    with ui.card().classes('bg-[#0f172a] border border-[#1e293b] p-3.5 rounded-xl shadow-sm'):
+                        ui.label('GRANULARIDAD EVALUADA').classes('text-[10px] font-bold text-slate-400 font-mono tracking-wider')
+                        ui.label(f"{summary.get('step_label', '1 Mes')} ({summary.get('interval_days', 30)}d)").classes('text-lg font-black text-amber-400 font-mono')
+                        ui.label(f"{len(periods)} períodos analizados post-Halving").classes('text-[10px] text-slate-400 font-mono')
+
+                    with ui.card().classes('bg-[#0f172a] border border-[#1e293b] p-3.5 rounded-xl shadow-sm'):
+                        ui.label('TASA GLOBAL DE CRECIMIENTO').classes('text-[10px] font-bold text-slate-400 font-mono tracking-wider')
+                        win_r = summary.get('global_positive_ratio', 0)
+                        ui.label(f"{win_r:.1f}%").classes('text-lg font-black text-emerald-400 font-mono')
+                        ui.label('Períodos con variación Δ% positiva').classes('text-[10px] text-slate-400 font-mono')
+
+                    with ui.card().classes('bg-[#0f172a] border border-[#1e293b] p-3.5 rounded-xl shadow-sm'):
+                        ui.label('RETORNO PERIÓDICO PROMEDIO').classes('text-[10px] font-bold text-slate-400 font-mono tracking-wider')
+                        avg_r = summary.get('avg_period_return', 0)
+                        color_avg = 'text-emerald-400' if avg_r >= 0 else 'text-rose-400'
+                        ui.label(f"{avg_r:+.2f}%").classes(f'text-lg font-black {color_avg} font-mono')
+                        ui.label('Media histórica por período').classes('text-[10px] text-slate-400 font-mono')
+
+                    with ui.card().classes('bg-[#0f172a] border border-[#1e293b] p-3.5 rounded-xl shadow-sm'):
+                        ui.label('MÁX RALLY VS MÁX CORRECCIÓN').classes('text-[10px] font-bold text-slate-400 font-mono tracking-wider')
+                        max_r = summary.get('max_period_return', 0)
+                        min_r = summary.get('min_period_return', 0)
+                        with ui.row().classes('items-center gap-2'):
+                            ui.label(f"+{max_r:.1f}%").classes('text-xs font-black text-emerald-400 font-mono')
+                            ui.label('|').classes('text-slate-600')
+                            ui.label(f"{min_r:.1f}%").classes('text-xs font-black text-rose-400 font-mono')
+                        ui.label('Rally máximo vs retroceso máximo').classes('text-[10px] text-slate-400 font-mono')
+
+                # 3. Gráfico Plotly
+                with ui.card().classes('w-full bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md mt-2'):
+                    fig_growth = build_growth_figure(growth_data, growth_state)
+                    ui.plotly(fig_growth).classes('w-full h-full')
+
+                # 4. Tabla y Resumen Analítico
+                with ui.row().classes('w-full grid grid-cols-1 lg:grid-cols-3 gap-4 mt-2'):
+                    with ui.card().classes('lg:col-span-2 bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md overflow-x-auto'):
+                        ui.label('DESGLOSE DE VARIACIÓN POR PERÍODO (Δ%)').classes('text-xs font-bold text-slate-300 font-mono tracking-wider mb-2')
+                        ui.html(build_growth_table_html(growth_data, growth_state)).classes('w-full')
+
+                    with ui.card().classes('bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md'):
+                        ui.label('INTERPRETACIÓN CUANTITATIVA').classes('text-xs font-bold text-amber-400 font-mono tracking-wider mb-2')
+                        ui.html(build_growth_insights_html(growth_data, growth_state)).classes('w-full')
+
+                # Handlers de reactividad para controles internos de growth
+                def on_growth_tf_change(e):
+                    growth_state['timeframe'] = e.value
+                    render_growth_tab()
+
+                def on_growth_step_change(e):
+                    growth_state['step_size'] = int(e.value)
+                    render_growth_tab()
+
+                def on_growth_metric_change(e):
+                    growth_state['metric'] = e.value
+                    render_growth_tab()
+
+                def on_growth_win_change(e):
+                    growth_state['max_days'] = int(e.value)
+                    render_growth_tab()
+
+                def update_growth_cycles():
+                    sel = []
+                    if g_chk_h1.value: sel.append("H1")
+                    if g_chk_h2.value: sel.append("H2")
+                    if g_chk_h3.value: sel.append("H3")
+                    if g_chk_h4.value: sel.append("H4")
+                    if g_chk_bench.value: sel.append("bench")
+                    growth_state['selected_cycles'] = sel
+                    render_growth_tab()
+
+                g_tf_select.on_value_change(on_growth_tf_change)
+                g_step_select.on_value_change(on_growth_step_change)
+                g_metric_select.on_value_change(on_growth_metric_change)
+                g_win_select.on_value_change(on_growth_win_change)
+                g_chk_h1.on_value_change(lambda _: update_growth_cycles())
+                g_chk_h2.on_value_change(lambda _: update_growth_cycles())
+                g_chk_h3.on_value_change(lambda _: update_growth_cycles())
+                g_chk_h4.on_value_change(lambda _: update_growth_cycles())
+                g_chk_bench.on_value_change(lambda _: update_growth_cycles())
+
         def render_horizons_tab():
             horizons_container.clear()
             metrics = analyzer.calculate_cycle_metrics()
@@ -622,7 +1288,6 @@ def render_halving_analyzer():
                 with ui.card().classes('w-full bg-[#111827] border border-[#1e293b] p-5 rounded-xl mt-3 overflow-x-auto'):
                     ui.label('DESGLOSE CUANTITATIVO COMPARATIVO DE HALVINGS').classes('text-xs font-bold text-slate-400 font-mono tracking-wider mb-3')
 
-                    # Estructura de tabla HTML personalizada con Bloomberg Obsidian Styling
                     html_table = '''
                     <table class="w-full text-left text-xs font-mono border-collapse">
                         <thead>
@@ -709,6 +1374,7 @@ def render_halving_analyzer():
                 # Re-renderizar todos los componentes
                 render_kpi_cards()
                 render_main_chart()
+                render_growth_tab()
                 render_horizons_tab()
                 render_correlation_tab()
                 render_decay_tab()
@@ -733,6 +1399,7 @@ def render_halving_analyzer():
         # Render inicial de todas las vistas
         render_kpi_cards()
         render_main_chart()
+        render_growth_tab()
         render_horizons_tab()
         render_correlation_tab()
         render_decay_tab()

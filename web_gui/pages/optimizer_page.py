@@ -208,7 +208,11 @@ def render_optimizer_page(on_go_to_analyzer=None):
                         val = getattr(e, 'value', None) or _asset_opts[1]
                         state['capital_asset'] = val
                         state['capital_type'] = 'QUOTE' if '(CITA)' in val else 'BASE'
-                        _update_sizing_ui()
+                        if '_update_sizing_ui' in globals() or '_update_sizing_ui' in locals() or callable(locals().get('_update_sizing_ui')):
+                            try:
+                                _update_sizing_ui()
+                            except NameError:
+                                pass
 
                     capital_type = ui.select(
                         _asset_opts,
@@ -227,7 +231,10 @@ def render_optimizer_page(on_go_to_analyzer=None):
                         state['capital_type'] = 'BASE'
                         lbl_asset_hdr.set_text(f'Activo inicial ({b}/{q})')
                         capital_type.update()
-                        _update_sizing_ui()
+                        try:
+                            _update_sizing_ui()
+                        except NameError:
+                            pass
 
                     sym_combo.on('update:model-value', _update_asset_combo)
 

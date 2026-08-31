@@ -98,20 +98,34 @@ class BTCHalvingAnalyzer:
         Descarga y compila la serie histórica de precios diarios de Bitcoin desde 2011 hasta la fecha actual.
         Combina Bitstamp (vía CCXT para 2011-2014) y Yahoo Finance (2014-actualidad) / Binance.
         """
-        if not force_refresh and os.path.exists(self.cache_file):
-            try:
-                df = pd.read_parquet(self.cache_file)
-                if not df.empty and "close" in df.columns:
-                    # Verificar si la fecha máxima es reciente (dentro de los últimos 2 días)
-                    last_date = pd.to_datetime(df['timestamp'].max())
-                    if last_date.tzinfo is None:
-                        last_date = last_date.tz_localize('UTC')
-                    now_utc = datetime.now(timezone.utc)
-                    if (now_utc - last_date).days <= 2:
-                        logger.info(f"Cargados {len(df)} registros históricos de BTC desde caché.")
-                        return df
-            except Exception as e:
-                logger.warning(f"Error al leer caché parquet: {e}. Re-descargando datos...")
+        csv_fallback = self.cache_file.replace('.parquet', '.csv')
+        if not force_refresh:
+            if os.path.exists(self.cache_file):
+                try:
+                    df = pd.read_parquet(self.cache_file)
+                    if not df.empty and "close" in df.columns:
+                        last_date = pd.to_datetime(df['timestamp'].max())
+                        if last_date.tzinfo is None:
+                            last_date = last_date.tz_localize('UTC')
+                        now_utc = datetime.now(timezone.utc)
+                        if (now_utc - last_date).days <= 2:
+                            logger.info(f"Cargados {len(df)} registros históricos de BTC desde caché parquet.")
+                            return df
+                except Exception as e:
+                    logger.debug(f"Error al leer caché parquet: {e}")
+
+            if os.path.exists(csv_fallback):
+                try:
+                    df = pd.read_csv(csv_fallback)
+                    if not df.empty and "close" in df.columns:
+                        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+                        last_date = pd.to_datetime(df['timestamp'].max())
+                        now_utc = datetime.now(timezone.utc)
+                        if (now_utc - last_date).days <= 2:
+                            logger.info(f"Cargados {len(df)} registros históricos de BTC desde caché CSV.")
+                            return df
+                except Exception as e:
+                    logger.debug(f"Error al leer caché CSV: {e}")
 
         logger.info("Descargando serie histórica completa de Bitcoin (2011 - Presente)...")
         all_dfs = []
@@ -180,13 +194,17 @@ class BTCHalvingAnalyzer:
             combined['timestamp'] = combined['timestamp'].dt.floor('D')
             combined = combined.sort_values('timestamp').drop_duplicates(subset=['timestamp'], keep='last').reset_index(drop=True)
             
-            # Guardar en parquet
+            # Guardar en parquet con fallback a CSV
             try:
                 os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
-                combined.to_parquet(self.cache_file, index=False)
-                logger.info(f"Caché de datos BTC guardada exitosamente en {self.cache_file}")
+                try:
+                    combined.to_parquet(self.cache_file, index=False)
+                    logger.info(f"Caché de datos BTC guardada en {self.cache_file}")
+                except Exception:
+                    combined.to_csv(csv_fallback, index=False)
+                    logger.info(f"Caché de datos BTC guardada en CSV {csv_fallback}")
             except Exception as e:
-                logger.warning(f"No se pudo guardar la caché parquet: {e}")
+                logger.warning(f"No se pudo guardar la caché: {e}")
                 
             return combined
         
@@ -576,3 +594,222 @@ class BTCHalvingAnalyzer:
             "scenarios": scenarios,
             "estimated_peak_window": estimated_peak_window
         }
+
+    def calculate_periodic_growth_analysis(
+        self,
+        timeframe: str = "month",
+        step_size: int = 1,
+        max_days: int = 1200
+    ) -> Dict[str, Any]:
+        """
+        Calcula el crecimiento y decrecimiento periódico y acumulado para todos los ciclos de Halving
+        según la granularidad temporal seleccionada: día, semana, mes, trimestre, semestre o año.
+
+        :param timeframe: 'day', 'week', 'month', 'quarter', 'semester', 'year'
+        :param step_size: Cantidad o multiplicador de períodos (ej: 1, 2, 3, etc.)
+        :param max_days: Ventana máxima de días post-Halving a evaluar (default: 1200)
+        :return: Diccionario estructurado con períodos, series por ciclo, benchmarks y estadísticas resumidas.
+        """
+        unit_days_map = {
+            "day": (1, "Día", "D"),
+            "week": (7, "Semana", "S"),
+            "month": (30, "Mes", "M"),
+            "quarter": (90, "Trimestre", "T"),
+            "semester": (180, "Semestre", "Sem"),
+            "year": (365, "Año", "A")
+        }
+
+        tf_key = timeframe.lower() if timeframe.lower() in unit_days_map else "month"
+        base_days, unit_name, unit_abbr = unit_days_map[tf_key]
+        step = max(1, int(step_size))
+        interval_days = base_days * step
+
+        # Límite de períodos
+        total_periods = int(np.ceil(max_days / interval_days))
+        # Limitar a un máximo razonable para evitar sobrecarga en días individuales
+        total_periods = min(total_periods, 120)
+
+        series_dict = self.get_halving_series(pre_days=0, post_days=max_days + interval_days)
+        if not series_dict:
+            return {"timeframe": tf_key, "step_size": step, "interval_days": interval_days, "periods": [], "cycles": {}, "benchmark": []}
+
+        # Generar metadatos de los períodos
+        period_meta = []
+        for p_idx in range(1, total_periods + 1):
+            start_d = (p_idx - 1) * interval_days
+            end_d = p_idx * interval_days
+            if step == 1:
+                label_short = f"{unit_abbr}{p_idx}"
+                label_full = f"{unit_name} {p_idx} (H+{start_d} a H+{end_d}d)"
+            else:
+                label_short = f"{step}{unit_abbr}_{p_idx}"
+                label_full = f"{step} {unit_name}s #{p_idx} (H+{start_d} a H+{end_d}d)"
+
+            period_meta.append({
+                "period_index": p_idx,
+                "label_short": label_short,
+                "label_full": label_full,
+                "start_day": start_d,
+                "end_day": end_d
+            })
+
+        cycles_data: Dict[str, List[Dict[str, Any]]] = {}
+
+        for h_meta in self.halvings:
+            h_id = h_meta["id"]
+            if h_id not in series_dict:
+                continue
+
+            df = series_dict[h_id]
+            post_df = df[df["rel_day"] >= 0].sort_values("rel_day").reset_index(drop=True)
+            if post_df.empty:
+                continue
+
+            h_price = float(df.attrs.get("halving_price", post_df.iloc[0]["close"]))
+            max_available_day = int(post_df["rel_day"].max())
+
+            cycle_periods = []
+            for p_info in period_meta:
+                s_day = p_info["start_day"]
+                e_day = p_info["end_day"]
+
+                # Si el ciclo no ha llegado al inicio de este período
+                if s_day > max_available_day:
+                    cycle_periods.append({
+                        "period_index": p_info["period_index"],
+                        "has_data": False,
+                        "is_in_progress": False,
+                        "periodic_return_pct": None,
+                        "cumulative_return_pct": None,
+                        "cumulative_multiplier": None,
+                        "start_price": None,
+                        "end_price": None,
+                        "high_price": None,
+                        "low_price": None,
+                        "intra_gain_pct": None,
+                        "intra_drawdown_pct": None
+                    })
+                    continue
+
+                # Filtrar datos dentro de la ventana del período
+                sub = post_df[(post_df["rel_day"] >= s_day) & (post_df["rel_day"] <= e_day)]
+                if sub.empty:
+                    # Usar precio más cercano
+                    closest_idx = (post_df["rel_day"] - s_day).abs().idxmin()
+                    p_start = float(post_df.loc[closest_idx, "close"])
+                    p_end = p_start
+                    p_high = p_start
+                    p_low = p_start
+                    is_in_progress = (s_day <= max_available_day < e_day)
+                else:
+                    # Precio de inicio: si s_day == 0, halving_price, o primera vela del período
+                    if s_day == 0:
+                        p_start = h_price
+                    else:
+                        start_candidates = post_df[post_df["rel_day"] <= s_day]
+                        p_start = float(start_candidates.iloc[-1]["close"]) if not start_candidates.empty else float(sub.iloc[0]["close"])
+
+                    p_end = float(sub.iloc[-1]["close"])
+                    p_high = float(sub["close"].max())
+                    p_low = float(sub["close"].min())
+                    is_in_progress = (not h_meta.get("is_completed", False)) and (max_available_day < e_day)
+
+                periodic_return = round(((p_end - p_start) / p_start) * 100.0, 2) if p_start > 0 else 0.0
+                cum_return = round(((p_end - h_price) / h_price) * 100.0, 2) if h_price > 0 else 0.0
+                cum_mult = round(p_end / h_price, 3) if h_price > 0 else 1.0
+                intra_gain = round(((p_high - p_start) / p_start) * 100.0, 2) if p_start > 0 else 0.0
+                intra_dd = round(((p_low - p_start) / p_start) * 100.0, 2) if p_start > 0 else 0.0
+
+                cycle_periods.append({
+                    "period_index": p_info["period_index"],
+                    "has_data": True,
+                    "is_in_progress": is_in_progress,
+                    "start_price": round(p_start, 2),
+                    "end_price": round(p_end, 2),
+                    "high_price": round(p_high, 2),
+                    "low_price": round(p_low, 2),
+                    "periodic_return_pct": periodic_return,
+                    "cumulative_return_pct": cum_return,
+                    "cumulative_multiplier": cum_mult,
+                    "intra_gain_pct": intra_gain,
+                    "intra_drawdown_pct": intra_dd
+                })
+
+            cycles_data[h_id] = cycle_periods
+
+        # Calcular Benchmarks periódicos (Promedio de ciclos completados H1, H2, H3)
+        benchmark_periods = []
+        completed_ids = [h["id"] for h in self.halvings if h["is_completed"] and h["id"] in cycles_data]
+
+        for idx, p_info in enumerate(period_meta):
+            vals_periodic = []
+            vals_cumulative = []
+            vals_mult = []
+
+            for cid in completed_ids:
+                c_period = cycles_data[cid][idx]
+                if c_period["has_data"] and c_period["periodic_return_pct"] is not None:
+                    vals_periodic.append(c_period["periodic_return_pct"])
+                    vals_cumulative.append(c_period["cumulative_return_pct"])
+                    vals_mult.append(c_period["cumulative_multiplier"])
+
+            if vals_periodic:
+                mean_per = float(np.mean(vals_periodic))
+                med_per = float(np.median(vals_periodic))
+                mean_cum = float(np.mean(vals_cumulative))
+                mean_mult = float(np.mean(vals_mult))
+                pos_pct = round((sum(1 for v in vals_periodic if v > 0) / len(vals_periodic)) * 100.0, 1)
+
+                benchmark_periods.append({
+                    "period_index": p_info["period_index"],
+                    "has_data": True,
+                    "mean_periodic_pct": round(mean_per, 2),
+                    "median_periodic_pct": round(med_per, 2),
+                    "mean_cumulative_pct": round(mean_cum, 2),
+                    "mean_cumulative_multiplier": round(mean_mult, 3),
+                    "positive_win_rate_pct": pos_pct,
+                    "count": len(vals_periodic)
+                })
+            else:
+                benchmark_periods.append({
+                    "period_index": p_info["period_index"],
+                    "has_data": False,
+                    "mean_periodic_pct": None,
+                    "median_periodic_pct": None,
+                    "mean_cumulative_pct": None,
+                    "mean_cumulative_multiplier": None,
+                    "positive_win_rate_pct": None,
+                    "count": 0
+                })
+
+        # Resumen cuantitativo general
+        all_completed_periodic_returns = [
+            p["periodic_return_pct"]
+            for cid in completed_ids
+            for p in cycles_data[cid]
+            if p["has_data"] and p["periodic_return_pct"] is not None
+        ]
+
+        summary = {
+            "total_evaluated_periods": len(period_meta),
+            "timeframe_label": unit_name,
+            "step_label": f"{step} {unit_name}{'s' if step > 1 else ''}",
+            "interval_days": interval_days,
+            "global_positive_ratio": round((sum(1 for v in all_completed_periodic_returns if v > 0) / max(1, len(all_completed_periodic_returns))) * 100.0, 1) if all_completed_periodic_returns else 0.0,
+            "avg_period_return": round(float(np.mean(all_completed_periodic_returns)), 2) if all_completed_periodic_returns else 0.0,
+            "max_period_return": round(float(np.max(all_completed_periodic_returns)), 2) if all_completed_periodic_returns else 0.0,
+            "min_period_return": round(float(np.min(all_completed_periodic_returns)), 2) if all_completed_periodic_returns else 0.0
+        }
+
+        return {
+            "timeframe": tf_key,
+            "step_size": step,
+            "interval_days": interval_days,
+            "unit_name": unit_name,
+            "unit_abbr": unit_abbr,
+            "periods": period_meta,
+            "cycles": cycles_data,
+            "benchmark": benchmark_periods,
+            "summary": summary
+        }
+
