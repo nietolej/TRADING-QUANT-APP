@@ -8,6 +8,29 @@ class BaseStrategy:
     """
     Clase base para cargar y evaluar una estrategia desde un archivo YAML.
     """
+    def __new__(cls, config_or_path, custom_parameters=None):
+        if cls is BaseStrategy:
+            cfg = None
+            if isinstance(config_or_path, str):
+                try:
+                    with open(config_or_path, 'r', encoding='utf-8') as f:
+                        cfg = yaml.safe_load(f)
+                except Exception:
+                    pass
+            elif isinstance(config_or_path, dict):
+                cfg = config_or_path
+
+            if cfg and isinstance(cfg, dict):
+                c_name = cfg.get("class_name")
+                if c_name == "StablecoinEmissionEMAStrategy":
+                    from .stablecoin_momentum_strategy import StablecoinEmissionEMAStrategy
+                    return super().__new__(StablecoinEmissionEMAStrategy)
+                elif c_name == "OnChainFlowStrategy":
+                    from .onchain_flow_strategy import OnChainFlowStrategy
+                    return super().__new__(OnChainFlowStrategy)
+
+        return super().__new__(cls)
+
     def __init__(self, config_or_path, custom_parameters=None):
         if isinstance(config_or_path, str):
             self.config = self._load_config(config_or_path)

@@ -80,16 +80,19 @@ HALVING_EVENTS = [
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 CACHE_FILE = os.path.join(DATA_DIR, "btc_daily_historical.parquet")
+STABLECOIN_CACHE_FILE = os.path.join(DATA_DIR, "stablecoins_daily_historical.csv")
 
 
 class BTCHalvingAnalyzer:
     """
-    Analizador cuantitativo de los ciclos de Halving de Bitcoin.
+    Analizador cuantitativo de los ciclos de Halving de Bitcoin y Liquidez de Stablecoins.
     """
 
-    def __init__(self, data_cache_file: str = CACHE_FILE):
+    def __init__(self, data_cache_file: str = CACHE_FILE, stablecoin_cache_file: str = STABLECOIN_CACHE_FILE):
         self.cache_file = data_cache_file
+        self.stablecoin_cache_file = stablecoin_cache_file
         self.df_btc: Optional[pd.DataFrame] = None
+        self.df_stables: Optional[pd.DataFrame] = None
         self.halvings = [h for h in HALVING_EVENTS if h["id"] != "H5"]  # Ciclos pasados y actual
         self.ensure_data_loaded()
 
@@ -233,10 +236,227 @@ class BTCHalvingAnalyzer:
             logger.warning(f"Error cargando fallback de DB: {e}")
         return pd.DataFrame()
 
+    def fetch_historical_stablecoin_data(self, force_refresh: bool = False) -> pd.DataFrame:
+        """
+        Descarga y compila la serie histórica de Market Cap de Stablecoins desde 2014 hasta la fecha actual.
+        Combina USDT histórico on-chain (CoinMetrics 2014-2017) con agregación global multi-chain (DefiLlama 2017-Presente).
+        """
+        if not force_refresh and os.path.exists(self.stablecoin_cache_file):
+            try:
+                df = pd.read_csv(self.stablecoin_cache_file)
+                if not df.empty and "market_cap" in df.columns:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+                    last_date = df['timestamp'].max()
+                    now_utc = datetime.now(timezone.utc)
+                    if (now_utc - last_date).days <= 2:
+                        logger.info(f"Cargados {len(df)} registros históricos de Stablecoins desde caché CSV.")
+                        df['close'] = df['market_cap']
+                        return df
+            except Exception as e:
+                logger.debug(f"Error al leer caché stablecoins CSV: {e}")
+
+        logger.info("Descargando serie histórica de Market Cap de Stablecoins (CoinMetrics + DefiLlama)...")
+        try:
+            import requests
+            import io
+
+            # 1. DefiLlama Global Stablecoin Market Cap
+            url_dl = "https://stablecoins.llama.fi/stablecoincharts/all"
+            resp_dl = requests.get(url_dl, timeout=15)
+            data_dl = resp_dl.json() if resp_dl.status_code == 200 else []
+            dl_records = []
+            for item in data_dl:
+                ts = pd.to_datetime(int(item['date']), unit='s', utc=True).floor('D')
+                val = float(item.get('totalCirculatingUSD', {}).get('peggedUSD', 0))
+                if val > 0:
+                    dl_records.append({'timestamp': ts, 'dl_total': val})
+            df_dl = pd.DataFrame(dl_records) if dl_records else pd.DataFrame(columns=['timestamp', 'dl_total'])
+
+            # 2. CoinMetrics USDT (para cubrir 2014 a 2017 cuando USDT era la principal masa monetaria)
+            url_cm = "https://raw.githubusercontent.com/coinmetrics/data/master/csv/usdt.csv"
+            resp_cm = requests.get(url_cm, timeout=15)
+            if resp_cm.status_code == 200:
+                df_cm = pd.read_csv(io.StringIO(resp_cm.text))
+                df_cm['timestamp'] = pd.to_datetime(df_cm['time'], utc=True).dt.floor('D')
+                df_cm = df_cm[['timestamp', 'CapMrktCurUSD']].dropna(subset=['CapMrktCurUSD'])
+                df_cm = df_cm.rename(columns={'CapMrktCurUSD': 'usdt'})
+            else:
+                df_cm = pd.DataFrame(columns=['timestamp', 'usdt'])
+
+            # 3. Consolidación
+            if not df_dl.empty and not df_cm.empty:
+                merged = df_cm.merge(df_dl, on='timestamp', how='outer').sort_values('timestamp').reset_index(drop=True)
+                merged['usdt'] = merged['usdt'].fillna(0)
+                merged['dl_total'] = merged['dl_total'].fillna(0)
+                merged['market_cap'] = merged[['usdt', 'dl_total']].max(axis=1)
+            elif not df_dl.empty:
+                merged = df_dl.rename(columns={'dl_total': 'market_cap'})
+            elif not df_cm.empty:
+                merged = df_cm.rename(columns={'usdt': 'market_cap'})
+            else:
+                merged = pd.DataFrame()
+
+            if not merged.empty:
+                merged = merged[merged['market_cap'] > 0][['timestamp', 'market_cap']].drop_duplicates(subset=['timestamp']).reset_index(drop=True)
+                merged['close'] = merged['market_cap']
+
+                # Guardar en caché
+                try:
+                    os.makedirs(os.path.dirname(self.stablecoin_cache_file), exist_ok=True)
+                    merged.to_csv(self.stablecoin_cache_file, index=False)
+                    logger.info(f"Caché de datos de Stablecoins guardada en {self.stablecoin_cache_file}")
+                except Exception as e:
+                    logger.warning(f"No se pudo guardar la caché de stablecoins: {e}")
+
+                return merged
+        except Exception as e:
+            logger.warning(f"Error descargando datos históricos de Stablecoins: {e}")
+
+        # Fallback si ya existía algún archivo
+        if os.path.exists(self.stablecoin_cache_file):
+            df = pd.read_csv(self.stablecoin_cache_file)
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+            df['close'] = df['market_cap']
+            return df
+
+        return pd.DataFrame()
+
     def ensure_data_loaded(self):
-        """Asegura que el DataFrame histórico esté cargado en memoria."""
+        """Asegura que los DataFrames históricos (BTC y Stablecoins) estén cargados en memoria."""
         if self.df_btc is None or self.df_btc.empty:
             self.df_btc = self.fetch_historical_btc_data()
+        if self.df_stables is None or self.df_stables.empty:
+            self.df_stables = self.fetch_historical_stablecoin_data()
+
+    def get_stablecoins_halving_series(
+        self,
+        pre_days: int = 180,
+        post_days: int = 1200
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Genera series temporales de Capitalización de Stablecoins indexadas por días relativos al Halving (H=0).
+        Retorna un diccionario con cada Halving: 'H1', 'H2', 'H3', 'H4'.
+        
+        Columnas para cada ciclo:
+        - `rel_day`: Día relativo al Halving (H=0, H+1, H+2...)
+        - `timestamp`: Fecha real (Timestamp)
+        - `market_cap`: Capitalización de mercado total en USD
+        - `close`: Equivalente a `market_cap` para compatibilidad
+        - `halving_price`: Capitalización de mercado en el día del Halving (H=0)
+        - `multiplier`: Múltiplo de crecimiento respecto al Halving (Mcap_t / Mcap_H0)
+        - `pct_return`: Variación porcentual acumulada desde H0 (%)
+        - `net_inflow_usd`: Inyección neta acumulada en USD (Mcap_t - Mcap_H0)
+        - `drawdown`: Contracción porcentual desde el pico del ciclo
+        """
+        self.ensure_data_loaded()
+        if self.df_stables is None or self.df_stables.empty:
+            return {}
+
+        df = self.df_stables.copy()
+        df['date_only'] = df['timestamp'].dt.strftime('%Y-%m-%d')
+        
+        cycle_series = {}
+
+        for h_meta in self.halvings:
+            h_id = h_meta["id"]
+            h_date_str = h_meta["date"]
+            h_date = pd.to_datetime(h_date_str, utc=True).floor('D')
+
+            # Si es H1 (2012), las stablecoins no existían aún
+            if h_id == "H1":
+                continue
+
+            # Buscar base en fecha de Halving
+            h_row = df[df['date_only'] == h_date_str]
+            if h_row.empty:
+                nearest_candidates = df[(df['timestamp'] >= h_date - timedelta(days=30)) & (df['timestamp'] <= h_date + timedelta(days=30))]
+                if nearest_candidates.empty:
+                    continue
+                nearest_idx = (nearest_candidates['timestamp'] - h_date).abs().idxmin()
+                h_mcap = float(nearest_candidates.loc[nearest_idx, 'market_cap'])
+            else:
+                h_mcap = float(h_row.iloc[0]['market_cap'])
+
+            start_date = h_date - timedelta(days=pre_days)
+            end_date = h_date + timedelta(days=post_days)
+
+            mask = (df['timestamp'] >= start_date) & (df['timestamp'] <= end_date)
+            sub_df = df[mask].copy().sort_values('timestamp').reset_index(drop=True)
+
+            if sub_df.empty:
+                continue
+
+            sub_df['rel_day'] = (sub_df['timestamp'] - h_date).dt.days
+            sub_df['halving_price'] = h_mcap
+            sub_df['halving_mcap'] = h_mcap
+            sub_df['close'] = sub_df['market_cap']
+            sub_df['multiplier'] = sub_df['market_cap'] / h_mcap if h_mcap > 0 else 1.0
+            sub_df['pct_return'] = (sub_df['multiplier'] - 1.0) * 100.0
+            sub_df['net_inflow_usd'] = sub_df['market_cap'] - h_mcap
+
+            cummax = sub_df['market_cap'].cummax()
+            sub_df['drawdown'] = ((sub_df['market_cap'] - cummax) / cummax) * 100.0
+
+            sub_df.attrs['id'] = h_id
+            sub_df.attrs['name'] = h_meta['name']
+            sub_df.attrs['color'] = h_meta['color']
+            sub_df.attrs['halving_date'] = h_date_str
+            sub_df.attrs['halving_price'] = h_mcap
+            sub_df.attrs['halving_mcap'] = h_mcap
+            sub_df.attrs['is_completed'] = h_meta['is_completed']
+            sub_df.attrs['has_data'] = True
+
+            cycle_series[h_id] = sub_df
+
+        return cycle_series
+
+    def calculate_stablecoin_summary_kpis(self) -> Dict[str, Any]:
+        """
+        Calcula KPIs macroeconómicos de liquidez de stablecoins para tarjetas de cabecera.
+        """
+        self.ensure_data_loaded()
+        stables_series = self.get_stablecoins_halving_series(pre_days=0, post_days=1000)
+        
+        h4_df = stables_series.get("H4")
+        h3_df = stables_series.get("H3")
+        h2_df = stables_series.get("H2")
+
+        curr_mcap = float(self.df_stables['market_cap'].iloc[-1]) if self.df_stables is not None and not self.df_stables.empty else 0.0
+        
+        h4_base = float(h4_df.attrs.get("halving_mcap", 157600000000.0)) if h4_df is not None else 157600000000.0
+        h4_inflow = curr_mcap - h4_base
+        h4_growth_pct = ((curr_mcap - h4_base) / h4_base) * 100.0 if h4_base > 0 else 0.0
+        h4_days = int(h4_df['rel_day'].max()) if h4_df is not None and not h4_df.empty else 0
+
+        # Pico ciclo 3
+        h3_peak = float(h3_df['market_cap'].max()) if h3_df is not None and not h3_df.empty else 187000000000.0
+        h3_base = float(h3_df.attrs.get("halving_mcap", 9950000000.0)) if h3_df is not None else 9950000000.0
+        h3_peak_roi = ((h3_peak - h3_base) / h3_base) * 100.0 if h3_base > 0 else 0.0
+
+        # Semestre 1 promedio histórico
+        sem1_deltas = []
+        for df_c in [h2_df, h3_df, h4_df]:
+            if df_c is not None and not df_c.empty:
+                s_sub = df_c[(df_c['rel_day'] >= 0) & (df_c['rel_day'] <= 180)]
+                if len(s_sub) >= 2:
+                    p0 = s_sub.iloc[0]['market_cap']
+                    p1 = s_sub.iloc[-1]['market_cap']
+                    sem1_deltas.append(((p1 - p0) / p0) * 100.0)
+
+        avg_sem1 = float(np.mean(sem1_deltas)) if sem1_deltas else 93.4
+
+        return {
+            "current_market_cap": curr_mcap,
+            "current_market_cap_billions": round(curr_mcap / 1e9, 2),
+            "h4_base_mcap": h4_base,
+            "h4_inflow_usd": h4_inflow,
+            "h4_inflow_billions": round(h4_inflow / 1e9, 2),
+            "h4_growth_pct": round(h4_growth_pct, 1),
+            "h4_current_day": h4_days,
+            "h3_peak_mcap_billions": round(h3_peak / 1e9, 2),
+            "h3_peak_roi_pct": round(h3_peak_roi, 1),
+            "avg_sem1_growth_pct": round(avg_sem1, 1)
+        }
 
     def get_halving_series(
         self,
@@ -599,15 +819,18 @@ class BTCHalvingAnalyzer:
         self,
         timeframe: str = "month",
         step_size: int = 1,
-        max_days: int = 1200
+        max_days: int = 1200,
+        asset_type: str = "btc"
     ) -> Dict[str, Any]:
         """
         Calcula el crecimiento y decrecimiento periódico y acumulado para todos los ciclos de Halving
         según la granularidad temporal seleccionada: día, semana, mes, trimestre, semestre o año.
+        Permite evaluar tanto el Precio de BTC como la Capitalización de Mercado de Stablecoins.
 
         :param timeframe: 'day', 'week', 'month', 'quarter', 'semester', 'year'
         :param step_size: Cantidad o multiplicador de períodos (ej: 1, 2, 3, etc.)
         :param max_days: Ventana máxima de días post-Halving a evaluar (default: 1200)
+        :param asset_type: 'btc' (Precio BTC) o 'stablecoins' (Capitalización de Stablecoins)
         :return: Diccionario estructurado con períodos, series por ciclo, benchmarks y estadísticas resumidas.
         """
         unit_days_map = {
@@ -626,12 +849,24 @@ class BTCHalvingAnalyzer:
 
         # Límite de períodos
         total_periods = int(np.ceil(max_days / interval_days))
-        # Limitar a un máximo razonable para evitar sobrecarga en días individuales
         total_periods = min(total_periods, 120)
 
-        series_dict = self.get_halving_series(pre_days=0, post_days=max_days + interval_days)
+        is_stables = (asset_type == "stablecoins")
+        if is_stables:
+            series_dict = self.get_stablecoins_halving_series(pre_days=0, post_days=max_days + interval_days)
+        else:
+            series_dict = self.get_halving_series(pre_days=0, post_days=max_days + interval_days)
+
         if not series_dict:
-            return {"timeframe": tf_key, "step_size": step, "interval_days": interval_days, "periods": [], "cycles": {}, "benchmark": []}
+            return {
+                "timeframe": tf_key,
+                "step_size": step,
+                "interval_days": interval_days,
+                "asset_type": asset_type,
+                "periods": [],
+                "cycles": {},
+                "benchmark": []
+            }
 
         # Generar metadatos de los períodos
         period_meta = []
@@ -658,6 +893,25 @@ class BTCHalvingAnalyzer:
         for h_meta in self.halvings:
             h_id = h_meta["id"]
             if h_id not in series_dict:
+                # Si no hay datos (ej. H1 en stablecoins)
+                cycles_data[h_id] = [
+                    {
+                        "period_index": p_info["period_index"],
+                        "has_data": False,
+                        "is_in_progress": False,
+                        "periodic_return_pct": None,
+                        "cumulative_return_pct": None,
+                        "cumulative_multiplier": None,
+                        "start_price": None,
+                        "end_price": None,
+                        "high_price": None,
+                        "low_price": None,
+                        "intra_gain_pct": None,
+                        "intra_drawdown_pct": None,
+                        "net_inflow_usd": None
+                    }
+                    for p_info in period_meta
+                ]
                 continue
 
             df = series_dict[h_id]
@@ -687,14 +941,14 @@ class BTCHalvingAnalyzer:
                         "high_price": None,
                         "low_price": None,
                         "intra_gain_pct": None,
-                        "intra_drawdown_pct": None
+                        "intra_drawdown_pct": None,
+                        "net_inflow_usd": None
                     })
                     continue
 
                 # Filtrar datos dentro de la ventana del período
                 sub = post_df[(post_df["rel_day"] >= s_day) & (post_df["rel_day"] <= e_day)]
                 if sub.empty:
-                    # Usar precio más cercano
                     closest_idx = (post_df["rel_day"] - s_day).abs().idxmin()
                     p_start = float(post_df.loc[closest_idx, "close"])
                     p_end = p_start
@@ -702,7 +956,6 @@ class BTCHalvingAnalyzer:
                     p_low = p_start
                     is_in_progress = (s_day <= max_available_day < e_day)
                 else:
-                    # Precio de inicio: si s_day == 0, halving_price, o primera vela del período
                     if s_day == 0:
                         p_start = h_price
                     else:
@@ -719,6 +972,7 @@ class BTCHalvingAnalyzer:
                 cum_mult = round(p_end / h_price, 3) if h_price > 0 else 1.0
                 intra_gain = round(((p_high - p_start) / p_start) * 100.0, 2) if p_start > 0 else 0.0
                 intra_dd = round(((p_low - p_start) / p_start) * 100.0, 2) if p_start > 0 else 0.0
+                net_inflow = round(p_end - p_start, 2)
 
                 cycle_periods.append({
                     "period_index": p_info["period_index"],
@@ -732,14 +986,20 @@ class BTCHalvingAnalyzer:
                     "cumulative_return_pct": cum_return,
                     "cumulative_multiplier": cum_mult,
                     "intra_gain_pct": intra_gain,
-                    "intra_drawdown_pct": intra_dd
+                    "intra_drawdown_pct": intra_dd,
+                    "net_inflow_usd": net_inflow
                 })
 
             cycles_data[h_id] = cycle_periods
 
-        # Calcular Benchmarks periódicos (Promedio de ciclos completados H1, H2, H3)
+        # Calcular Benchmarks periódicos
+        # Para stablecoins, los ciclos completados válidos con datos son H2 y H3
+        # Para BTC, son H1, H2, H3
         benchmark_periods = []
-        completed_ids = [h["id"] for h in self.halvings if h["is_completed"] and h["id"] in cycles_data]
+        completed_ids = [
+            h["id"] for h in self.halvings
+            if h["is_completed"] and h["id"] in cycles_data and any(p["has_data"] for p in cycles_data[h["id"]])
+        ]
 
         for idx, p_info in enumerate(period_meta):
             vals_periodic = []
@@ -792,6 +1052,8 @@ class BTCHalvingAnalyzer:
 
         summary = {
             "total_evaluated_periods": len(period_meta),
+            "asset_type": asset_type,
+            "asset_label": "Capitalización de Stablecoins (Mcap)" if is_stables else "Precio de Bitcoin (BTC)",
             "timeframe_label": unit_name,
             "step_label": f"{step} {unit_name}{'s' if step > 1 else ''}",
             "interval_days": interval_days,
@@ -805,6 +1067,7 @@ class BTCHalvingAnalyzer:
             "timeframe": tf_key,
             "step_size": step,
             "interval_days": interval_days,
+            "asset_type": asset_type,
             "unit_name": unit_name,
             "unit_abbr": unit_abbr,
             "periods": period_meta,

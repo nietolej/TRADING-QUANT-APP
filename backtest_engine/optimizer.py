@@ -111,6 +111,9 @@ def _create_strategy_instance(config: Dict[str, Any], params: Dict[str, Any]) ->
     if class_name == "OnChainFlowStrategy":
         from strategy_engine.onchain_flow_strategy import OnChainFlowStrategy
         return OnChainFlowStrategy(config, custom_parameters=params)
+    elif class_name == "StablecoinEmissionEMAStrategy":
+        from strategy_engine.stablecoin_momentum_strategy import StablecoinEmissionEMAStrategy
+        return StablecoinEmissionEMAStrategy(config, custom_parameters=params)
     return BaseStrategy(config, custom_parameters=params)
 
 

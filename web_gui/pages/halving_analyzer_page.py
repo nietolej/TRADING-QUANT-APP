@@ -13,6 +13,7 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timezone
 from nicegui import ui, background_tasks
 from data_layer.halving_analyzer import BTCHalvingAnalyzer, HALVING_EVENTS
+from data_layer.stablecoin_backtester import StablecoinBacktester
 
 # Singleton o instancia global para caché rápida
 _analyzer_instance = None
@@ -108,6 +109,8 @@ def render_halving_analyzer():
         # --- PESTAÑAS DE ANÁLISIS CUANTITATIVO ---
         with ui.tabs().classes('w-full text-slate-300 border-b border-[#1e293b]') as tabs:
             tab_growth = ui.tab('growth', label='Crecimiento / Decrecimiento por Temporalidad', icon='trending_up')
+            tab_stables = ui.tab('stables', label='Capitalización de Stablecoins por Halving', icon='account_balance_wallet')
+            tab_backtest = ui.tab('backtest', label='Backtesting Cuantitativo (Stablecoins + EMA)', icon='psychology')
             tab_horizons = ui.tab('horizons', label='Rendimientos por Horizonte', icon='bar_chart')
             tab_corr = ui.tab('correlation', label='Matriz de Correlación y Similitud', icon='grid_view')
             tab_decay = ui.tab('decay', label='Decaimiento y Proyecciones', icon='auto_graph')
@@ -116,6 +119,12 @@ def render_halving_analyzer():
         with ui.tab_panels(tabs, value='growth').classes('w-full bg-transparent p-0'):
             with ui.tab_panel('growth'):
                 growth_container = ui.column().classes('w-full')
+
+            with ui.tab_panel('stables'):
+                stables_container = ui.column().classes('w-full')
+
+            with ui.tab_panel('backtest'):
+                backtest_container = ui.column().classes('w-full')
 
             with ui.tab_panel('horizons'):
                 horizons_container = ui.column().classes('w-full')
@@ -397,11 +406,15 @@ def render_halving_analyzer():
         # -------------------------------------------------------------
         # PESTAÑA 1: CRECIMIENTO Y DECRECIMIENTO POR TEMPORALIDAD
         # -------------------------------------------------------------
+        # -------------------------------------------------------------
+        # PESTAÑA 1: CRECIMIENTO Y DECRECIMIENTO POR TEMPORALIDAD
+        # -------------------------------------------------------------
         growth_state = {
-            "timeframe": "month",         # 'day', 'week', 'month', 'quarter', 'semester', 'year'
+            "asset_type": "btc",          # 'btc', 'stablecoins'
+            "timeframe": "semester",      # 'day', 'week', 'month', 'quarter', 'semester', 'year'
             "step_size": 1,               # 1, 2, 3, 4, 6, 12...
             "metric": "periodic_delta",   # 'periodic_delta', 'cumulative_pct', 'cumulative_mult', 'dual_view', 'heatmap'
-            "max_days": 1000,
+            "max_days": 1080,
             "selected_cycles": ["H1", "H2", "H3", "H4", "bench"],
             "y_scale": "linear"
         }
@@ -411,8 +424,21 @@ def render_halving_analyzer():
             "H2": {"name": "Halving 2 (2016)", "color": "#a855f7"},
             "H3": {"name": "Halving 3 (2020)", "color": "#10b981"},
             "H4": {"name": "Halving 4 (2024 Actual)", "color": "#f59e0b"},
-            "bench": {"name": "Promedio Histórico (H1-H3)", "color": "#94a3b8"}
+            "bench": {"name": "Promedio Histórico", "color": "#94a3b8"}
         }
+
+        def format_currency_val(val: float, is_stables: bool = False) -> str:
+            if val is None:
+                return "-"
+            if is_stables:
+                if abs(val) >= 1e9:
+                    return f"${val/1e9:,.2f}B"
+                elif abs(val) >= 1e6:
+                    return f"${val/1e6:,.1f}M"
+                else:
+                    return f"${val:,.0f}"
+            else:
+                return f"${val:,.2f}"
 
         def build_growth_figure(growth_data: dict, g_state: dict) -> go.Figure:
             periods = growth_data.get("periods", [])
@@ -421,6 +447,8 @@ def render_halving_analyzer():
             metric = g_state.get("metric", "periodic_delta")
             sel_cycles = g_state.get("selected_cycles", ["H1", "H2", "H3", "H4", "bench"])
             y_scale = g_state.get("y_scale", "linear")
+            is_stables = (g_state.get("asset_type") == "stablecoins")
+            val_type_label = "Capitalización Stablecoins" if is_stables else "Precio BTC"
 
             x_labels = [p["label_short"] for p in periods]
             x_full_labels = [p["label_full"] for p in periods]
@@ -432,8 +460,8 @@ def render_halving_analyzer():
                     vertical_spacing=0.10,
                     row_heights=[0.55, 0.45],
                     subplot_titles=[
-                        'Variación Periódica Δ% (Crecimiento / Decrecimiento por Intervalo)',
-                        'Crecimiento Acumulado (% sobre precio inicial del Halving)'
+                        f'Variación Periódica Δ% ({val_type_label} por Intervalo)',
+                        f'Crecimiento Acumulado (% desde el día del Halving H0)'
                     ]
                 )
 
@@ -445,9 +473,24 @@ def render_halving_analyzer():
                         y_cum = [p["cumulative_return_pct"] for p in c_list]
                         
                         customdata = [
-                            [p.get("start_price", 0), p.get("end_price", 0), p.get("cumulative_return_pct", 0), p.get("cumulative_multiplier", 1.0), x_full_labels[i] if i < len(x_full_labels) else ""]
+                            [
+                                format_currency_val(p.get("start_price", 0), is_stables),
+                                format_currency_val(p.get("end_price", 0), is_stables),
+                                p.get("cumulative_return_pct", 0),
+                                p.get("cumulative_multiplier", 1.0),
+                                x_full_labels[i] if i < len(x_full_labels) else "",
+                                format_currency_val(p.get("net_inflow_usd", 0), is_stables)
+                            ]
                             for i, p in enumerate(c_list)
                         ]
+
+                        hover_p1 = (
+                            f"<b>{c_info['name']}</b><br>"
+                            + "Período: %{customdata[4]}<br>"
+                            + f"Inicio: %{{customdata[0]}} | Fin: %{{customdata[1]}}<br>"
+                            + (f"Inyección Neta: %{{customdata[5]}}<br>" if is_stables else "")
+                            + "Variación Período: <b>%{y:+.2f}%</b><extra></extra>"
+                        )
 
                         fig.add_trace(
                             go.Bar(
@@ -456,12 +499,7 @@ def render_halving_analyzer():
                                 name=f"{c_info['name']} (Δ%)",
                                 marker_color=c_info["color"],
                                 customdata=customdata,
-                                hovertemplate=(
-                                    f"<b>{c_info['name']}</b><br>"
-                                    "Período: %{customdata[4]}<br>"
-                                    "Inicio: $%{customdata[0]:,.2f} | Fin: $%{customdata[1]:,.2f}<br>"
-                                    "Variación Período: <b>%{y:+.2f}%</b><extra></extra>"
-                                ),
+                                hovertemplate=hover_p1,
                                 showlegend=True
                             ),
                             row=1, col=1
@@ -478,8 +516,8 @@ def render_halving_analyzer():
                                 customdata=customdata,
                                 hovertemplate=(
                                     f"<b>{c_info['name']} (Acumulado)</b><br>"
-                                    "Período: %{customdata[4]}<br>"
-                                    "Retorno Acumulado: <b>+%{y:,.1f}%</b> (%{customdata[3]:.2f}x)<extra></extra>"
+                                    + "Período: %{customdata[4]}<br>"
+                                    + "Crecimiento Acumulado: <b>+%{y:,.1f}%</b> (%{customdata[3]:.2f}x)<extra></extra>"
                                 ),
                                 showlegend=False
                             ),
@@ -588,7 +626,11 @@ def render_halving_analyzer():
                         c_info = cycle_meta_map[cid]
                         y_vals = [p["cumulative_return_pct"] for p in c_list]
                         customdata = [
-                            [p.get("end_price", 0), p.get("cumulative_multiplier", 1.0), x_full_labels[i] if i < len(x_full_labels) else ""]
+                            [
+                                format_currency_val(p.get("end_price", 0), is_stables),
+                                p.get("cumulative_multiplier", 1.0),
+                                x_full_labels[i] if i < len(x_full_labels) else ""
+                            ]
                             for i, p in enumerate(c_list)
                         ]
                         fig.add_trace(go.Scatter(
@@ -601,9 +643,9 @@ def render_halving_analyzer():
                             customdata=customdata,
                             hovertemplate=(
                                 f"<b>{c_info['name']}</b><br>"
-                                "Período: %{customdata[2]}<br>"
-                                "Precio: $%{customdata[0]:,.2f}<br>"
-                                "Crecimiento Acumulado: <b>+%{y:,.1f}%</b> (%{customdata[1]:.2f}x)<extra></extra>"
+                                + "Período: %{customdata[2]}<br>"
+                                + f"{val_type_label}: %{{customdata[0]}}<br>"
+                                + "Crecimiento Acumulado: <b>+%{y:,.1f}%</b> (%{customdata[1]:.2f}x)<extra></extra>"
                             )
                         ))
 
@@ -613,7 +655,7 @@ def render_halving_analyzer():
                         x=x_labels,
                         y=y_b_cum,
                         mode='lines+markers',
-                        name="Promedio Histórico (H1-H3)",
+                        name="Promedio Histórico",
                         line=dict(color="#94a3b8", width=2, dash='dash'),
                         marker=dict(size=5),
                         hovertemplate="<b>Promedio Histórico</b><br>Retorno Acumulado: <b>+%{y:,.1f}%</b><extra></extra>"
@@ -639,7 +681,7 @@ def render_halving_analyzer():
                     ),
                     xaxis=dict(gridcolor='#1e293b', tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10)),
                     yaxis=dict(
-                        title='Retorno Acumulado (%)',
+                        title=f'Crecimiento Acumulado (%) — {val_type_label}',
                         type='log' if y_scale == 'log' else 'linear',
                         gridcolor='#1e293b',
                         ticksuffix='%',
@@ -656,7 +698,11 @@ def render_halving_analyzer():
                         c_info = cycle_meta_map[cid]
                         y_vals = [p["cumulative_multiplier"] for p in c_list]
                         customdata = [
-                            [p.get("end_price", 0), p.get("cumulative_return_pct", 0), x_full_labels[i] if i < len(x_full_labels) else ""]
+                            [
+                                format_currency_val(p.get("end_price", 0), is_stables),
+                                p.get("cumulative_return_pct", 0),
+                                x_full_labels[i] if i < len(x_full_labels) else ""
+                            ]
                             for i, p in enumerate(c_list)
                         ]
                         fig.add_trace(go.Scatter(
@@ -669,9 +715,9 @@ def render_halving_analyzer():
                             customdata=customdata,
                             hovertemplate=(
                                 f"<b>{c_info['name']}</b><br>"
-                                "Período: %{customdata[2]}<br>"
-                                "Precio: $%{customdata[0]:,.2f}<br>"
-                                "Múltiplo: <b>%{y:.2f}x</b> (+%{customdata[1]:,.1f}%)<extra></extra>"
+                                + "Período: %{customdata[2]}<br>"
+                                + f"{val_type_label}: %{{customdata[0]}}<br>"
+                                + "Múltiplo: <b>%{y:.2f}x</b> (+%{customdata[1]:,.1f}%)<extra></extra>"
                             )
                         ))
 
@@ -681,7 +727,7 @@ def render_halving_analyzer():
                         x=x_labels,
                         y=y_b_mult,
                         mode='lines+markers',
-                        name="Promedio Histórico (H1-H3)",
+                        name="Promedio Histórico",
                         line=dict(color="#94a3b8", width=2, dash='dash'),
                         marker=dict(size=5),
                         hovertemplate="<b>Promedio Histórico</b><br>Múltiplo: <b>%{y:.2f}x</b><extra></extra>"
@@ -707,10 +753,75 @@ def render_halving_analyzer():
                     ),
                     xaxis=dict(gridcolor='#1e293b', tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10)),
                     yaxis=dict(
-                        title='Múltiplo Normalizado (P_t / P_H0)',
+                        title=f'Múltiplo Normalizado (Mcap_t / Mcap_H0)',
                         type='log' if y_scale == 'log' else 'linear',
                         gridcolor='#1e293b',
                         ticksuffix='x',
+                        tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10)
+                    )
+                )
+                return fig
+
+            elif metric == "absolute_usd":
+                fig = go.Figure()
+                for cid in ["H1", "H2", "H3", "H4"]:
+                    if cid in sel_cycles and cid in cycles:
+                        c_list = cycles[cid]
+                        c_info = cycle_meta_map[cid]
+                        y_vals = [p["end_price"] / 1e9 if (p.get("end_price") is not None and is_stables) else p.get("end_price") for p in c_list]
+                        customdata = [
+                            [
+                                format_currency_val(p.get("start_price", 0), is_stables),
+                                format_currency_val(p.get("end_price", 0), is_stables),
+                                p.get("periodic_return_pct", 0),
+                                p.get("cumulative_return_pct", 0),
+                                x_full_labels[i] if i < len(x_full_labels) else ""
+                            ]
+                            for i, p in enumerate(c_list)
+                        ]
+                        fig.add_trace(go.Bar(
+                            x=x_labels,
+                            y=y_vals,
+                            name=c_info["name"],
+                            marker_color=c_info["color"],
+                            customdata=customdata,
+                            hovertemplate=(
+                                f"<b>{c_info['name']}</b><br>"
+                                + "Período: %{customdata[4]}<br>"
+                                + f"Cierre: %{{customdata[1]}} (Inicio: %{{customdata[0]}})<br>"
+                                + "Variación Periódica: <b>%{customdata[2]:+.2f}%</b><extra></extra>"
+                            )
+                        ))
+
+                fig.update_layout(
+                    paper_bgcolor='#111827',
+                    plot_bgcolor='#0a0e17',
+                    font=dict(family='Plus Jakarta Sans, sans-serif', color='#94a3b8', size=11),
+                    height=520,
+                    barmode='group',
+                    margin=dict(l=55, r=25, t=35, b=75),
+                    legend=dict(
+                        orientation='h',
+                        yanchor='top',
+                        y=-0.16,
+                        xanchor='center',
+                        x=0.5,
+                        bgcolor='rgba(15, 23, 42, 0.95)',
+                        bordercolor='#1e293b',
+                        borderwidth=1,
+                        font=dict(size=10, color='#e2e8f0', family='JetBrains Mono')
+                    ),
+                    xaxis=dict(
+                        title=dict(text='Períodos Relativos Post-Halving', font=dict(color='#94a3b8', size=11)),
+                        gridcolor='#1e293b',
+                        tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10)
+                    ),
+                    yaxis=dict(
+                        title='Capitalización de Mercado ($ Billones USD)' if is_stables else 'Precio BTC ($ USD)',
+                        type='log' if y_scale == 'log' else 'linear',
+                        gridcolor='#1e293b',
+                        ticksuffix='B' if is_stables else '',
+                        tickprefix='' if is_stables else '$',
                         tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10)
                     )
                 )
@@ -725,22 +836,32 @@ def render_halving_analyzer():
                         c_info = cycle_meta_map[cid]
                         y_vals = [p["periodic_return_pct"] for p in c_list]
                         customdata = [
-                            [p.get("start_price", 0), p.get("end_price", 0), p.get("cumulative_return_pct", 0), p.get("cumulative_multiplier", 1.0), p.get("is_in_progress", False), x_full_labels[i] if i < len(x_full_labels) else ""]
+                            [
+                                format_currency_val(p.get("start_price", 0), is_stables),
+                                format_currency_val(p.get("end_price", 0), is_stables),
+                                p.get("cumulative_return_pct", 0),
+                                p.get("cumulative_multiplier", 1.0),
+                                p.get("is_in_progress", False),
+                                x_full_labels[i] if i < len(x_full_labels) else "",
+                                format_currency_val(p.get("net_inflow_usd", 0), is_stables)
+                            ]
                             for i, p in enumerate(c_list)
                         ]
+                        hover_temp = (
+                            f"<b>{c_info['name']}</b><br>"
+                            + "Período: %{customdata[5]}<br>"
+                            + f"Inicio: %{{customdata[0]}} | Cierre: %{{customdata[1]}}<br>"
+                            + (f"Inyección Neta: %{{customdata[6]}}<br>" if is_stables else "")
+                            + "Variación Periódica: <b>%{y:+.2f}%</b><br>"
+                            + "Crecimiento Acumulado: +%{customdata[2]:,.1f}% (%{customdata[3]:.2f}x)<extra></extra>"
+                        )
                         fig.add_trace(go.Bar(
                             x=x_labels,
                             y=y_vals,
                             name=c_info["name"],
                             marker_color=c_info["color"],
                             customdata=customdata,
-                            hovertemplate=(
-                                f"<b>{c_info['name']}</b><br>"
-                                "Período: %{customdata[5]}<br>"
-                                "Inicio: $%{customdata[0]:,.2f} | Cierre: $%{customdata[1]:,.2f}<br>"
-                                "Variación Periódica: <b>%{y:+.2f}%</b><br>"
-                                "Crecimiento Acumulado: +%{customdata[2]:,.1f}% (%{customdata[3]:.2f}x)<extra></extra>"
-                            )
+                            hovertemplate=hover_temp
                         ))
 
                 if "bench" in sel_cycles and benchmark:
@@ -748,7 +869,7 @@ def render_halving_analyzer():
                     fig.add_trace(go.Bar(
                         x=x_labels,
                         y=y_b_delta,
-                        name="Promedio Histórico (H1-H3)",
+                        name="Promedio Histórico",
                         marker_color="#64748b",
                         opacity=0.85,
                         hovertemplate="<b>Promedio Histórico</b><br>Variación Media: <b>%{y:+.2f}%</b><extra></extra>"
@@ -778,7 +899,7 @@ def render_halving_analyzer():
                         tickfont=dict(family='JetBrains Mono', color='#cbd5e1', size=10)
                     ),
                     yaxis=dict(
-                        title='Variación Periódica (Δ% Crecimiento / Decrecimiento)',
+                        title=f'Variación Periódica (Δ% Crecimiento / Decrecimiento de {val_type_label})',
                         gridcolor='#1e293b',
                         zeroline=True,
                         zerolinecolor='#cbd5e1',
@@ -793,6 +914,7 @@ def render_halving_analyzer():
             periods = growth_data.get("periods", [])
             cycles = growth_data.get("cycles", {})
             benchmark = growth_data.get("benchmark", [])
+            is_stables = (g_state.get("asset_type") == "stablecoins")
 
             html = '''
             <table class="w-full text-left text-xs font-mono border-collapse">
@@ -815,6 +937,8 @@ def render_halving_analyzer():
                 d_range = f"H+{p['start_day']} a H+{p['end_day']}d"
 
                 def format_cell(cid: str) -> str:
+                    if cid == "H1" and is_stables:
+                        return "<span class='text-slate-600' title='Las stablecoins no existían en 2012 (creadas a finales de 2014)'>-</span>"
                     if cid not in cycles or idx >= len(cycles[cid]):
                         return "<span class='text-slate-600'>-</span>"
                     c_period = cycles[cid][idx]
@@ -822,12 +946,18 @@ def render_halving_analyzer():
                         return "<span class='text-slate-600'>-</span>"
                     val = c_period["periodic_return_pct"]
                     in_prog = " <span class='text-amber-400 text-[9px]'>*</span>" if c_period.get("is_in_progress") else ""
+                    
+                    # Tooltip con valores en $
+                    p_start_str = format_currency_val(c_period.get("start_price", 0), is_stables)
+                    p_end_str = format_currency_val(c_period.get("end_price", 0), is_stables)
+                    cell_title = f"{p_start_str} -> {p_end_str}"
+
                     if val > 0:
-                        return f"<span class='text-emerald-400 font-bold'>+{val:.1f}%{in_prog}</span>"
+                        return f"<span class='text-emerald-400 font-bold' title='{cell_title}'>+{val:.1f}%{in_prog}</span>"
                     elif val < 0:
-                        return f"<span class='text-rose-400 font-bold'>{val:.1f}%{in_prog}</span>"
+                        return f"<span class='text-rose-400 font-bold' title='{cell_title}'>{val:.1f}%{in_prog}</span>"
                     else:
-                        return f"<span class='text-slate-400'>0.0%{in_prog}</span>"
+                        return f"<span class='text-slate-400' title='{cell_title}'>0.0%{in_prog}</span>"
 
                 b_val_str = "<span class='text-slate-600'>-</span>"
                 if idx < len(benchmark) and benchmark[idx].get("has_data") and benchmark[idx].get("mean_periodic_pct") is not None:
@@ -854,39 +984,177 @@ def render_halving_analyzer():
             html += '</tbody></table>'
             return html
 
+        def format_btc_price_val(val: float) -> str:
+            if val is None:
+                return "-"
+            if abs(val) >= 1000:
+                return f"${val:,.0f}"
+            elif abs(val) >= 1:
+                return f"${val:,.2f}"
+            else:
+                return f"${val:,.4f}"
+
+        def build_stables_detailed_table_html(stables_data: dict, btc_data: dict = None) -> str:
+            periods = stables_data.get("periods", [])
+            s_cycles = stables_data.get("cycles", {})
+            b_cycles = btc_data.get("cycles", {}) if btc_data else {}
+
+            html = '''
+            <table class="w-full text-left text-xs font-mono border-collapse">
+                <thead>
+                    <tr class="border-b border-[#1e293b] text-slate-400 text-[11px]">
+                        <th class="py-2.5 px-3">Período</th>
+                        <th class="py-2.5 px-3">Días Relativos</th>
+                        <th class="py-2.5 px-3 text-right text-purple-400 min-w-[280px]">H2 (2016) Mcap & Precio BTC</th>
+                        <th class="py-2.5 px-3 text-right text-emerald-400 min-w-[280px]">H3 (2020) Mcap & Precio BTC</th>
+                        <th class="py-2.5 px-3 text-right text-amber-400 min-w-[280px]">H4 (Actual) Mcap & Precio BTC</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-[#1e293b]/60">
+            '''
+
+            for idx, p in enumerate(periods):
+                p_label = p["label_short"]
+                d_range = f"H+{p['start_day']} a H+{p['end_day']}d"
+
+                def format_cycle_col(cid: str) -> str:
+                    s_c = s_cycles.get(cid, [])[idx] if (cid in s_cycles and idx < len(s_cycles[cid])) else {}
+                    b_c = b_cycles.get(cid, [])[idx] if (cid in b_cycles and idx < len(b_cycles[cid])) else {}
+
+                    has_s = s_c.get("has_data", False) and s_c.get("start_price") is not None
+                    has_b = b_c.get("has_data", False) and b_c.get("start_price") is not None
+
+                    if not has_s and not has_b:
+                        return "<span class='text-slate-600'>-</span>"
+
+                    # 1. Capitalización Stablecoins (Mcap Inicial -> Final, Flujo $ e Incremento %)
+                    if has_s:
+                        s_p0 = s_c.get("start_price", 0)
+                        s_p1 = s_c.get("end_price", 0)
+                        s_delta = s_c.get("net_inflow_usd", 0)
+                        s_pct = s_c.get("periodic_return_pct", 0)
+                        s_p0_str = format_currency_val(s_p0, True)
+                        s_p1_str = format_currency_val(s_p1, True)
+                        s_delta_str = format_currency_val(abs(s_delta), True)
+                        s_color = "text-emerald-400" if s_pct >= 0 else "text-rose-400"
+                        s_badge_bg = "bg-emerald-950/60 border-emerald-800/60" if s_pct >= 0 else "bg-rose-950/60 border-rose-800/60"
+                        s_sign = "+" if s_delta >= 0 else "-"
+                        s_in_prog = " <span class='text-amber-400 text-[9px] font-black'>*</span>" if s_c.get("is_in_progress") else ""
+
+                        mcap_block = f'''
+                        <div class="flex items-center justify-between gap-1.5 text-[11px] bg-[#0a0e17]/90 px-2 py-1.5 rounded border border-[#1e293b]/70 hover:border-slate-700 transition-colors">
+                            <span class="text-slate-400 text-[10.5px]"><b class="text-emerald-400">💧 Mcap:</b> <span class="text-slate-200">{s_p0_str} → {s_p1_str}</span></span>
+                            <span class="text-right font-mono font-bold {s_color} whitespace-nowrap">
+                                {s_sign}{s_delta_str} <span class="text-[10px] font-extrabold px-1.5 py-0.5 rounded border {s_badge_bg}">({'+' if s_pct >= 0 else ''}{s_pct:.1f}%){s_in_prog}</span>
+                            </span>
+                        </div>
+                        '''
+                    else:
+                        mcap_block = '''
+                        <div class="flex items-center justify-between gap-1.5 text-[11px] bg-[#0a0e17]/50 px-2 py-1.5 rounded border border-[#1e293b]/40">
+                            <span class="text-slate-500 text-[10px]"><b class="text-slate-500">💧 Mcap:</b> Inexistente en 2012</span>
+                            <span class="text-slate-600 text-[10px]">-</span>
+                        </div>
+                        '''
+
+                    # 2. Precio Bitcoin (Precio Inicial -> Final, Variación $ e Incremento/Reducción %)
+                    if has_b:
+                        b_p0 = b_c.get("start_price", 0)
+                        b_p1 = b_c.get("end_price", 0)
+                        b_delta = b_p1 - b_p0
+                        b_pct = b_c.get("periodic_return_pct", 0)
+                        b_p0_str = format_btc_price_val(b_p0)
+                        b_p1_str = format_btc_price_val(b_p1)
+                        b_delta_str = format_btc_price_val(abs(b_delta))
+                        b_color = "text-emerald-400" if b_pct >= 0 else "text-rose-400"
+                        b_badge_bg = "bg-emerald-950/60 border-emerald-800/60" if b_pct >= 0 else "bg-rose-950/60 border-rose-800/60"
+                        b_sign = "+" if b_delta >= 0 else "-"
+                        b_in_prog = " <span class='text-amber-400 text-[9px] font-black'>*</span>" if b_c.get("is_in_progress") else ""
+
+                        btc_block = f'''
+                        <div class="flex items-center justify-between gap-1.5 text-[11px] bg-[#0a0e17]/90 px-2 py-1.5 rounded border border-[#1e293b]/70 hover:border-slate-700 transition-colors">
+                            <span class="text-slate-400 text-[10.5px]"><b class="text-amber-400">🪙 BTC:</b> <span class="text-slate-200">{b_p0_str} → {b_p1_str}</span></span>
+                            <span class="text-right font-mono font-bold {b_color} whitespace-nowrap">
+                                {b_sign}{b_delta_str} <span class="text-[10px] font-extrabold px-1.5 py-0.5 rounded border {b_badge_bg}">({'+' if b_pct >= 0 else ''}{b_pct:.1f}%){b_in_prog}</span>
+                            </span>
+                        </div>
+                        '''
+                    else:
+                        btc_block = ""
+
+                    return f'''
+                    <div class="space-y-1.5 py-1">
+                        {mcap_block}
+                        {btc_block}
+                    </div>
+                    '''
+
+                html += f'''
+                    <tr class="hover:bg-slate-800/40 transition-colors">
+                        <td class="py-2.5 px-3 font-bold text-white align-middle">{p_label}</td>
+                        <td class="py-2.5 px-3 text-slate-400 text-[11px] align-middle">{d_range}</td>
+                        <td class="py-2.5 px-3 text-right">{format_cycle_col("H2")}</td>
+                        <td class="py-2.5 px-3 text-right">{format_cycle_col("H3")}</td>
+                        <td class="py-2.5 px-3 text-right font-semibold">{format_cycle_col("H4")}</td>
+                    </tr>
+                '''
+
+            html += '</tbody></table>'
+            return html
+
         def build_growth_insights_html(growth_data: dict, g_state: dict) -> str:
             summary = growth_data.get("summary", {})
-            tf_name = summary.get("timeframe_label", "Mes")
-            step_name = summary.get("step_label", "1 Mes")
+            is_stables = (g_state.get("asset_type") == "stablecoins")
+            step_name = summary.get("step_label", "1 Semestre")
             win_r = summary.get("global_positive_ratio", 0)
             avg_r = summary.get("avg_period_return", 0)
             max_r = summary.get("max_period_return", 0)
             min_r = summary.get("min_period_return", 0)
 
-            # Extraer rendimiento más reciente de H4
             h4_periods = growth_data.get("cycles", {}).get("H4", [])
             h4_active = [p for p in h4_periods if p.get("has_data") and p.get("periodic_return_pct") is not None]
             h4_last_ret = h4_active[-1]["periodic_return_pct"] if h4_active else 0
             h4_last_label = growth_data.get("periods", [])[len(h4_active)-1]["label_short"] if h4_active else "-"
+            h4_last_inflow = h4_active[-1].get("net_inflow_usd", 0) if h4_active else 0
 
-            html = f'''
-            <div class="space-y-3 text-xs text-slate-300 leading-relaxed font-sans">
-                <div class="p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]">
-                    <div class="font-bold text-white font-mono text-[11px] mb-1">📊 Dinámica en {step_name}</div>
-                    <div>Evaluando los ciclos en bloques de <b>{step_name}</b>, el <b>{win_r:.1f}%</b> de los períodos históricos completados cerraron con rendimientos positivos (crecimiento neto).</div>
-                </div>
+            if is_stables:
+                html = f'''
+                <div class="space-y-3 text-xs text-slate-300 leading-relaxed font-sans">
+                    <div class="p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]">
+                        <div class="font-bold text-white font-mono text-[11px] mb-1">🌊 Flujo de Liquidez en {step_name}</div>
+                        <div>Evaluando la masa monetaria de stablecoins en bloques de <b>{step_name}</b>, el <b>{win_r:.1f}%</b> de los períodos históricos completados registraron expansión neta de liquidez (acuñación positiva de capital fiat hacia cripto).</div>
+                    </div>
 
-                <div class="p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]">
-                    <div class="font-bold text-amber-400 font-mono text-[11px] mb-1">🚀 Impulsos y Volatilidad</div>
-                    <div>El retorno promedio por período asciende a <b class="text-emerald-400">{avg_r:+.2f}%</b>, con un rally máximo registrado de <b class="text-emerald-400">+{max_r:.1f}%</b> y una contracción máxima por período de <b class="text-rose-400">{min_r:.1f}%</b>.</div>
-                </div>
+                    <div class="p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]">
+                        <div class="font-bold text-amber-400 font-mono text-[11px] mb-1">🚀 Impulsos de Emisión vs Contracción</div>
+                        <div>La tasa de expansión promedio por período es de <b class="text-emerald-400">{avg_r:+.2f}%</b>, con un pico de emisión récord de <b class="text-emerald-400">+{max_r:.1f}%</b> y una contracción máxima de absorción de <b class="text-rose-400">{min_r:.1f}%</b>.</div>
+                    </div>
 
-                <div class="p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]">
-                    <div class="font-bold text-sky-400 font-mono text-[11px] mb-1">⚡ Estado Ciclo 4 (Actual)</div>
-                    <div>En su período más reciente evaluado (<b>{h4_last_label}</b>), el Ciclo 4 exhibe una variación de <b class="{'text-emerald-400' if h4_last_ret >= 0 else 'text-rose-400'}">{h4_last_ret:+.2f}%</b>, alineándose con las pautas de consolidación/expansión observadas en los Halvings 2 y 3.</div>
+                    <div class="p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]">
+                        <div class="font-bold text-emerald-400 font-mono text-[11px] mb-1">⚡ Estado Liquidez Ciclo 4 (Actual)</div>
+                        <div>En su período más reciente (<b>{h4_last_label}</b>), el Market Cap de stablecoins varió <b class="{'text-emerald-400' if h4_last_ret >= 0 else 'text-rose-400'}">{h4_last_ret:+.2f}%</b> ({format_currency_val(h4_last_inflow, True)} USD), confirmando la sólida base de poder adquisitivo para sostener la estructura alcista del ciclo.</div>
+                    </div>
                 </div>
-            </div>
-            '''
+                '''
+            else:
+                html = f'''
+                <div class="space-y-3 text-xs text-slate-300 leading-relaxed font-sans">
+                    <div class="p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]">
+                        <div class="font-bold text-white font-mono text-[11px] mb-1">📊 Dinámica en {step_name}</div>
+                        <div>Evaluando los ciclos en bloques de <b>{step_name}</b>, el <b>{win_r:.1f}%</b> de los períodos históricos completados cerraron con rendimientos positivos (crecimiento neto).</div>
+                    </div>
+
+                    <div class="p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]">
+                        <div class="font-bold text-amber-400 font-mono text-[11px] mb-1">🚀 Impulsos y Volatilidad</div>
+                        <div>El retorno promedio por período asciende a <b class="text-emerald-400">{avg_r:+.2f}%</b>, con un rally máximo registrado de <b class="text-emerald-400">+{max_r:.1f}%</b> y una contracción máxima por período de <b class="text-rose-400">{min_r:.1f}%</b>.</div>
+                    </div>
+
+                    <div class="p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]">
+                        <div class="font-bold text-sky-400 font-mono text-[11px] mb-1">⚡ Estado Ciclo 4 (Actual)</div>
+                        <div>En su período más reciente evaluado (<b>{h4_last_label}</b>), el Ciclo 4 exhibe una variación de <b class="{'text-emerald-400' if h4_last_ret >= 0 else 'text-rose-400'}">{h4_last_ret:+.2f}%</b>, alineándose con las pautas de consolidación/expansión observadas en los Halvings 2 y 3.</div>
+                    </div>
+                </div>
+                '''
             return html
 
         def render_growth_tab():
@@ -894,11 +1162,13 @@ def render_halving_analyzer():
             growth_data = analyzer.calculate_periodic_growth_analysis(
                 timeframe=growth_state["timeframe"],
                 step_size=growth_state["step_size"],
-                max_days=growth_state["max_days"]
+                max_days=growth_state["max_days"],
+                asset_type=growth_state.get("asset_type", "btc")
             )
 
             periods = growth_data.get("periods", [])
             summary = growth_data.get("summary", {})
+            is_stables = (growth_state.get("asset_type") == "stablecoins")
 
             with growth_container:
                 # 1. Panel de Controles
@@ -908,12 +1178,21 @@ def render_halving_analyzer():
                             with ui.row().classes('items-center gap-2'):
                                 ui.icon('query_stats', size='1.3rem').classes('text-amber-400')
                                 ui.label('CRECIMIENTO / DECRECIMIENTO POR TEMPORALIDAD').classes('text-xs font-extrabold text-white font-mono tracking-wider')
-                            ui.label('Selecciona la temporalidad (Día, Semana, Mes, Trimestre, Semestre, Año) y cantidad de períodos para comparar la variación periódica (Δ%) o acumulada entre ciclos.').classes('text-[11px] text-slate-400')
+                            ui.label('Selecciona el activo (Precio BTC o Capitalización de Stablecoins), la temporalidad (Día, Semana, Mes, Trimestre, Semestre, Año) y cantidad de períodos para comparar la variación periódica (Δ%) o acumulada entre ciclos.').classes('text-[11px] text-slate-400')
 
                     with ui.row().classes('w-full items-center justify-between flex-wrap gap-3'):
-                        # Selectores de Temporalidad y Cantidad
+                        # Selectores Principales
                         with ui.row().classes('items-center flex-wrap gap-2.5'):
-                            ui.label('TEMPORALIDAD:').classes('text-[11px] font-bold text-slate-400 font-mono self-center')
+                            ui.label('VARIABLE / ACTIVO:').classes('text-[11px] font-bold text-amber-400 font-mono self-center')
+                            g_asset_select = ui.select(
+                                options={
+                                    'btc': 'Precio de Bitcoin (BTC)',
+                                    'stablecoins': 'Capitalización Stablecoins (Mcap)'
+                                },
+                                value=growth_state.get('asset_type', 'btc')
+                            ).props('dense outlined dark options-dense').classes('w-60 text-xs')
+
+                            ui.label('TEMPORALIDAD:').classes('text-[11px] font-bold text-slate-400 font-mono self-center ml-1')
                             g_tf_select = ui.select(
                                 options={
                                     'day': 'Día (1 día base)',
@@ -924,7 +1203,7 @@ def render_halving_analyzer():
                                     'year': 'Año (365 días / 12M)'
                                 },
                                 value=growth_state['timeframe']
-                            ).props('dense outlined dark options-dense').classes('w-56 text-xs')
+                            ).props('dense outlined dark options-dense').classes('w-52 text-xs')
 
                             ui.label('CANTIDAD:').classes('text-[11px] font-bold text-slate-400 font-mono self-center ml-1')
                             g_step_select = ui.select(
@@ -937,7 +1216,7 @@ def render_halving_analyzer():
                                     12: '12 Períodos (x12)'
                                 },
                                 value=growth_state['step_size']
-                            ).props('dense outlined dark options-dense').classes('w-44 text-xs')
+                            ).props('dense outlined dark options-dense').classes('w-40 text-xs')
 
                             ui.label('MÉTRICA:').classes('text-[11px] font-bold text-slate-400 font-mono self-center ml-1')
                             g_metric_select = ui.select(
@@ -945,11 +1224,12 @@ def render_halving_analyzer():
                                     'periodic_delta': 'Variación Periódica Δ% (Crecimiento / Decrecimiento)',
                                     'cumulative_pct': 'Crecimiento Acumulado (+% desde H0)',
                                     'cumulative_mult': 'Múltiplo Acumulado (Nx)',
+                                    'absolute_usd': 'Valor Absoluto ($ USD / Mcap)',
                                     'dual_view': 'Vista Dual (Barras Δ% + Curva Acumulada)',
                                     'heatmap': 'Mapa de Calor (Matriz de Retornos)'
                                 },
                                 value=growth_state['metric']
-                            ).props('dense outlined dark options-dense').classes('w-72 text-xs')
+                            ).props('dense outlined dark options-dense').classes('w-64 text-xs')
 
                         # Ventana y Escala
                         with ui.row().classes('items-center flex-wrap gap-2.5'):
@@ -958,7 +1238,7 @@ def render_halving_analyzer():
                                 options={
                                     365: 'Primer Año (0 a +365d)',
                                     730: '2 Años (0 a +730d)',
-                                    1000: 'Ciclo Estándar (0 a +1000d)',
+                                    1080: 'Ciclo Estándar (0 a +1080d)',
                                     1400: 'Ciclo Extendido (0 a +1400d)'
                                 },
                                 value=growth_state['max_days']
@@ -978,7 +1258,7 @@ def render_halving_analyzer():
                 with ui.row().classes('w-full grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5 mt-2'):
                     with ui.card().classes('bg-[#0f172a] border border-[#1e293b] p-3.5 rounded-xl shadow-sm'):
                         ui.label('GRANULARIDAD EVALUADA').classes('text-[10px] font-bold text-slate-400 font-mono tracking-wider')
-                        ui.label(f"{summary.get('step_label', '1 Mes')} ({summary.get('interval_days', 30)}d)").classes('text-lg font-black text-amber-400 font-mono')
+                        ui.label(f"{summary.get('step_label', '1 Semestre')} ({summary.get('interval_days', 180)}d)").classes('text-lg font-black text-amber-400 font-mono')
                         ui.label(f"{len(periods)} períodos analizados post-Halving").classes('text-[10px] text-slate-400 font-mono')
 
                     with ui.card().classes('bg-[#0f172a] border border-[#1e293b] p-3.5 rounded-xl shadow-sm'):
@@ -988,7 +1268,7 @@ def render_halving_analyzer():
                         ui.label('Períodos con variación Δ% positiva').classes('text-[10px] text-slate-400 font-mono')
 
                     with ui.card().classes('bg-[#0f172a] border border-[#1e293b] p-3.5 rounded-xl shadow-sm'):
-                        ui.label('RETORNO PERIÓDICO PROMEDIO').classes('text-[10px] font-bold text-slate-400 font-mono tracking-wider')
+                        ui.label('VARIACIÓN PERIÓDICA PROMEDIO').classes('text-[10px] font-bold text-slate-400 font-mono tracking-wider')
                         avg_r = summary.get('avg_period_return', 0)
                         color_avg = 'text-emerald-400' if avg_r >= 0 else 'text-rose-400'
                         ui.label(f"{avg_r:+.2f}%").classes(f'text-lg font-black {color_avg} font-mono')
@@ -1002,7 +1282,7 @@ def render_halving_analyzer():
                             ui.label(f"+{max_r:.1f}%").classes('text-xs font-black text-emerald-400 font-mono')
                             ui.label('|').classes('text-slate-600')
                             ui.label(f"{min_r:.1f}%").classes('text-xs font-black text-rose-400 font-mono')
-                        ui.label('Rally máximo vs retroceso máximo').classes('text-[10px] text-slate-400 font-mono')
+                        ui.label('Expansión máxima vs retroceso máximo').classes('text-[10px] text-slate-400 font-mono')
 
                 # 3. Gráfico Plotly
                 with ui.card().classes('w-full bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md mt-2'):
@@ -1020,6 +1300,10 @@ def render_halving_analyzer():
                         ui.html(build_growth_insights_html(growth_data, growth_state)).classes('w-full')
 
                 # Handlers de reactividad para controles internos de growth
+                def on_growth_asset_change(e):
+                    growth_state['asset_type'] = e.value
+                    render_growth_tab()
+
                 def on_growth_tf_change(e):
                     growth_state['timeframe'] = e.value
                     render_growth_tab()
@@ -1046,6 +1330,7 @@ def render_halving_analyzer():
                     growth_state['selected_cycles'] = sel
                     render_growth_tab()
 
+                g_asset_select.on_value_change(on_growth_asset_change)
                 g_tf_select.on_value_change(on_growth_tf_change)
                 g_step_select.on_value_change(on_growth_step_change)
                 g_metric_select.on_value_change(on_growth_metric_change)
@@ -1055,6 +1340,534 @@ def render_halving_analyzer():
                 g_chk_h3.on_value_change(lambda _: update_growth_cycles())
                 g_chk_h4.on_value_change(lambda _: update_growth_cycles())
                 g_chk_bench.on_value_change(lambda _: update_growth_cycles())
+
+        # -------------------------------------------------------------
+        # PESTAÑA: CAPITALIZACIÓN DE STABLECOINS POR HALVING
+        # -------------------------------------------------------------
+        stables_state = {
+            "asset_type": "stablecoins",
+            "timeframe": "semester",      # 'day', 'week', 'month', 'quarter', 'semester', 'year'
+            "step_size": 1,
+            "metric": "periodic_delta",   # 'periodic_delta', 'cumulative_pct', 'cumulative_mult', 'absolute_usd', 'dual_view', 'heatmap'
+            "max_days": 1080,
+            "selected_cycles": ["H2", "H3", "H4", "bench"],
+            "y_scale": "linear"
+        }
+
+        def render_stables_tab():
+            stables_container.clear()
+            stables_kpis = analyzer.calculate_stablecoin_summary_kpis()
+            stables_data = analyzer.calculate_periodic_growth_analysis(
+                timeframe=stables_state["timeframe"],
+                step_size=stables_state["step_size"],
+                max_days=stables_state["max_days"],
+                asset_type="stablecoins"
+            )
+            btc_data = analyzer.calculate_periodic_growth_analysis(
+                timeframe=stables_state["timeframe"],
+                step_size=stables_state["step_size"],
+                max_days=stables_state["max_days"],
+                asset_type="btc"
+            )
+
+            periods = stables_data.get("periods", [])
+            summary = stables_data.get("summary", {})
+
+            with stables_container:
+                # 1. Header explicativo
+                with ui.card().classes('w-full bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md mt-3'):
+                    with ui.row().classes('w-full justify-between items-center flex-wrap gap-2 border-b border-[#1e293b] pb-3 mb-3'):
+                        with ui.column().classes('gap-0.5'):
+                            with ui.row().classes('items-center gap-2'):
+                                ui.icon('account_balance_wallet', size='1.4rem').classes('text-emerald-400')
+                                ui.label('CAPITALIZACIÓN DE STABLECOINS SEGÚN PERÍODOS DEL HALVING').classes('text-sm font-extrabold text-white font-mono tracking-wider')
+                                ui.badge('LIQUIDEZ ON-CHAIN GLOBAL', color='teal').classes('text-[10px] font-mono font-bold')
+                            ui.label('Monitoreo del poder adquisitivo latente (USDT, USDC, DAI...) indexado a partir del bloque de Halving (H=0). Analiza la tasa de inyección de capital en dólares y su correlación con los ciclos alcistas.').classes('text-xs text-slate-400')
+
+                # 2. Tarjetas KPI de Liquidez Global
+                with ui.row().classes('w-full grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5'):
+                    with ui.card().classes('bg-[#0f172a] border border-emerald-500/30 p-3.5 rounded-xl shadow-sm'):
+                        with ui.row().classes('w-full justify-between items-center mb-0.5'):
+                            ui.label('CAPITALIZACIÓN TOTAL ACTUAL').classes('text-[10px] font-bold text-emerald-400 font-mono tracking-wider')
+                            ui.icon('savings', size='1.1rem').classes('text-emerald-400')
+                        ui.label(f"${stables_kpis.get('current_market_cap_billions', 0):,.2f}B").classes('text-2xl font-black text-white font-mono')
+                        with ui.row().classes('items-baseline gap-1.5 mt-0.5'):
+                            ui.label(f"+{stables_kpis.get('h4_growth_pct', 0):.1f}%").classes('text-xs font-black text-emerald-400 font-mono')
+                            ui.label('desde Halving 4 (H0)').classes('text-[10px] text-slate-400 font-mono')
+
+                    with ui.card().classes('bg-[#0f172a] border border-[#1e293b] p-3.5 rounded-xl shadow-sm'):
+                        with ui.row().classes('w-full justify-between items-center mb-0.5'):
+                            ui.label('INYECCIÓN NETA HALVING 4').classes('text-[10px] font-bold text-amber-400 font-mono tracking-wider')
+                            ui.icon('add_circle', size='1.1rem').classes('text-amber-400')
+                        ui.label(f"+${stables_kpis.get('h4_inflow_billions', 0):,.2f}B").classes('text-2xl font-black text-amber-400 font-mono')
+                        ui.label(f"Dólares acuñados en {stables_kpis.get('h4_current_day', 0)} días").classes('text-[10px] text-slate-400 font-mono mt-0.5')
+
+                    with ui.card().classes('bg-[#0f172a] border border-[#1e293b] p-3.5 rounded-xl shadow-sm'):
+                        with ui.row().classes('w-full justify-between items-center mb-0.5'):
+                            ui.label('PICO CICLO 3 (2020-2021)').classes('text-[10px] font-bold text-purple-400 font-mono tracking-wider')
+                            ui.icon('trending_up', size='1.1rem').classes('text-purple-400')
+                        ui.label(f"${stables_kpis.get('h3_peak_mcap_billions', 0):,.2f}B").classes('text-2xl font-black text-white font-mono')
+                        with ui.row().classes('items-baseline gap-1.5 mt-0.5'):
+                            ui.label(f"+{stables_kpis.get('h3_peak_roi_pct', 0):,.0f}%").classes('text-xs font-black text-purple-400 font-mono')
+                            ui.label('expansión en ATH').classes('text-[10px] text-slate-400 font-mono')
+
+                    with ui.card().classes('bg-[#0f172a] border border-[#1e293b] p-3.5 rounded-xl shadow-sm'):
+                        with ui.row().classes('w-full justify-between items-center mb-0.5'):
+                            ui.label('EXPANSIÓN SEMESTRE 1 PROMEDIO').classes('text-[10px] font-bold text-sky-400 font-mono tracking-wider')
+                            ui.icon('speed', size='1.1rem').classes('text-sky-400')
+                        ui.label(f"+{stables_kpis.get('avg_sem1_growth_pct', 0):.1f}%").classes('text-2xl font-black text-sky-400 font-mono')
+                        ui.label('Media histórica en primeros 180 días').classes('text-[10px] text-slate-400 font-mono mt-0.5')
+
+                # 3. Controles Interactivos
+                with ui.card().classes('w-full bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md'):
+                    with ui.row().classes('w-full items-center justify-between flex-wrap gap-3'):
+                        with ui.row().classes('items-center flex-wrap gap-2.5'):
+                            ui.label('TEMPORALIDAD:').classes('text-[11px] font-bold text-slate-400 font-mono self-center')
+                            s_tf_select = ui.select(
+                                options={
+                                    'semester': 'Semestre (180 días / 6M)',
+                                    'quarter': 'Trimestre (90 días / 3M)',
+                                    'month': 'Mes (30 días)',
+                                    'week': 'Semana (7 días)',
+                                    'year': 'Año (365 días / 12M)'
+                                },
+                                value=stables_state['timeframe']
+                            ).props('dense outlined dark options-dense').classes('w-56 text-xs')
+
+                            ui.label('CANTIDAD:').classes('text-[11px] font-bold text-slate-400 font-mono self-center ml-1')
+                            s_step_select = ui.select(
+                                options={
+                                    1: '1 Período (Base)',
+                                    2: '2 Períodos (x2)',
+                                    3: '3 Períodos (x3)',
+                                    4: '4 Períodos (x4)',
+                                    6: '6 Períodos (x6)'
+                                },
+                                value=stables_state['step_size']
+                            ).props('dense outlined dark options-dense').classes('w-40 text-xs')
+
+                            ui.label('MÉTRICA:').classes('text-[11px] font-bold text-slate-400 font-mono self-center ml-1')
+                            s_metric_select = ui.select(
+                                options={
+                                    'periodic_delta': 'Variación Periódica Δ% (Crecimiento / Decrecimiento)',
+                                    'cumulative_pct': 'Expansión Acumulada (+% desde H0)',
+                                    'cumulative_mult': 'Múltiplo de Liquidez (Nx Base)',
+                                    'absolute_usd': 'Capitalización de Mercado ($ Billones USD)',
+                                    'dual_view': 'Vista Dual (Barras Δ% + Curva Acumulada)',
+                                    'heatmap': 'Mapa de Calor de Liquidez'
+                                },
+                                value=stables_state['metric']
+                            ).props('dense outlined dark options-dense').classes('w-72 text-xs')
+
+                        with ui.row().classes('items-center flex-wrap gap-2.5'):
+                            ui.label('VENTANA:').classes('text-[11px] font-bold text-slate-400 font-mono self-center')
+                            s_win_select = ui.select(
+                                options={
+                                    730: '2 Años (0 a +730d)',
+                                    1080: 'Ciclo Estándar (0 a +1080d)',
+                                    1400: 'Ciclo Extendido (0 a +1400d)'
+                                },
+                                value=stables_state['max_days']
+                            ).props('dense outlined dark options-dense').classes('w-52 text-xs')
+
+                    with ui.row().classes('w-full items-center justify-between flex-wrap gap-2 pt-2 border-t border-[#1e293b]/70 mt-1'):
+                        with ui.row().classes('items-center gap-3 flex-wrap'):
+                            ui.label('CICLOS:').classes('text-[11px] font-bold text-slate-400 font-mono self-center')
+                            s_chk_h1 = ui.checkbox('H1 (2012 - Inexistente)', value=('H1' in stables_state['selected_cycles'])).props('dense dark color=cyan').classes('text-xs text-sky-400 font-semibold opacity-50')
+                            s_chk_h2 = ui.checkbox('H2 (2016)', value=('H2' in stables_state['selected_cycles'])).props('dense dark color=purple').classes('text-xs text-purple-400 font-semibold')
+                            s_chk_h3 = ui.checkbox('H3 (2020)', value=('H3' in stables_state['selected_cycles'])).props('dense dark color=green').classes('text-xs text-emerald-400 font-semibold')
+                            s_chk_h4 = ui.checkbox('H4 (2024 Actual)', value=('H4' in stables_state['selected_cycles'])).props('dense dark color=amber').classes('text-xs text-amber-400 font-bold')
+                            s_chk_bench = ui.checkbox('Promedio Histórico', value=('bench' in stables_state['selected_cycles'])).props('dense dark color=grey').classes('text-xs text-slate-300 font-medium')
+
+                # 4. Gráfico Plotly de Capitalización de Stablecoins
+                with ui.card().classes('w-full bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md'):
+                    fig_stables = build_growth_figure(stables_data, stables_state)
+                    ui.plotly(fig_stables).classes('w-full h-full')
+
+                # 5. Tablas Cuantitativas y Análisis
+                with ui.row().classes('w-full grid grid-cols-1 lg:grid-cols-3 gap-4'):
+                    with ui.card().classes('lg:col-span-2 bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md overflow-x-auto'):
+                        with ui.row().classes('w-full justify-between items-center mb-2'):
+                            ui.label('DESGLOSE DE VARIACIÓN POR PERÍODO (Δ%)').classes('text-xs font-bold text-slate-300 font-mono tracking-wider')
+                            ui.label('Tasa de cambio porcentual del Market Cap de Stablecoins').classes('text-[10px] text-slate-400 font-mono')
+                        ui.html(build_growth_table_html(stables_data, stables_state)).classes('w-full')
+
+                    with ui.card().classes('bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md'):
+                        ui.label('INTERPRETACIÓN DE LIQUIDEZ MACRO').classes('text-xs font-bold text-emerald-400 font-mono tracking-wider mb-2')
+                        ui.html(build_growth_insights_html(stables_data, stables_state)).classes('w-full')
+
+                # 6. Tabla Complementaria de Capitalización e Inyección en Dólares ($ Billones) y Acción de Precio BTC
+                with ui.card().classes('w-full bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md overflow-x-auto'):
+                    with ui.row().classes('w-full justify-between items-center flex-wrap gap-2 mb-3'):
+                        with ui.column().classes('gap-0.5'):
+                            with ui.row().classes('items-center gap-2'):
+                                ui.icon('table_chart', size='1.2rem').classes('text-amber-400')
+                                ui.label('DETALLE DE CAPITALIZACIÓN (MCAP STABLECOINS) Y ACCIÓN DE PRECIO (BTC)').classes('text-xs font-bold text-slate-200 font-mono tracking-wider')
+                            ui.label('Valores iniciales vs finales, incremento/reducción en monto ($) y porcentaje (Δ%) para Capitalización de Stablecoins y Precio de Bitcoin por período.').classes('text-[10px] text-slate-400 font-mono')
+                        with ui.row().classes('items-center gap-3 bg-[#0a0e17] px-3 py-1.5 rounded-lg border border-[#1e293b]'):
+                            with ui.row().classes('items-center gap-1.5'):
+                                ui.icon('water_drop', size='0.9rem').classes('text-emerald-400')
+                                ui.label('Mcap Stablecoins').classes('text-[10.5px] font-mono text-emerald-400 font-bold')
+                            with ui.row().classes('items-center gap-1.5 ml-2'):
+                                ui.icon('currency_bitcoin', size='0.9rem').classes('text-amber-400')
+                                ui.label('Precio Bitcoin').classes('text-[10.5px] font-mono text-amber-400 font-bold')
+
+                    ui.html(build_stables_detailed_table_html(stables_data, btc_data)).classes('w-full')
+
+                # Handlers de reactividad para controles internos de stables
+                def on_stables_tf_change(e):
+                    stables_state['timeframe'] = e.value
+                    render_stables_tab()
+
+                def on_stables_step_change(e):
+                    stables_state['step_size'] = int(e.value)
+                    render_stables_tab()
+
+                def on_stables_metric_change(e):
+                    stables_state['metric'] = e.value
+                    render_stables_tab()
+
+                def on_stables_win_change(e):
+                    stables_state['max_days'] = int(e.value)
+                    render_stables_tab()
+
+                def update_stables_cycles():
+                    sel = []
+                    if s_chk_h1.value: sel.append("H1")
+                    if s_chk_h2.value: sel.append("H2")
+                    if s_chk_h3.value: sel.append("H3")
+                    if s_chk_h4.value: sel.append("H4")
+                    if s_chk_bench.value: sel.append("bench")
+                    stables_state['selected_cycles'] = sel
+                    render_stables_tab()
+
+                s_tf_select.on_value_change(on_stables_tf_change)
+                s_step_select.on_value_change(on_stables_step_change)
+                s_metric_select.on_value_change(on_stables_metric_change)
+                s_win_select.on_value_change(on_stables_win_change)
+                s_chk_h1.on_value_change(lambda _: update_stables_cycles())
+                s_chk_h2.on_value_change(lambda _: update_stables_cycles())
+                s_chk_h3.on_value_change(lambda _: update_stables_cycles())
+                s_chk_h4.on_value_change(lambda _: update_stables_cycles())
+                s_chk_bench.on_value_change(lambda _: update_stables_cycles())
+
+        # -------------------------------------------------------------
+        # PESTAÑA: BACKTESTING CUANTITATIVO (STABLECOINS + EMA)
+        # -------------------------------------------------------------
+        bt_state = {
+            "initial_capital": 10000.0,
+            "ema_fast": 20,
+            "ema_slow": 50,
+            "ema_trend": 100,
+            "trend_mode": "price_above", # 'price_above', 'crossover', 'both'
+            "flow_window": 14,
+            "z_window": 60,
+            "z_entry_threshold": 1.0,
+            "z_exit_threshold": -0.5,
+            "halving_filter_enabled": True,
+            "min_post_halving_days": 150,
+            "max_post_halving_days": 550,
+            "stop_loss_pct": 12.0,
+            "take_profit_pct": 60.0,
+            "trailing_stop": False,
+            "commission_pct": 0.1,
+            "slippage_pct": 0.05,
+            "last_results": None
+        }
+        bt_engine = StablecoinBacktester()
+
+        def build_trades_table_html(trades_df: pd.DataFrame) -> str:
+            if trades_df.empty:
+                return "<div class='text-xs text-slate-500 font-mono py-6 text-center'>No se ejecutaron operaciones en el histórico con los parámetros seleccionados.</div>"
+
+            html = '''
+            <table class="w-full text-left text-xs font-mono border-collapse">
+                <thead>
+                    <tr class="border-b border-[#1e293b] text-slate-400 text-[11px]">
+                        <th class="py-2.5 px-2.5">#</th>
+                        <th class="py-2.5 px-2.5">Fecha Entrada</th>
+                        <th class="py-2.5 px-2.5">Fecha Salida</th>
+                        <th class="py-2.5 px-2.5">Días Halving</th>
+                        <th class="py-2.5 px-2 text-right">Precio Compra</th>
+                        <th class="py-2.5 px-2 text-right">Precio Venta</th>
+                        <th class="py-2.5 px-2 text-right">Duración</th>
+                        <th class="py-2.5 px-2.5 text-right">PnL ($)</th>
+                        <th class="py-2.5 px-2.5 text-right">PnL (%)</th>
+                        <th class="py-2.5 px-3 text-right">Motivo de Salida</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-[#1e293b]/60">
+            '''
+
+            for _, t in trades_df.iterrows():
+                pnl = t['pnl_usd']
+                pnl_pct = t['pnl_pct']
+                pnl_color = "text-emerald-400" if pnl >= 0 else "text-rose-400"
+                pnl_bg = "bg-emerald-950/60 border-emerald-800/60" if pnl >= 0 else "bg-rose-950/60 border-rose-800/60"
+                h_days = f"H+{int(t['entry_halving_day'])}d → H+{int(t['exit_halving_day'])}d"
+
+                html += f'''
+                    <tr class="hover:bg-slate-800/40 transition-colors">
+                        <td class="py-2 px-2.5 font-bold text-slate-400">{int(t['trade_id'])}</td>
+                        <td class="py-2 px-2.5 text-slate-300">{t['entry_date']}</td>
+                        <td class="py-2 px-2.5 text-slate-300">{t['exit_date']}</td>
+                        <td class="py-2 px-2.5 text-slate-400 text-[10.5px]">{h_days}</td>
+                        <td class="py-2 px-2 text-right text-slate-200">${t['entry_price']:,.2f}</td>
+                        <td class="py-2 px-2 text-right text-slate-200">${t['exit_price']:,.2f}</td>
+                        <td class="py-2 px-2 text-right text-slate-400">{int(t['holding_days'])}d</td>
+                        <td class="py-2 px-2.5 text-right font-bold {pnl_color}">{'+' if pnl >= 0 else ''}${pnl:+,.2f}</td>
+                        <td class="py-2 px-2.5 text-right font-extrabold {pnl_color}">
+                            <span class="px-1.5 py-0.5 rounded border {pnl_bg}">{'+' if pnl_pct >= 0 else ''}{pnl_pct:.2f}%</span>
+                        </td>
+                        <td class="py-2 px-3 text-right text-slate-400 text-[10.5px]">{t['exit_reason']}</td>
+                    </tr>
+                '''
+
+            html += '</tbody></table>'
+            return html
+
+        def render_backtest_tab():
+            backtest_container.clear()
+
+            # Si no hay resultados calculados previamente, ejecutar backtest inicial
+            if bt_state["last_results"] is None:
+                bt_state["last_results"] = bt_engine.run_backtest(
+                    initial_capital=bt_state["initial_capital"],
+                    commission_pct=bt_state["commission_pct"],
+                    slippage_pct=bt_state["slippage_pct"],
+                    ema_fast=bt_state["ema_fast"],
+                    ema_slow=bt_state["ema_slow"],
+                    ema_trend=bt_state["ema_trend"],
+                    trend_mode=bt_state["trend_mode"],
+                    flow_window=bt_state["flow_window"],
+                    z_window=bt_state["z_window"],
+                    z_entry_threshold=bt_state["z_entry_threshold"],
+                    z_exit_threshold=bt_state["z_exit_threshold"],
+                    halving_filter_enabled=bt_state["halving_filter_enabled"],
+                    min_post_halving_days=bt_state["min_post_halving_days"],
+                    max_post_halving_days=bt_state["max_post_halving_days"],
+                    stop_loss_pct=bt_state["stop_loss_pct"],
+                    take_profit_pct=bt_state["take_profit_pct"],
+                    trailing_stop=bt_state["trailing_stop"]
+                )
+
+            res = bt_state["last_results"]
+            m = res["metrics"]
+            df_trades = res.get("trades", pd.DataFrame())
+
+            with backtest_container:
+                # 1. Header explicativo
+                with ui.card().classes('w-full bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md mt-3'):
+                    with ui.row().classes('w-full justify-between items-center flex-wrap gap-2 border-b border-[#1e293b] pb-3 mb-3'):
+                        with ui.column().classes('gap-0.5'):
+                            with ui.row().classes('items-center gap-2'):
+                                ui.icon('psychology', size='1.4rem').classes('text-amber-400')
+                                ui.label('BACKTESTING: STABLECOIN EMISSION & EMA MOMENTUM (SHM)').classes('text-sm font-extrabold text-white font-mono tracking-wider')
+                                ui.badge('SISTEMA CUANTITATIVO ON-CHAIN', color='amber').classes('text-[10px] font-mono font-bold')
+                            ui.label('Simula y evalúa sistemáticamente la estrategia de impulso por emisión neta de Stablecoins (Z-Score), filtros de tendencia EMA y ventanas de aceleración post-Halving.').classes('text-xs text-slate-400')
+
+                # 2. Panel de Configuración de Parámetros
+                with ui.card().classes('w-full bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md'):
+                    ui.label('PARÁMETROS DE LA ESTRATEGIA Y GESTIÓN DE RIESGO').classes('text-xs font-bold text-slate-300 font-mono tracking-wider mb-3')
+                    
+                    with ui.row().classes('w-full grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3'):
+                        # Sección Tendencia
+                        with ui.column().classes('gap-1.5 p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]'):
+                            ui.label('📈 TENDENCIA (EMA)').classes('text-[11px] font-bold text-sky-400 font-mono')
+                            bt_fast_in = ui.select(
+                                options={10: 'EMA 10 (Rápida)', 20: 'EMA 20 (Estándar)', 30: 'EMA 30'},
+                                value=bt_state['ema_fast'],
+                                label='EMA Rápida'
+                            ).props('dense outlined dark').classes('w-full text-xs')
+                            
+                            bt_slow_in = ui.select(
+                                options={35: 'EMA 35', 50: 'EMA 50 (Estándar)', 65: 'EMA 65', 100: 'EMA 100'},
+                                value=bt_state['ema_slow'],
+                                label='EMA Lenta'
+                            ).props('dense outlined dark').classes('w-full text-xs')
+
+                            bt_mode_in = ui.select(
+                                options={'price_above': 'Precio > EMA Lenta', 'crossover': 'Cruce EMA Rápida > Lenta', 'both': 'Ambas Condiciones'},
+                                value=bt_state['trend_mode'],
+                                label='Modo Tendencia'
+                            ).props('dense outlined dark').classes('w-full text-xs')
+
+                        # Sección Liquidez Stablecoins
+                        with ui.column().classes('gap-1.5 p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]'):
+                            ui.label('💧 LIQUIDEZ ON-CHAIN').classes('text-[11px] font-bold text-emerald-400 font-mono')
+                            bt_flow_in = ui.select(
+                                options={7: '7 Días (1 Sem)', 14: '14 Días (2 Sem)', 21: '21 Días', 30: '30 Días (1 Mes)'},
+                                value=bt_state['flow_window'],
+                                label='Ventana Flujo'
+                            ).props('dense outlined dark').classes('w-full text-xs')
+
+                            bt_zwin_in = ui.select(
+                                options={30: '30 Días', 60: '60 Días (Estándar)', 90: '90 Días', 120: '120 Días'},
+                                value=bt_state['z_window'],
+                                label='Ventana Z-Score'
+                            ).props('dense outlined dark').classes('w-full text-xs')
+
+                            bt_zin_in = ui.select(
+                                options={0.5: '+0.5σ (Sensible)', 0.8: '+0.8σ', 1.0: '+1.0σ (Estándar)', 1.2: '+1.2σ', 1.5: '+1.5σ (Fuerte)', 2.0: '+2.0σ'},
+                                value=bt_state['z_entry_threshold'],
+                                label='Z-Score Entrada'
+                            ).props('dense outlined dark').classes('w-full text-xs')
+
+                            bt_zout_in = ui.select(
+                                options={0.0: '0.0σ (Neutro)', -0.3: '-0.3σ', -0.5: '-0.5σ (Estándar)', -0.8: '-0.8σ', -1.0: '-1.0σ (Contracción)'},
+                                value=bt_state['z_exit_threshold'],
+                                label='Z-Score Salida'
+                            ).props('dense outlined dark').classes('w-full text-xs')
+
+                        # Sección Filtro Halving
+                        with ui.column().classes('gap-1.5 p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]'):
+                            ui.label('⏳ RÉGIMEN HALVING').classes('text-[11px] font-bold text-amber-400 font-mono')
+                            bt_hfilter_in = ui.checkbox('Activar Filtro Halving', value=bt_state['halving_filter_enabled']).props('dense dark color=amber').classes('text-xs font-bold text-amber-400 mt-1')
+                            
+                            with ui.row().classes('w-full items-center gap-2 mt-1'):
+                                bt_hmin_in = ui.number('Inicio (H+)', value=bt_state['min_post_halving_days'], min=0, max=1000).props('dense outlined dark').classes('w-1/2 text-xs')
+                                bt_hmax_in = ui.number('Fin (H+)', value=bt_state['max_post_halving_days'], min=100, max=1200).props('dense outlined dark').classes('w-1/2 text-xs')
+                            ui.label('Ventana histórica recomendada: H+150d a H+550d').classes('text-[10px] text-slate-500 font-mono')
+
+                        # Sección Gestión de Riesgo y Capital
+                        with ui.column().classes('gap-1.5 p-3 bg-[#0a0e17] rounded-lg border border-[#1e293b]'):
+                            ui.label('🛡️ GESTIÓN DE RIESGO').classes('text-[11px] font-bold text-rose-400 font-mono')
+                            with ui.row().classes('w-full items-center gap-2'):
+                                bt_sl_in = ui.select(
+                                    options={0.0: 'Desactivado', 8.0: '8% SL', 10.0: '10% SL', 12.0: '12% SL', 15.0: '15% SL'},
+                                    value=bt_state['stop_loss_pct'],
+                                    label='Stop Loss'
+                                ).props('dense outlined dark').classes('w-1/2 text-xs')
+                                
+                                bt_tp_in = ui.select(
+                                    options={0.0: 'Desactivado', 30.0: '30% TP', 45.0: '45% TP', 60.0: '60% TP', 100.0: '100% TP'},
+                                    value=bt_state['take_profit_pct'],
+                                    label='Take Profit'
+                                ).props('dense outlined dark').classes('w-1/2 text-xs')
+
+                            bt_cap_in = ui.number('Capital Inicial ($ USD)', value=bt_state['initial_capital'], min=100, step=1000).props('dense outlined dark').classes('w-full text-xs')
+                            bt_trail_in = ui.checkbox('Trailing Stop', value=bt_state['trailing_stop']).props('dense dark color=teal').classes('text-xs font-semibold text-slate-300')
+
+                    # Botón Ejecutar
+                    with ui.row().classes('w-full justify-end items-center gap-3 mt-3 pt-3 border-t border-[#1e293b]'):
+                        bt_spinner = ui.spinner(size='1.3rem').classes('text-amber-400')
+                        bt_spinner.set_visibility(False)
+                        bt_run_btn = ui.button(
+                            'EJECUTAR SIMULACIÓN DE BACKTEST',
+                            icon='play_arrow'
+                        ).classes('bg-gradient-to-r from-amber-500 to-emerald-500 text-slate-950 font-black px-6 py-2 rounded-xl text-xs shadow-md font-mono hover:brightness-110')
+
+                # 3. Tarjetas KPI de Resultados
+                with ui.row().classes('w-full grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3.5'):
+                    with ui.card().classes('bg-[#0f172a] border border-emerald-500/30 p-3.5 rounded-xl shadow-sm'):
+                        ui.label('CAPITAL FINAL & RETORNO').classes('text-[10px] font-bold text-emerald-400 font-mono tracking-wider')
+                        ui.label(f"${m['final_capital']:,.2f}").classes('text-xl font-black text-white font-mono')
+                        with ui.row().classes('items-baseline gap-1 mt-0.5'):
+                            ret_col = 'text-emerald-400' if m['total_return_pct'] >= 0 else 'text-rose-400'
+                            ui.label(f"{'+' if m['total_return_pct'] >= 0 else ''}{m['total_return_pct']:,.1f}%").classes(f'text-xs font-black {ret_col} font-mono')
+                            ui.label(f"(B&H: +{m['bnh_return_pct']:,.0f}%)").classes('text-[10px] text-slate-500 font-mono')
+
+                    with ui.card().classes('bg-[#0f172a] border border-[#1e293b] p-3.5 rounded-xl shadow-sm'):
+                        ui.label('CAGR ANUALIZADO').classes('text-[10px] font-bold text-sky-400 font-mono tracking-wider')
+                        cagr_col = 'text-sky-400' if m['cagr_pct'] >= 0 else 'text-rose-400'
+                        ui.label(f"{'+' if m['cagr_pct'] >= 0 else ''}{m['cagr_pct']:.2f}%").classes(f'text-xl font-black {cagr_col} font-mono')
+                        ui.label(f"{m['total_days']} días simulados").classes('text-[10px] text-slate-400 font-mono mt-0.5')
+
+                    with ui.card().classes('bg-[#0f172a] border border-[#1e293b] p-3.5 rounded-xl shadow-sm'):
+                        ui.label('RATIOS SHARPE & SORTINO').classes('text-[10px] font-bold text-purple-400 font-mono tracking-wider')
+                        ui.label(f"{m['sharpe_ratio']} | {m['sortino_ratio']}").classes('text-xl font-black text-purple-400 font-mono')
+                        ui.label(f"Calmar Ratio: {m['calmar_ratio']}").classes('text-[10px] text-slate-400 font-mono mt-0.5')
+
+                    with ui.card().classes('bg-[#0f172a] border border-[#1e293b] p-3.5 rounded-xl shadow-sm'):
+                        ui.label('MAX DRAWDOWN').classes('text-[10px] font-bold text-rose-400 font-mono tracking-wider')
+                        ui.label(f"{m['max_drawdown_pct']:.1f}%").classes('text-xl font-black text-rose-400 font-mono')
+                        ui.label('Caída máxima de capital').classes('text-[10px] text-slate-400 font-mono mt-0.5')
+
+                    with ui.card().classes('bg-[#0f172a] border border-[#1e293b] p-3.5 rounded-xl shadow-sm'):
+                        ui.label('WIN RATE & PROFIT FACTOR').classes('text-[10px] font-bold text-amber-400 font-mono tracking-wider')
+                        ui.label(f"{m['win_rate_pct']:.1f}%").classes('text-xl font-black text-amber-400 font-mono')
+                        ui.label(f"PF: {m['profit_factor']} ({m['winning_trades']}W / {m['losing_trades']}L de {m['total_trades']})").classes('text-[10px] text-slate-400 font-mono mt-0.5')
+
+                # 4. Gráfico Plotly de 3 Paneles Sincronizados
+                with ui.card().classes('w-full bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md'):
+                    fig_bt = bt_engine.build_backtest_figure(res)
+                    ui.plotly(fig_bt).classes('w-full')
+
+                # 5. Tabla de Operaciones (Trades Log)
+                with ui.card().classes('w-full bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md overflow-x-auto'):
+                    with ui.row().classes('w-full justify-between items-center mb-2'):
+                        with ui.row().classes('items-center gap-2'):
+                            ui.icon('receipt_long', size='1.2rem').classes('text-emerald-400')
+                            ui.label('REGISTRO DETALLADO DE OPERACIONES (TRADES LOG)').classes('text-xs font-bold text-slate-200 font-mono tracking-wider')
+                        ui.label(f"{len(df_trades)} operaciones completadas").classes('text-[10px] text-slate-400 font-mono')
+                    ui.html(build_trades_table_html(df_trades)).classes('w-full')
+
+                # 6. Interpretación Cuantitativa de la Estrategia
+                with ui.card().classes('w-full bg-[#111827] border border-[#1e293b] p-4 rounded-xl shadow-md'):
+                    ui.label('INTERPRETACIÓN Y EDGE CUANTITATIVO DE LA ESTRATEGIA').classes('text-xs font-bold text-amber-400 font-mono tracking-wider mb-2')
+                    ui.html('''
+                    <div class="space-y-2 text-xs text-slate-300 leading-relaxed font-sans">
+                        <div><b>1. Filtro de Asimetría de Liquidez:</b> Al exigir un <b>Z-Score ≥ +1.0σ</b> en la emisión neta de stablecoins, el sistema evita entradas en consolidaciones sin volumen y sólo participa cuando se detecta inyección fresca de capital institucional hacia el ecosistema.</div>
+                        <div><b>2. Protección de Capital en Bear Markets:</b> Al restringir las compras a la ventana de aceleración post-Halving (<b>H+150d a H+550d</b>) y ejecutar salidas automáticas cuando el flujo de stablecoins se contrae (<b>Z-Score ≤ -0.5σ</b>), la estrategia permanece 100% en liquidez durante las caídas de más del -70% del ciclo bajista.</div>
+                        <div><b>3. Adaptabilidad:</b> Puedes ajustar los umbrales de Stop Loss y Take Profit o dejar que las salidas sean 100% dinámicas según la pérdida de la EMA rápida y el agotamiento del flujo de stablecoins.</div>
+                    </div>
+                    ''').classes('w-full')
+
+                # Handler de ejecución interactiva
+                async def on_execute_backtest():
+                    bt_spinner.set_visibility(True)
+                    bt_run_btn.disable()
+                    ui.notify('Ejecutando simulación de backtest...', type='info', position='top-right')
+
+                    # Actualizar estado desde los inputs
+                    bt_state["initial_capital"] = float(bt_cap_in.value or 10000.0)
+                    bt_state["ema_fast"] = int(bt_fast_in.value or 20)
+                    bt_state["ema_slow"] = int(bt_slow_in.value or 50)
+                    bt_state["trend_mode"] = str(bt_mode_in.value or 'price_above')
+                    bt_state["flow_window"] = int(bt_flow_in.value or 14)
+                    bt_state["z_window"] = int(bt_zwin_in.value or 60)
+                    bt_state["z_entry_threshold"] = float(bt_zin_in.value or 1.0)
+                    bt_state["z_exit_threshold"] = float(bt_zout_in.value or -0.5)
+                    bt_state["halving_filter_enabled"] = bool(bt_hfilter_in.value)
+                    bt_state["min_post_halving_days"] = int(bt_hmin_in.value or 150)
+                    bt_state["max_post_halving_days"] = int(bt_hmax_in.value or 550)
+                    bt_state["stop_loss_pct"] = float(bt_sl_in.value or 0.0)
+                    bt_state["take_profit_pct"] = float(bt_tp_in.value or 0.0)
+                    bt_state["trailing_stop"] = bool(bt_trail_in.value)
+
+                    try:
+                        loop = asyncio.get_event_loop()
+                        bt_state["last_results"] = await loop.run_in_executor(
+                            None,
+                            lambda: bt_engine.run_backtest(
+                                initial_capital=bt_state["initial_capital"],
+                                commission_pct=bt_state["commission_pct"],
+                                slippage_pct=bt_state["slippage_pct"],
+                                ema_fast=bt_state["ema_fast"],
+                                ema_slow=bt_state["ema_slow"],
+                                ema_trend=bt_state["ema_trend"],
+                                trend_mode=bt_state["trend_mode"],
+                                flow_window=bt_state["flow_window"],
+                                z_window=bt_state["z_window"],
+                                z_entry_threshold=bt_state["z_entry_threshold"],
+                                z_exit_threshold=bt_state["z_exit_threshold"],
+                                halving_filter_enabled=bt_state["halving_filter_enabled"],
+                                min_post_halving_days=bt_state["min_post_halving_days"],
+                                max_post_halving_days=bt_state["max_post_halving_days"],
+                                stop_loss_pct=bt_state["stop_loss_pct"],
+                                take_profit_pct=bt_state["take_profit_pct"],
+                                trailing_stop=bt_state["trailing_stop"]
+                            )
+                        )
+                        ui.notify('¡Simulación de backtest completada!', type='positive', position='top-right')
+                        render_backtest_tab()
+                    except Exception as ex:
+                        ui.notify(f'Error en backtest: {ex}', type='negative', position='top-right')
+                    finally:
+                        bt_spinner.set_visibility(False)
+                        bt_run_btn.enable()
+
+                bt_run_btn.on_click(on_execute_backtest)
 
         def render_horizons_tab():
             horizons_container.clear()
@@ -1364,22 +2177,30 @@ def render_halving_analyzer():
         async def on_refresh():
             loading_spinner.set_visibility(True)
             refresh_btn.disable()
-            ui.notify('Sincronizando datos históricos de Halvings...', type='info', position='top-right')
+            ui.notify('Sincronizando datos históricos de Halvings y Stablecoins...', type='info', position='top-right')
             
             try:
-                # Ejecutar descarga en segundo plano
+                # Ejecutar descarga en segundo plano para BTC y Stablecoins
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, lambda: analyzer.fetch_historical_btc_data(force_refresh=True))
+                await loop.run_in_executor(
+                    None,
+                    lambda: (
+                        analyzer.fetch_historical_btc_data(force_refresh=True),
+                        analyzer.fetch_historical_stablecoin_data(force_refresh=True)
+                    )
+                )
                 
                 # Re-renderizar todos los componentes
                 render_kpi_cards()
                 render_main_chart()
                 render_growth_tab()
+                render_stables_tab()
+                render_backtest_tab()
                 render_horizons_tab()
                 render_correlation_tab()
                 render_decay_tab()
                 render_table_tab()
-                ui.notify('¡Datos de Halvings actualizados con éxito!', type='positive', position='top-right')
+                ui.notify('¡Datos de Halvings y Stablecoins actualizados con éxito!', type='positive', position='top-right')
             except Exception as ex:
                 ui.notify(f'Error actualizando datos: {ex}', type='negative', position='top-right')
             finally:
@@ -1400,6 +2221,8 @@ def render_halving_analyzer():
         render_kpi_cards()
         render_main_chart()
         render_growth_tab()
+        render_stables_tab()
+        render_backtest_tab()
         render_horizons_tab()
         render_correlation_tab()
         render_decay_tab()

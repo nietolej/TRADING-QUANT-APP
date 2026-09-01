@@ -1,0 +1,32 @@
+strategy_name: "Stablecoin Emission & EMA Momentum"
+class_name: "StablecoinEmissionEMAStrategy"
+symbol: "BTC/USDT"
+timeframe: "1d"
+trade_direction: "Long"
+
+parameters:
+  ema_fast: 20
+  ema_slow: 50
+  ema_trend: 100
+  trend_mode: "price_above" # 'price_above' | 'crossover' | 'both'
+  flow_window: 14           # Ventana de días para medir flujo de stablecoins
+  z_window: 60              # Ventana de normalización Z-Score
+  z_entry_threshold: 1.0    # Umbral de impulso alcista (Z-Score >= 1.0)
+  z_exit_threshold: -0.5    # Umbral de contracción / salida (Z-Score <= -0.5)
+  halving_filter_enabled: true
+  min_post_halving_days: 150 # Inicio ventana aceleración post-Halving
+  max_post_halving_days: 550 # Fin ventana expansión / ATH post-Halving
+  SL: 12.0                  # Stop Loss en %
+  TP: 60.0                  # Take Profit en %
+
+risk_management:
+  position_sizing:
+    type: "risk_percent"
+    value: 2.0
+  stop_loss:
+    type: "percentage"
+    value: 12.0
+    trailing: false
+  take_profit:
+    type: "percentage"
+    value: 60.0
