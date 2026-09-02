@@ -107,14 +107,27 @@ def render_halving_analyzer():
         chart_container = ui.column().classes('w-full bg-[#111827] p-4 rounded-xl border border-[#1e293b] shadow-lg')
 
         # --- PESTAÑAS DE ANÁLISIS CUANTITATIVO ---
-        with ui.tabs().classes('w-full text-slate-300 border-b border-[#1e293b]') as tabs:
-            tab_growth = ui.tab('growth', label='Crecimiento / Decrecimiento por Temporalidad', icon='trending_up')
-            tab_stables = ui.tab('stables', label='Capitalización de Stablecoins por Halving', icon='account_balance_wallet')
-            tab_backtest = ui.tab('backtest', label='Backtesting Cuantitativo (Stablecoins + EMA)', icon='psychology')
-            tab_horizons = ui.tab('horizons', label='Rendimientos por Horizonte', icon='bar_chart')
-            tab_corr = ui.tab('correlation', label='Matriz de Correlación y Similitud', icon='grid_view')
-            tab_decay = ui.tab('decay', label='Decaimiento y Proyecciones', icon='auto_graph')
-            tab_table = ui.tab('table', label='Tabla Cuantitativa Detallada', icon='table_chart')
+        with ui.tabs().props('dense no-caps inline-label narrow-indicator').classes('w-full text-slate-300 font-semibold bg-[#111827] rounded-xl p-1 border border-[#1e293b]') as tabs:
+            tab_growth = ui.tab('growth', label='Crecimiento', icon='trending_up').classes('text-xs px-2.5 py-1.5')
+            tab_growth.tooltip('Crecimiento / Decrecimiento por Temporalidad')
+
+            tab_stables = ui.tab('stables', label='Cap. Stablecoins', icon='account_balance_wallet').classes('text-xs px-2.5 py-1.5')
+            tab_stables.tooltip('Capitalización de Stablecoins por Halving')
+
+            tab_backtest = ui.tab('backtest', label='Backtest Stables + EMA', icon='psychology').classes('text-xs px-2.5 py-1.5')
+            tab_backtest.tooltip('Backtesting Cuantitativo (Stablecoins + EMA)')
+
+            tab_horizons = ui.tab('horizons', label='Horizontes', icon='bar_chart').classes('text-xs px-2.5 py-1.5')
+            tab_horizons.tooltip('Rendimientos por Horizonte Temporal Post-Halving')
+
+            tab_corr = ui.tab('correlation', label='Correlación', icon='grid_view').classes('text-xs px-2.5 py-1.5')
+            tab_corr.tooltip('Matriz de Correlación y Similitud entre Ciclos')
+
+            tab_decay = ui.tab('decay', label='Decaimiento', icon='auto_graph').classes('text-xs px-2.5 py-1.5')
+            tab_decay.tooltip('Modelo de Rendimientos Decrecientes y Proyecciones')
+
+            tab_table = ui.tab('table', label='Tabla Detallada', icon='table_chart').classes('text-xs px-2.5 py-1.5')
+            tab_table.tooltip('Tabla Cuantitativa Detallada de Halvings')
 
         with ui.tab_panels(tabs, value='growth').classes('w-full bg-transparent p-0'):
             with ui.tab_panel('growth'):
@@ -1629,29 +1642,40 @@ def render_halving_analyzer():
         def render_backtest_tab():
             backtest_container.clear()
 
-            # Si no hay resultados calculados previamente, ejecutar backtest inicial
+            # Si no hay resultados calculados previamente, intentar ejecutar backtest inicial
             if bt_state["last_results"] is None:
-                bt_state["last_results"] = bt_engine.run_backtest(
-                    initial_capital=bt_state["initial_capital"],
-                    commission_pct=bt_state["commission_pct"],
-                    slippage_pct=bt_state["slippage_pct"],
-                    ema_fast=bt_state["ema_fast"],
-                    ema_slow=bt_state["ema_slow"],
-                    ema_trend=bt_state["ema_trend"],
-                    trend_mode=bt_state["trend_mode"],
-                    flow_window=bt_state["flow_window"],
-                    z_window=bt_state["z_window"],
-                    z_entry_threshold=bt_state["z_entry_threshold"],
-                    z_exit_threshold=bt_state["z_exit_threshold"],
-                    halving_filter_enabled=bt_state["halving_filter_enabled"],
-                    min_post_halving_days=bt_state["min_post_halving_days"],
-                    max_post_halving_days=bt_state["max_post_halving_days"],
-                    stop_loss_pct=bt_state["stop_loss_pct"],
-                    take_profit_pct=bt_state["take_profit_pct"],
-                    trailing_stop=bt_state["trailing_stop"]
-                )
+                try:
+                    bt_state["last_results"] = bt_engine.run_backtest(
+                        initial_capital=bt_state["initial_capital"],
+                        commission_pct=bt_state["commission_pct"],
+                        slippage_pct=bt_state["slippage_pct"],
+                        ema_fast=bt_state["ema_fast"],
+                        ema_slow=bt_state["ema_slow"],
+                        ema_trend=bt_state["ema_trend"],
+                        trend_mode=bt_state["trend_mode"],
+                        flow_window=bt_state["flow_window"],
+                        z_window=bt_state["z_window"],
+                        z_entry_threshold=bt_state["z_entry_threshold"],
+                        z_exit_threshold=bt_state["z_exit_threshold"],
+                        halving_filter_enabled=bt_state["halving_filter_enabled"],
+                        min_post_halving_days=bt_state["min_post_halving_days"],
+                        max_post_halving_days=bt_state["max_post_halving_days"],
+                        stop_loss_pct=bt_state["stop_loss_pct"],
+                        take_profit_pct=bt_state["take_profit_pct"],
+                        trailing_stop=bt_state["trailing_stop"]
+                    )
+                except Exception as err:
+                    with backtest_container:
+                        with ui.card().classes('w-full bg-[#111827] border border-amber-500/30 p-6 rounded-xl text-center'):
+                            ui.icon('warning', size='2.5rem', color='amber')
+                            ui.label('No se pudieron calcular los resultados iniciales del backtest de Stablecoins').classes('text-base font-bold text-white mt-2')
+                            ui.label(f'{err}').classes('text-xs text-slate-400 mt-1 font-mono')
+                            ui.button('Sincronizar y Reintentar', icon='refresh', on_click=lambda: on_refresh()).props('flat outline text-color=amber-400 size=sm').classes('mt-4 self-center')
+                    return
 
             res = bt_state["last_results"]
+            if not res or "metrics" not in res:
+                return
             m = res["metrics"]
             df_trades = res.get("trades", pd.DataFrame())
 

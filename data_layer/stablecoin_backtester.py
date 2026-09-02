@@ -17,25 +17,68 @@ class StablecoinBacktester:
     basadas en Flujos de Stablecoins, Tendencia EMA y Filtros de Halving.
     """
     def __init__(self, data_dir: Optional[str] = None):
-        self.data_dir = data_dir or os.path.join(os.getcwd(), "data")
+        self.data_dir = data_dir or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
         self.df_merged: Optional[pd.DataFrame] = None
         self._load_datasets()
 
     def _load_datasets(self) -> None:
         """Carga y une los datasets históricos diarios de BTC y Stablecoins."""
-        btc_file = os.path.join(self.data_dir, "btc_daily_historical.csv")
-        stables_file = os.path.join(self.data_dir, "stablecoins_daily_historical.csv")
+        if not os.path.exists(self.data_dir):
+            os.makedirs(self.data_dir, exist_ok=True)
 
-        if not os.path.exists(btc_file) or not os.path.exists(stables_file):
-            logger.warning("Archivos de datos históricos no encontrados en data_dir.")
-            return
+        btc_parquet = os.path.join(self.data_dir, "btc_daily_historical.parquet")
+        btc_csv = os.path.join(self.data_dir, "btc_daily_historical.csv")
+        stables_csv = os.path.join(self.data_dir, "stablecoins_daily_historical.csv")
+        stables_parquet = os.path.join(self.data_dir, "stablecoins_daily_historical.parquet")
+
+        df_btc: Optional[pd.DataFrame] = None
+        if os.path.exists(btc_parquet):
+            try:
+                df_btc = pd.read_parquet(btc_parquet)
+            except Exception as e:
+                logger.warning(f"Error leyendo btc_daily_historical.parquet: {e}")
+
+        if df_btc is None and os.path.exists(btc_csv):
+            try:
+                df_btc = pd.read_csv(btc_csv)
+            except Exception as e:
+                logger.warning(f"Error leyendo btc_daily_historical.csv: {e}")
+
+        if df_btc is None:
+            try:
+                from data_layer.halving_analyzer import BTCHalvingAnalyzer
+                analyzer = BTCHalvingAnalyzer()
+                df_btc = analyzer.fetch_historical_btc_data()
+            except Exception as e:
+                logger.error(f"Error al descargar df_btc: {e}")
+                return
+
+        df_stables: Optional[pd.DataFrame] = None
+        if os.path.exists(stables_csv):
+            try:
+                df_stables = pd.read_csv(stables_csv)
+            except Exception as e:
+                logger.warning(f"Error leyendo stablecoins_daily_historical.csv: {e}")
+
+        if df_stables is None and os.path.exists(stables_parquet):
+            try:
+                df_stables = pd.read_parquet(stables_parquet)
+            except Exception as e:
+                logger.warning(f"Error leyendo stablecoins_daily_historical.parquet: {e}")
+
+        if df_stables is None:
+            try:
+                from data_layer.halving_analyzer import BTCHalvingAnalyzer
+                analyzer = BTCHalvingAnalyzer()
+                df_stables = analyzer.fetch_historical_stablecoin_data()
+            except Exception as e:
+                logger.error(f"Error al descargar df_stables: {e}")
+                return
 
         try:
-            df_btc = pd.read_csv(btc_file)
             df_btc['timestamp'] = pd.to_datetime(df_btc['timestamp'], utc=True)
-
-            df_stables = pd.read_csv(stables_file)
             df_stables['timestamp'] = pd.to_datetime(df_stables['timestamp'], utc=True)
+
             if 'market_cap' in df_stables.columns:
                 df_stables = df_stables.rename(columns={'market_cap': 'stables_mcap'})
 
@@ -55,7 +98,7 @@ class StablecoinBacktester:
             self.df_merged = merged
             logger.info(f"StablecoinBacktester: {len(self.df_merged)} registros diarios cargados con éxito.")
         except Exception as e:
-            logger.error(f"Error cargando y uniendo datasets: {e}")
+            logger.error(f"Error uniendo datasets BTC y Stablecoins: {e}")
 
     def run_backtest(
         self,
