@@ -22,6 +22,7 @@ from .pages.live_monitor_page import render_live_monitor_page
 from .pages.mle_thermometer_page import render_mle_thermometer_page
 from .pages.onchain_analyzer_page import render_onchain_analyzer
 from .pages.halving_analyzer_page import render_halving_analyzer
+from .pages.binance_account_page import render_binance_account_page
 
 def create_gui(app):
     """
@@ -236,6 +237,10 @@ def create_gui(app):
                     btn.classes(replace='w-full justify-start text-left bg-amber-500/20 text-amber-400 font-bold border border-amber-500/50 shadow-sm text-xs py-2.5 px-3 rounded-lg transition-all')
                 else:
                     btn.classes(replace='w-full justify-start text-left text-slate-300 hover:text-white hover:bg-slate-800/80 font-medium text-xs py-2.5 px-3 rounded-lg transition-all border border-transparent')
+            
+            if live_page and hasattr(live_page, 'set_page_active'):
+                live_page.set_page_active(page_name == 'live')
+
             # Persistir la página activa en localStorage del navegador
             ui.run_javascript(f"localStorage.setItem('tqa_active_page', '{page_name}');")
 
@@ -273,6 +278,7 @@ def create_gui(app):
                 menu_item('Filtro MLE', 'thermostat', 'mle')
                 menu_item('Análisis On-Chain', 'currency_exchange', 'onchain')
                 menu_item('Live Monitor', 'play_circle', 'live')
+                menu_item('Cuenta Binance (Exchange)', 'account_balance_wallet', 'binance_account')
 
             # Pie del Drawer Lateral
             with ui.column().classes('w-full gap-2 pt-3 border-t border-[#1e293b]/80 mt-auto'):
@@ -310,8 +316,9 @@ def create_gui(app):
                 
                 def on_go_to_live(strategy_filename):
                     if strategy_filename and live_page:
-                        live_page.selected_strategy = strategy_filename
-                        live_page.strat_select.value = strategy_filename
+                        matching = [b for b in bot_manager.get_all_bots() if strategy_filename in getattr(b, 'strategy_yaml_path', '')]
+                        if matching:
+                            live_page._select_bot(matching[0].bot_id)
                     show_page('live')
 
                 def on_go_to_portfolio_page():
@@ -377,6 +384,9 @@ def create_gui(app):
                 
             with ui.column().classes('w-full h-full') as pages['halving']:
                 render_halving_analyzer()
+
+            with ui.column().classes('w-full h-full') as pages['binance_account']:
+                render_binance_account_page()
                 
         # Restaurar la última página activa desde localStorage (evita volver a builder tras reconexiones)
         async def restore_active_page():

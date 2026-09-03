@@ -1,3 +1,4 @@
+import json
 from nicegui import ui, run
 import pandas as pd
 import numpy as np
@@ -15,8 +16,43 @@ from data_layer.market_data import MarketDataManager, normalize_timeframe
 from backtest_engine.optimizer import run_grid_search, count_combinations, _build_range, run_walk_forward
 from backtest_engine.robustness_analyzer import analyze_robustness
 from sqlalchemy import func
-from data_layer.export_utils import format_date_display, parse_flexible_date
+from data_layer.export_utils import format_date_display, format_dt_display, parse_flexible_date
 
+SAVED_OPTIMIZATIONS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "saved_optimizations.json")
+
+def _load_saved_optimizations() -> dict:
+    if os.path.exists(SAVED_OPTIMIZATIONS_FILE):
+        try:
+            with open(SAVED_OPTIMIZATIONS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+def _save_optimization_entry(name: str, payload: dict) -> str:
+    opts = _load_saved_optimizations()
+    opt_id = f"opt_{int(datetime.now().timestamp() * 1000)}"
+    opts[opt_id] = {
+        "id": opt_id,
+        "name": name,
+        "created_at": datetime.now().isoformat(),
+        "created_at_display": format_dt_display(datetime.now()),
+        "payload": payload
+    }
+    os.makedirs(os.path.dirname(SAVED_OPTIMIZATIONS_FILE), exist_ok=True)
+    with open(SAVED_OPTIMIZATIONS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(opts, f, indent=2, ensure_ascii=False)
+    return opt_id
+
+def _delete_optimization_entry(opt_id: str) -> bool:
+    opts = _load_saved_optimizations()
+    if opt_id in opts:
+        del opts[opt_id]
+        with open(SAVED_OPTIMIZATIONS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(opts, f, indent=2, ensure_ascii=False)
+        return True
+    return False
 
 def _parse_assets(symbol: str) -> tuple[str, str]:
     """Extrae (base_asset, quote_asset) de un string 'BTC/USDT'."""
@@ -117,6 +153,8 @@ def render_optimizer_page(on_go_to_analyzer=None):
                         ui.label('Exploración masiva de parámetros, detección de mesetas óptimas y evaluación de sobreajuste (Overfitting).').classes('text-slate-400 text-[11px] leading-tight')
                 
                 with ui.row().classes('items-center gap-2'):
+                    ui.button('📂 Mis Optimizaciones', icon='folder_open', on_click=lambda: open_saved_optimizations_modal()).props('dense size=sm rounded').classes('bg-blue-600 hover:bg-blue-500 text-white font-bold px-3 py-1 text-xs shadow transition-all')
+                    ui.button('💾 Guardar Resultados', icon='save', on_click=lambda: open_save_optimization_modal()).props('dense size=sm rounded').classes('bg-purple-600 hover:bg-purple-500 text-white font-bold px-3 py-1 text-xs shadow transition-all')
                     if on_go_to_analyzer:
                         ui.button('Ir a Strategy Analyzer', icon='analytics', on_click=lambda: on_go_to_analyzer(state.get('strategy_name'), state.get('symbol'), state.get('timeframe'))) \
                             .props('dense size=sm rounded').classes('bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-3 py-1')
@@ -515,7 +553,191 @@ def render_optimizer_page(on_go_to_analyzer=None):
                         ui.download(csv_str.encode('utf-8'), f"optimizer_{strat_clean}_{state.get('symbol', 'asset').replace('/', '_')}.csv")
                         ui.notify('✅ Archivo CSV generado para descarga', type='positive')
 
+                    ui.button('💾 Guardar Resultados', icon='save', on_click=lambda: open_save_optimization_modal()).props('dense size=sm rounded').classes('bg-purple-600 hover:bg-purple-500 text-white font-bold px-3 py-1 text-xs shadow')
                     ui.button('Exportar CSV', icon='file_download', on_click=_export_csv).props('dense size=sm rounded').classes('bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold px-3 py-1 text-xs shadow border border-slate-700')
+
+            def _populate_table_with_results(results):
+                rows = []
+                for i, r in enumerate(results, 1):
+                    param_str = ' | '.join(f"{k}={v}" for k, v in r.get('params', {}).items())
+                    rows.append({
+                        'rank': i,
+                        'params': param_str,
+                        'raw_params': r.get('params', {}),
+                        'sharpe': r.get('sharpe_ratio', 0),
+                        'cagr': r.get('cagr', 0),
+                        'maxdd': f"{r.get('max_drawdown_pct', 0):.2f}%",
+                        'profit_factor': r.get('profit_factor', 0),
+                        'trades': r.get('total_trades', 0),
+                        'win_rate': f"{r.get('percent_profitable', 0):.2f}%",
+                        'cons_losses': r.get('consecutive_losses', r.get('max_consecutive_losers', 0)),
+                        'final_eq': f"{r.get('final_equity', 0):,.2f}",
+                        'pnl': r.get('net_pnl', 0),
+                    })
+                opt_result_table.rows = rows
+                opt_result_table.update()
+                lbl_res_info.set_text(f"Total: {len(rows):,} configuraciones clasificadas")
+
+            def open_save_optimization_modal():
+                res_list = state.get('last_results', [])
+                if not res_list:
+                    ui.notify('No hay resultados de optimización activos para guardar. Ejecuta una optimización primero.', type='warning')
+                    return
+                    
+                s_name = str(state.get('strategy_name', 'Estrategia')).replace('.yaml', '')
+                sym = str(state.get('symbol', 'BTC/USDT'))
+                tf = str(state.get('timeframe', '1d'))
+                s_date = format_date_display(state.get('start_date')) if state.get('start_date') else "01/01/20"
+                e_date = format_date_display(state.get('end_date')) if state.get('end_date') else format_date_display(datetime.now())
+                
+                best_p = res_list[0].get('params', {}) if res_list else {}
+                if best_p:
+                    p_summary = ", ".join([f"{k}={v}" for k, v in best_p.items()])
+                else:
+                    p_summary = "Grid"
+                
+                default_name = f"OPT - {s_name} - {sym} - {tf} - [{p_summary}] - [{s_date} a {e_date}]"
+                
+                with ui.dialog() as dialog, ui.card().classes('bg-slate-900 border border-slate-700 p-5 rounded-2xl w-[640px] max-w-full shadow-2xl text-white'):
+                    with ui.row().classes('items-center justify-between w-full mb-1'):
+                        with ui.row().classes('items-center gap-2'):
+                            ui.icon('save', color='purple-400', size='24px')
+                            ui.label('Guardar Resultados de Optimización').classes('text-base font-bold text-white')
+                        ui.badge('TIPO: OPTIMIZACIÓN', color='purple-9').props('rounded').classes('text-xs font-bold font-mono px-2 py-0.5')
+                    
+                    ui.label('Guarda la clasificación de combinaciones, mejores parámetros hallados, métricas y configuración completa del backtest.').classes('text-xs text-slate-400 mb-2')
+                    
+                    with ui.row().classes('w-full gap-2 mb-3 bg-slate-950/70 p-2 rounded-lg border border-slate-800 text-[11px] text-slate-300 flex-wrap'):
+                        ui.label(f"Estrategia: {s_name}").classes('font-bold text-purple-300')
+                        ui.label(f"| Activo: {sym} ({tf})").classes('text-slate-400')
+                        ui.label(f"| Rango: {s_date} ➔ {e_date}").classes('text-slate-400')
+                        ui.label(f"| Combos: {len(res_list):,}").classes('text-amber-400 font-mono')
+                    
+                    name_input = ui.input('Nombre / Identificador del Archivo', value=default_name).classes('w-full mb-4').props('outlined dense')
+                    
+                    with ui.row().classes('w-full justify-end gap-2'):
+                        ui.button('Cancelar', on_click=dialog.close).props('flat text-color=grey')
+                        
+                        def do_save():
+                            val_name = name_input.value.strip() or default_name
+                            clean_res = []
+                            for r in res_list[:100]:
+                                clean_res.append({
+                                    'params': r.get('params', {}),
+                                    'sharpe_ratio': r.get('sharpe_ratio'),
+                                    'cagr': r.get('cagr'),
+                                    'max_drawdown_pct': r.get('max_drawdown_pct'),
+                                    'profit_factor': r.get('profit_factor'),
+                                    'total_trades': r.get('total_trades'),
+                                    'percent_profitable': r.get('percent_profitable'),
+                                    'consecutive_losses': r.get('consecutive_losses', 0),
+                                    'final_equity': r.get('final_equity'),
+                                    'net_pnl': r.get('net_pnl'),
+                                })
+                            
+                            payload = {
+                                'file_type': 'OPTIMIZATION_EXPERIMENT',
+                                'strategy_name': state.get('strategy_name'),
+                                'symbol': state.get('symbol'),
+                                'timeframe': state.get('timeframe'),
+                                'parameters': best_p,
+                                'date_range': f"{s_date} a {e_date}",
+                                'start_date': state.get('start_date'),
+                                'end_date': state.get('end_date'),
+                                'capital': state.get('capital'),
+                                'capital_asset': state.get('capital_asset'),
+                                'optimize_metric': state.get('optimize_metric'),
+                                'total_combinations': len(res_list),
+                                'best_params': best_p,
+                                'best_metrics': {
+                                    'sharpe': res_list[0].get('sharpe_ratio'),
+                                    'cagr': res_list[0].get('cagr'),
+                                    'maxdd': res_list[0].get('max_drawdown_pct'),
+                                    'pf': res_list[0].get('profit_factor'),
+                                    'win_rate': res_list[0].get('percent_profitable'),
+                                } if res_list else {},
+                                'results': clean_res,
+                            }
+                            _save_optimization_entry(val_name, payload)
+                            ui.notify(f"✅ Optimización '{val_name}' guardada exitosamente", type="positive")
+                            dialog.close()
+                            
+                        ui.button('Guardar', icon='save', on_click=do_save).classes('bg-purple-600 hover:bg-purple-500 font-bold text-white px-4 rounded-xl')
+                dialog.open()
+
+            def open_saved_optimizations_modal():
+                with ui.dialog() as dialog, ui.card().classes('bg-slate-900 border border-slate-700 p-6 rounded-2xl w-[720px] max-w-full shadow-2xl text-white'):
+                    with ui.row().classes('w-full justify-between items-center mb-3'):
+                        with ui.row().classes('items-center gap-2'):
+                            ui.icon('folder_open', color='purple-400', size='24px')
+                            ui.label('Optimizaciones Guardadas').classes('text-lg font-bold text-white')
+                        ui.button(icon='close', on_click=dialog.close).props('flat round dense')
+                        
+                    list_container = ui.column().classes('w-full gap-3 max-h-[440px] overflow-y-auto')
+                    
+                    def render_list():
+                        list_container.clear()
+                        saved = _load_saved_optimizations()
+                        if not saved:
+                            with list_container:
+                                ui.label('No tienes optimizaciones guardadas todavía. Ejecuta una optimización y guárdala para verla aquí.').classes('text-sm text-slate-400 italic py-6 text-center w-full')
+                            return
+                            
+                        with list_container:
+                            for opt_id, opt_info in sorted(saved.items(), key=lambda x: x[1].get('created_at', ''), reverse=True):
+                                opt_name = opt_info.get('name', 'Sin Nombre')
+                                dt_s = opt_info.get('created_at_display', '')
+                                payload = opt_info.get('payload', {})
+                                strat = payload.get('strategy_name', '')
+                                sym = payload.get('symbol', '')
+                                tf = payload.get('timeframe', '')
+                                combos = payload.get('total_combinations', 0)
+                                best_p = payload.get('best_params', {})
+                                best_m = payload.get('best_metrics', {})
+                                
+                                with ui.card().classes('w-full bg-slate-950/70 border border-slate-800 p-3.5 rounded-xl hover:border-slate-700 transition-all'):
+                                    with ui.row().classes('w-full justify-between items-start gap-2'):
+                                        with ui.column().classes('gap-1 flex-1'):
+                                            with ui.row().classes('items-center gap-2 flex-wrap'):
+                                                ui.label(opt_name).classes('font-bold text-purple-400 text-sm')
+                                                ui.badge(f"{strat} ({sym} {tf})", color='purple-950').props('rounded').classes('text-purple-300 text-[10px]')
+                                                ui.badge(f"{combos} Combinaciones", color='slate-800').props('rounded').classes('text-slate-300 text-[10px]')
+                                            
+                                            ui.label(f"Guardado el: {dt_s}").classes('text-[11px] text-slate-500')
+                                            
+                                            if best_p:
+                                                p_str = ', '.join([f"{k}: {v}" for k, v in best_p.items()])
+                                                ui.label(f"Mejor Configuración: {p_str}").classes('text-[11px] text-amber-300 font-mono')
+                                                
+                                            if best_m:
+                                                sh_val = best_m.get('sharpe') or 0.0
+                                                cagr_val = best_m.get('cagr') or 0.0
+                                                mdd_val = best_m.get('maxdd') or 0.0
+                                                pf_val = best_m.get('pf') or 0.0
+                                                ui.label(f"Sharpe: {sh_val:.2f} | CAGR: {cagr_val:.1f}% | Max DD: {mdd_val:.1f}% | PF: {pf_val:.2f}").classes('text-[11px] text-emerald-400 font-mono')
+                                                
+                                        with ui.row().classes('items-center gap-1.5 self-center'):
+                                            def make_loader(p_load=payload, p_n=opt_name):
+                                                def load_this():
+                                                    state['last_results'] = p_load.get('results', [])
+                                                    _populate_table_with_results(state['last_results'])
+                                                    ui.notify(f"🚀 Optimización '{p_n}' cargada en la tabla", type="positive")
+                                                    dialog.close()
+                                                return load_this
+                                                
+                                            ui.button('Ver Tabla', icon='visibility', on_click=make_loader()).props('size=sm rounded').classes('bg-purple-600 hover:bg-purple-500 font-bold text-white text-xs px-2.5 py-1')
+                                            
+                                            def make_deleter(p_to_del=opt_id, p_n=opt_name):
+                                                def del_this():
+                                                    _delete_optimization_entry(p_to_del)
+                                                    ui.notify(f"🗑️ Optimización '{p_n}' eliminada", type="info")
+                                                    render_list()
+                                                return del_this
+                                                
+                                            ui.button(icon='delete', on_click=make_deleter()).props('flat round size=sm').classes('text-red-400 hover:text-red-300')
+                                            
+                    render_list()
+                dialog.open()
 
             opt_result_cols = [
                 {'name': 'rank',          'label': '#',           'field': 'rank',         'sortable': True,  'align': 'center'},

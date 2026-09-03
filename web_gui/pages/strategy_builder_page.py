@@ -72,7 +72,13 @@ def render_strategy_builder():
             'exit_rules': [],
             'ec_enabled': False,
             'ec_start_dd': '30.0',
-            'ec_stop_dd': '0.0'
+            'ec_stop_dd': '0.0',
+            
+            # Tipos de Órdenes de Ejecución (Por defecto: Señales a MARKET, SL/TP a LIMIT)
+            'entry_order_type': 'MARKET',
+            'exit_order_type': 'MARKET',
+            'sl_order_type': 'LIMIT',
+            'tp_order_type': 'LIMIT'
         }
         
         strategy_files = glob.glob(os.path.join(STRATEGIES_DIR, '*.yaml'))
@@ -161,6 +167,12 @@ def render_strategy_builder():
                 "risk_management": {
                     "take_profit": tp_config,
                     "stop_loss": sl_config
+                },
+                "execution": {
+                    "entry_order_type": state.get('entry_order_type', 'MARKET'),
+                    "exit_order_type": state.get('exit_order_type', 'MARKET'),
+                    "stop_loss_order_type": state.get('sl_order_type', 'LIMIT'),
+                    "take_profit_order_type": state.get('tp_order_type', 'LIMIT')
                 },
                 "entry_conditions": {
                     "logic": "AND",
@@ -531,6 +543,45 @@ def render_strategy_builder():
                                     step=1
                                 ).bind_value(state, 'sl_swing_lookback').classes('flex-1')
                             sl_swing_row.set_visibility(state['sl_type'] == 'swing')
+
+                        # ── TARJETA 3: TIPOS DE ÓRDENES DE EJECUCIÓN ──
+                        with ui.card().classes('w-full shadow-lg border border-purple-900/50 bg-slate-900/80 rounded-xl p-5'):
+                            with ui.row().classes('w-full items-center justify-between border-b border-slate-800 pb-3 mb-3'):
+                                with ui.row().classes('items-center gap-2'):
+                                    ui.icon('tune', size='1.75rem').classes('text-purple-400')
+                                    with ui.column().classes('gap-0'):
+                                        ui.label('Tipos de Órdenes de Ejecución (Execution Types)').classes('text-base font-bold text-white')
+                                        ui.label('Configura el tipo de orden para señales (Market por defecto) y órdenes condicionales (Limit por defecto)').classes('text-[11px] text-slate-400')
+                                ui.badge('DEFAULT: SEÑALES MARKET / SL-TP LIMIT', color='purple-9').props('rounded').classes('text-[10px] font-bold font-mono px-2 py-0.5')
+
+                            with ui.grid(columns=2).classes('w-full gap-4'):
+                                with ui.column().classes('gap-1'):
+                                    ui.label('Orden de Entrada por Señal').classes('text-xs text-slate-400 font-semibold')
+                                    ui.select(
+                                        {'MARKET': '⚡ MARKET (A Mercado)', 'LIMIT': '🎯 LIMIT (Límite al Precio)'},
+                                        value=state['entry_order_type']
+                                    ).bind_value(state, 'entry_order_type').classes('w-full')
+                                
+                                with ui.column().classes('gap-1'):
+                                    ui.label('Orden de Salida por Señal').classes('text-xs text-slate-400 font-semibold')
+                                    ui.select(
+                                        {'MARKET': '⚡ MARKET (A Mercado)', 'LIMIT': '🎯 LIMIT (Límite al Precio)'},
+                                        value=state['exit_order_type']
+                                    ).bind_value(state, 'exit_order_type').classes('w-full')
+
+                                with ui.column().classes('gap-1'):
+                                    ui.label('Orden de Stop Loss (SL)').classes('text-xs text-slate-400 font-semibold')
+                                    ui.select(
+                                        {'LIMIT': '🛡️ LIMIT (Stop Limit - Predeterminado)', 'MARKET': '⚡ MARKET (Stop Market)'},
+                                        value=state['sl_order_type']
+                                    ).bind_value(state, 'sl_order_type').classes('w-full')
+
+                                with ui.column().classes('gap-1'):
+                                    ui.label('Orden de Take Profit (TP)').classes('text-xs text-slate-400 font-semibold')
+                                    ui.select(
+                                        {'LIMIT': '🎯 LIMIT (Take Profit Limit - Predeterminado)', 'MARKET': '⚡ MARKET (Take Profit Market)'},
+                                        value=state['tp_order_type']
+                                    ).bind_value(state, 'tp_order_type').classes('w-full')
 
                 def update_risk_options():
                     opts = [p['name'] for p in state['parameters'] if p['name']]

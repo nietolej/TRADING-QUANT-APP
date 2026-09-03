@@ -92,6 +92,29 @@ def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=Non
                         ui.label('Consulta, evalúa y recupera simulaciones cuantitativas guardadas').classes('text-slate-400 text-[11px] leading-tight')
                 
                 with ui.row().classes('items-center gap-2'):
+                    def _confirm_clear_all():
+                        with ui.dialog() as dlg, ui.card().classes('bg-slate-900 border border-slate-700 p-5 rounded-2xl w-96 text-white'):
+                            ui.label('⚠️ Confirmar Eliminación').classes('text-base font-bold text-rose-400 mb-2')
+                            ui.label('¿Estás seguro de que deseas eliminar TODOS los backtests guardados en el historial? Esta acción no se puede deshacer.').classes('text-xs text-slate-300 mb-4')
+                            with ui.row().classes('w-full justify-end gap-2'):
+                                ui.button('Cancelar', on_click=dlg.close).props('flat text-color=grey')
+                                def _do_clear():
+                                    db = SessionLocal()
+                                    try:
+                                        db.query(BacktestRun).delete()
+                                        db.commit()
+                                        ui.notify('🗑️ Todo el historial de backtests ha sido eliminado', type='positive')
+                                        load_data()
+                                    except Exception as ex:
+                                        db.rollback()
+                                        ui.notify(f'Error al vaciar historial: {ex}', type='negative')
+                                    finally:
+                                        db.close()
+                                    dlg.close()
+                                ui.button('Borrar Todo', icon='delete_forever', on_click=_do_clear).classes('bg-rose-600 hover:bg-rose-500 font-bold text-white px-3 py-1 text-xs rounded-xl')
+                        dlg.open()
+
+                    btn_clear_all = ui.button('Borrar Todo', icon='delete_sweep', on_click=_confirm_clear_all).props('dense size=sm rounded').classes('bg-rose-900/60 hover:bg-rose-700 text-rose-200 border border-rose-700 font-bold px-3 py-1 text-xs shadow transition-all')
                     btn_top_portfolio = ui.button('💼 SIMULAR PORTAFOLIO', icon='pie_chart').props('dense size=sm rounded').classes('bg-blue-600 hover:bg-blue-500 text-white font-bold px-3 py-1 text-xs shadow transition-all')
                     btn_refresh = ui.button('Actualizar Lista', icon='refresh').props('dense size=sm rounded').classes('bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-1 text-xs shadow transition-all')
 

@@ -15,6 +15,41 @@ from data_layer.market_data import MarketDataManager, normalize_timeframe
 from data_layer.storage import SessionLocal, BacktestRun, OHLCV
 from data_layer.export_utils import format_dt_display, format_date_display, parse_flexible_date
 
+SAVED_PORTFOLIOS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "saved_portfolios.json")
+
+def _load_saved_portfolios() -> dict:
+    if os.path.exists(SAVED_PORTFOLIOS_FILE):
+        try:
+            with open(SAVED_PORTFOLIOS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+def _save_portfolio_entry(name: str, payload: dict) -> str:
+    portfolios = _load_saved_portfolios()
+    port_id = f"port_{int(datetime.now().timestamp() * 1000)}"
+    portfolios[port_id] = {
+        "id": port_id,
+        "name": name,
+        "created_at": datetime.now().isoformat(),
+        "created_at_display": format_dt_display(datetime.now()),
+        "payload": payload
+    }
+    os.makedirs(os.path.dirname(SAVED_PORTFOLIOS_FILE), exist_ok=True)
+    with open(SAVED_PORTFOLIOS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(portfolios, f, indent=2, ensure_ascii=False)
+    return port_id
+
+def _delete_portfolio_entry(port_id: str) -> bool:
+    portfolios = _load_saved_portfolios()
+    if port_id in portfolios:
+        del portfolios[port_id]
+        with open(SAVED_PORTFOLIOS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(portfolios, f, indent=2, ensure_ascii=False)
+        return True
+    return False
 
 def _get_currency_symbol(curr_str: str) -> str:
     """Devuelve el símbolo corto de moneda para formatear números."""
@@ -450,7 +485,8 @@ def render_portfolio_page():
                         ui.label('Combina múltiples estrategias cuantitativas y activos con ponderaciones personalizadas, comparativa de HOLD y medición multi-divisa.').classes('text-slate-400 text-xs')
                 
                 with ui.row().classes('items-center gap-2'):
-                    ui.badge('Multi-Estrategia & Multi-Divisa', color='emerald-8').classes('font-bold text-xs px-3 py-1')
+                    ui.button('📂 Mis Portafolios', icon='folder_open', on_click=lambda: open_saved_portfolios_modal()).props('dense size=sm rounded').classes('bg-blue-600 hover:bg-blue-500 text-white font-bold px-3 py-1 text-xs shadow transition-all')
+                    ui.button('💾 Guardar Actual', icon='save', on_click=lambda: open_save_portfolio_modal()).props('dense size=sm rounded').classes('bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-1 text-xs shadow transition-all')
 
         # ── Configuración Global del Portafolio ──
         with ui.card().classes('w-full p-5 mb-4 rounded-2xl border border-slate-800 bg-slate-900/80 shadow-xl backdrop-blur'):
@@ -702,8 +738,158 @@ def render_portfolio_page():
                     refresh_portfolio_items_ui()
                     ui.notify(f"Pesos distribuidos equitativamente ({eq_w}% por estrategia)", type="info")
 
-            ui.button('➕ Agregar Otra Estrategia al Portafolio', on_click=add_portfolio_item).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 px-5 rounded-xl shadow')
-            ui.button('⚖️ Distribuir Capital Equitativamente (100%)', on_click=rebalance_equal_weights).classes('bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-2.5 px-5 rounded-xl border border-slate-700 shadow')
+            def open_save_portfolio_modal(metrics_summary=None):
+                strat_parts = []
+                sym_parts = []
+                tf_parts = []
+                for it in portfolio_state['items']:
+                    s = str(it.get('strategy', 'Estrategia')).replace('.yaml', '')
+                    w = float(it.get('weight_pct', 0))
+                    sym = str(it.get('symbol', 'BTC/USDT'))
+                    tf = str(it.get('timeframe', '1d'))
+                    strat_parts.append(f"{s}({w:.0f}%)")
+                    if sym not in sym_parts: sym_parts.append(sym)
+                    if tf not in tf_parts: tf_parts.append(tf)
+                
+                s_str = " + ".join(strat_parts) if strat_parts else "Portafolio"
+                sym_str = " + ".join(sym_parts) if sym_parts else "Multi-Activo"
+                tf_str = " + ".join(tf_parts) if tf_parts else "Multi-TF"
+                s_date = str(port_start_input.value or '01/01/20')
+                e_date = str(port_end_input.value or format_date_display(datetime.now()))
+                
+                default_name = f"PORTAFOLIO - [{s_str}] - [{sym_str}] - [{tf_str}] - [{s_date} a {e_date}]"
+                
+                with ui.dialog() as dialog, ui.card().classes('bg-slate-900 border border-slate-700 p-5 rounded-2xl w-[660px] max-w-full shadow-2xl text-white'):
+                    with ui.row().classes('items-center justify-between w-full mb-1'):
+                        with ui.row().classes('items-center gap-2'):
+                            ui.icon('save', color='emerald-400', size='24px')
+                            ui.label('Guardar Simulación de Portafolio').classes('text-base font-bold text-white')
+                        ui.badge('TIPO: PORTAFOLIO', color='emerald-9').props('rounded').classes('text-xs font-bold font-mono px-2 py-0.5')
+                        
+                    ui.label('Guarda la composición completa de estrategias, pesos %, activos, temporalidades, parámetros y rango histórico.').classes('text-xs text-slate-400 mb-2')
+                    
+                    with ui.row().classes('w-full gap-2 mb-3 bg-slate-950/70 p-2 rounded-lg border border-slate-800 text-[11px] text-slate-300 flex-wrap'):
+                        ui.label(f"Estrategias: {s_str}").classes('font-bold text-emerald-300')
+                        ui.label(f"| Activos: {sym_str} ({tf_str})").classes('text-slate-400')
+                        ui.label(f"| Rango: {s_date} ➔ {e_date}").classes('text-slate-400')
+                    
+                    name_input = ui.input('Nombre / Identificador del Archivo', value=default_name).classes('w-full mb-4').props('outlined dense')
+                    
+                    with ui.row().classes('w-full justify-end gap-2'):
+                        ui.button('Cancelar', on_click=dialog.close).props('flat text-color=grey')
+                        
+                        def do_save():
+                            val_name = name_input.value.strip() or default_name
+                            payload = {
+                                'file_type': 'PORTFOLIO_SIMULATION',
+                                'portfolio_name': val_name,
+                                'strategies': [it.get('strategy') for it in portfolio_state['items']],
+                                'symbols': sym_parts,
+                                'timeframes': tf_parts,
+                                'items': portfolio_state['items'],
+                                'parameters_by_strategy': {it.get('strategy'): it.get('custom_params', {}) for it in portfolio_state['items']},
+                                'capital': float(port_capital_input.value or 10000.0),
+                                'currency': str(port_currency_select.value or 'USDT (Dólares / Quote)'),
+                                'hold_benchmark': str(port_hold_select.value or 'weighted'),
+                                'account_mode': str(port_acct_mode_select.value or 'spot_cash'),
+                                'date_range': f"{s_date} a {e_date}",
+                                'start_date': s_date,
+                                'end_date': e_date,
+                                'commission_pct': float(port_comm_input.value or 0.1),
+                                'slippage_pct': float(port_slip_input.value or 0.05),
+                                'metrics_summary': metrics_summary,
+                            }
+                            _save_portfolio_entry(val_name, payload)
+                            ui.notify(f"✅ Portafolio '{val_name}' guardado exitosamente", type="positive")
+                            dialog.close()
+                            
+                        ui.button('Guardar', icon='save', on_click=do_save).classes('bg-emerald-600 hover:bg-emerald-500 font-bold text-white px-4 rounded-xl')
+                dialog.open()
+
+            def open_saved_portfolios_modal():
+                with ui.dialog() as dialog, ui.card().classes('bg-slate-900 border border-slate-700 p-6 rounded-2xl w-[700px] max-w-full shadow-2xl text-white'):
+                    with ui.row().classes('w-full justify-between items-center mb-3'):
+                        with ui.row().classes('items-center gap-2'):
+                            ui.icon('folder_open', color='emerald-400', size='24px')
+                            ui.label('Portafolios Guardados').classes('text-lg font-bold text-white')
+                        ui.button(icon='close', on_click=dialog.close).props('flat round dense')
+                        
+                    list_container = ui.column().classes('w-full gap-3 max-h-[440px] overflow-y-auto')
+                    
+                    def render_list():
+                        list_container.clear()
+                        saved = _load_saved_portfolios()
+                        if not saved:
+                            with list_container:
+                                ui.label('No tienes portafolios guardados todavía. Usa el botón "Guardar Portafolio" para crear uno.').classes('text-sm text-slate-400 italic py-6 text-center w-full')
+                            return
+                            
+                        with list_container:
+                            for p_id, p_info in sorted(saved.items(), key=lambda x: x[1].get('created_at', ''), reverse=True):
+                                p_name = p_info.get('name', 'Sin Nombre')
+                                dt_s = p_info.get('created_at_display', '')
+                                payload = p_info.get('payload', {})
+                                items = payload.get('items', [])
+                                cap = payload.get('capital', 1.0)
+                                curr = payload.get('currency', 'USDT')
+                                metrics = payload.get('metrics_summary')
+                                
+                                with ui.card().classes('w-full bg-slate-950/70 border border-slate-800 p-3.5 rounded-xl hover:border-slate-700 transition-all'):
+                                    with ui.row().classes('w-full justify-between items-start gap-2'):
+                                        with ui.column().classes('gap-1 flex-1'):
+                                            with ui.row().classes('items-center gap-2 flex-wrap'):
+                                                ui.label(p_name).classes('font-bold text-emerald-400 text-sm')
+                                                ui.badge(f"{len(items)} Estrategias", color='blue-950').props('rounded').classes('text-blue-300 text-[10px]')
+                                                ui.badge(f"{cap} {curr.split(' ')[0]}", color='slate-800').props('rounded').classes('text-slate-300 text-[10px]')
+                                            
+                                            ui.label(f"Guardado el: {dt_s}").classes('text-[11px] text-slate-500')
+                                            
+                                            strat_badges = []
+                                            for it in items:
+                                                s_lbl = os.path.basename(it.get('strategy', ''))
+                                                strat_badges.append(f"{s_lbl} ({it.get('symbol', '')} {it.get('weight_pct', 0)}%)")
+                                            ui.label(' • '.join(strat_badges)).classes('text-[11px] text-slate-400')
+                                            
+                                            if metrics:
+                                                cagr = metrics.get('cagr', 0.0)
+                                                mdd = metrics.get('max_drawdown_pct', 0.0)
+                                                sr = metrics.get('sharpe_ratio', 0.0)
+                                                ui.label(f"CAGR: {cagr:.1f}% | Max DD: {mdd:.1f}% | Sharpe: {sr:.2f}").classes('text-[11px] text-amber-300 font-mono')
+                                                
+                                        with ui.row().classes('items-center gap-1.5 self-center'):
+                                            def make_loader(p_load=payload, p_n=p_name):
+                                                def load_this():
+                                                    port_capital_input.value = p_load.get('capital', 1.0)
+                                                    port_currency_select.value = p_load.get('currency', 'BTC (Satoshis / Base)')
+                                                    port_hold_select.value = p_load.get('hold_benchmark', 'btc')
+                                                    port_acct_mode_select.value = p_load.get('account_mode', 'spot_cash')
+                                                    port_start_input.value = p_load.get('start_date', '01/01/20')
+                                                    port_end_input.value = p_load.get('end_date', format_date_display(datetime.now()))
+                                                    port_comm_input.value = p_load.get('commission_pct', 0.1)
+                                                    port_slip_input.value = p_load.get('slippage_pct', 0.05)
+                                                    portfolio_state['items'] = p_load.get('items', [])
+                                                    refresh_portfolio_items_ui()
+                                                    ui.notify(f"🚀 Portafolio '{p_n}' cargado en el simulador", type="positive")
+                                                    dialog.close()
+                                                return load_this
+                                                
+                                            ui.button('Cargar', icon='play_arrow', on_click=make_loader()).props('size=sm rounded').classes('bg-emerald-600 hover:bg-emerald-500 font-bold text-white text-xs px-2.5 py-1')
+                                            
+                                            def make_deleter(p_to_del=p_id, p_n=p_name):
+                                                def del_this():
+                                                    _delete_portfolio_entry(p_to_del)
+                                                    ui.notify(f"🗑️ Portafolio '{p_n}' eliminado", type="info")
+                                                    render_list()
+                                                return del_this
+                                                
+                                            ui.button(icon='delete', on_click=make_deleter()).props('flat round size=sm').classes('text-red-400 hover:text-red-300')
+                                            
+                    render_list()
+                dialog.open()
+
+            ui.button('➕ Agregar Otra Estrategia', icon='add', on_click=add_portfolio_item).classes('bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-xl shadow text-xs')
+            ui.button('⚖️ Distribuir Pesos Equitativos (100%)', icon='balance', on_click=rebalance_equal_weights).classes('bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-2 px-4 rounded-xl border border-slate-700 shadow text-xs')
+            ui.button('💾 Guardar Configuración Actual', icon='save', on_click=lambda: open_save_portfolio_modal()).classes('bg-slate-800 hover:bg-slate-700 text-emerald-400 font-bold py-2 px-4 rounded-xl border border-emerald-900 shadow text-xs')
 
         # Action Button
         btn_run_portfolio = ui.button('⚡ EJECUTAR SIMULACIÓN DE PORTAFOLIO COMBINADO').classes('w-full bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold py-4 text-lg rounded-2xl shadow-2xl transition-all')
@@ -825,7 +1011,9 @@ def render_portfolio_page():
                                     with ui.column().classes('gap-0'):
                                         ui.label('Métricas Simultáneas Multi-Divisa (USDT, BTC, ETH)').classes('text-base font-bold text-white')
                                         ui.label('Evaluación cuantitativa del rendimiento y riesgo del portafolio expresado en cada divisa clave').classes('text-xs text-slate-400')
-                                ui.badge('Visión Integral 360°', color='emerald-8').classes('text-xs font-bold px-3 py-1')
+                                with ui.row().classes('items-center gap-2'):
+                                    ui.button('💾 Guardar Portafolio con Resultados', icon='save', on_click=lambda: open_save_portfolio_modal(metrics_summary={'cagr': res.get('cagr'), 'max_drawdown_pct': res.get('max_drawdown_pct'), 'sharpe_ratio': res.get('sharpe_ratio')})).props('dense size=sm rounded').classes('bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-1 text-xs shadow')
+                                    ui.badge('Visión Integral 360°', color='emerald-8').classes('text-xs font-bold px-3 py-1')
 
                             with ui.row().classes('w-full gap-4 flex-wrap'):
                                 # Card USDT

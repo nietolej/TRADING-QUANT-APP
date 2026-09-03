@@ -441,50 +441,107 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                 ui.notify("Ejecuta primero una prueba retrospectiva para guardar sus resultados", type="warning")
                 return
 
-            db = SessionLocal()
-            try:
-                run_id = str(uuid.uuid4())
-                config_json = json.dumps({
-                    'strategy_filename': state.get('strategy_name'),
-                    'strategy_name': state.get('strategy_name'),
-                    'custom_parameters': state.get('custom_parameters', {}),
-                    'sizing_mode': state.get('sizing_mode'),
-                    'commission_pct': state.get('commission_pct'),
-                    'slippage_pct': state.get('slippage_pct'),
-                    'capital': state.get('capital'),
-                    'capital_type': state.get('capital_type')
-                })
-                start_val = metrics.get('start_dt') or state.get('start_date')
-                end_val = metrics.get('end_dt') or state.get('end_date')
-                s_dt = parse_flexible_date(start_val) if start_val else datetime(2020, 1, 1, tzinfo=timezone.utc)
-                e_dt = parse_flexible_date(end_val) if end_val else datetime.now(timezone.utc)
+            s_name = str(state.get('strategy_name', 'Estrategia')).replace('.yaml', '')
+            sym = str(state.get('symbol', 'BTC/USDT'))
+            tf = str(state.get('timeframe', '1d'))
+            params_dict = state.get('custom_parameters', {})
+            p_summary = ", ".join([f"{k}={v}" for k, v in list(params_dict.items())[:3]]) if params_dict else "Parametros_Defecto"
+            
+            start_val = metrics.get('start_dt') or state.get('start_date')
+            end_val = metrics.get('end_dt') or state.get('end_date')
+            s_dt = parse_flexible_date(start_val) if start_val else datetime(2020, 1, 1, tzinfo=timezone.utc)
+            e_dt = parse_flexible_date(end_val) if end_val else datetime.now(timezone.utc)
+            s_date = format_date_display(s_dt)
+            e_date = format_date_display(e_dt)
+            
+            default_name = f"BACKTEST - {s_name} - {sym} - {tf} - [{p_summary}] - [{s_date} a {e_date}]"
+            
+            with ui.dialog() as dialog, ui.card().classes('bg-slate-900 border border-slate-700 p-5 rounded-2xl w-[640px] max-w-full shadow-2xl text-white'):
+                with ui.row().classes('items-center justify-between w-full mb-1'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('save', color='emerald-400', size='24px')
+                        ui.label('Guardar Análisis de Backtest').classes('text-base font-bold text-white')
+                    ui.badge('TIPO: BACKTEST / ANÁLISIS', color='emerald-9').props('rounded').classes('text-xs font-bold font-mono px-2 py-0.5')
+                
+                ui.label('Registra la simulación con sus métricas completas, parámetros exactos y rango de fechas en el historial.').classes('text-xs text-slate-400 mb-2')
+                
+                with ui.row().classes('w-full gap-2 mb-3 bg-slate-950/70 p-2 rounded-lg border border-slate-800 text-[11px] text-slate-300 flex-wrap'):
+                    ui.label(f"Estrategia: {s_name}").classes('font-bold text-emerald-300')
+                    ui.label(f"| Activo: {sym} ({tf})").classes('text-slate-400')
+                    ui.label(f"| Rango: {s_date} ➔ {e_date}").classes('text-slate-400')
+                    if metrics:
+                        cagr_val = metrics.get('cagr', 0.0)
+                        sh_val = metrics.get('sharpe_ratio', 0.0)
+                        ui.label(f"| CAGR: {cagr_val:+.1f}% | Sharpe: {sh_val:.2f}").classes('text-amber-400 font-mono')
+                
+                name_input = ui.input('Nombre / Identificador del Archivo', value=default_name).classes('w-full mb-4').props('outlined dense')
+                
+                with ui.row().classes('w-full justify-end gap-2'):
+                    ui.button('Cancelar', on_click=dialog.close).props('flat text-color=grey')
+                    
+                    def do_save():
+                        val_name = name_input.value.strip() or default_name
+                        db = SessionLocal()
+                        try:
+                            run_id = str(uuid.uuid4())
+                            config_payload = {
+                                'file_type': 'BACKTEST_ANALYSIS',
+                                'record_name': val_name,
+                                'strategy_filename': state.get('strategy_name'),
+                                'strategy_name': state.get('strategy_name'),
+                                'symbol': sym,
+                                'timeframe': tf,
+                                'parameters': params_dict,
+                                'custom_parameters': params_dict,
+                                'date_range': f"{s_date} a {e_date}",
+                                'start_date': s_dt.isoformat(),
+                                'end_date': e_dt.isoformat(),
+                                'sizing_mode': state.get('sizing_mode'),
+                                'commission_pct': state.get('commission_pct'),
+                                'slippage_pct': state.get('slippage_pct'),
+                                'capital': state.get('capital'),
+                                'capital_type': state.get('capital_type'),
+                                'metrics': {
+                                    'cagr': metrics.get('cagr', 0.0),
+                                    'sharpe_ratio': metrics.get('sharpe_ratio', 0.0),
+                                    'max_drawdown_pct': metrics.get('max_drawdown_pct', 0.0),
+                                    'win_rate': metrics.get('win_rate', 0.0),
+                                    'profit_factor': metrics.get('profit_factor', 0.0),
+                                    'total_trades': metrics.get('total_trades', 0),
+                                }
+                            }
+                            config_json = json.dumps(config_payload)
 
-                run_record = BacktestRun(
-                    run_id=run_id,
-                    strategy_name=state.get('strategy_name', 'Estrategia'),
-                    symbol=state.get('symbol', 'BTC/USDT'),
-                    timeframe=state.get('timeframe', '1d'),
-                    start_date=s_dt,
-                    end_date=e_dt,
-                    created_at=datetime.now(timezone.utc),
-                    config_snapshot=config_json,
-                    cagr=metrics.get('cagr', 0.0),
-                    sharpe_ratio=metrics.get('sharpe_ratio', 0.0),
-                    max_drawdown_pct=metrics.get('max_drawdown_pct', 0.0),
-                    win_rate=metrics.get('win_rate', 0.0),
-                    profit_factor=metrics.get('profit_factor', 0.0),
-                    total_trades=metrics.get('total_trades', 0),
-                    percent_profitable=metrics.get('win_rate', 0.0),
-                    average_trade_net_profit=0.0
-                )
-                db.add(run_record)
-                db.commit()
-                ui.notify("💾 ¡Backtest guardado exitosamente en el historial!", type="positive")
-            except Exception as ex:
-                db.rollback()
-                ui.notify(f"Error al guardar backtest: {ex}", type="negative")
-            finally:
-                db.close()
+                            run_record = BacktestRun(
+                                run_id=run_id,
+                                strategy_name=val_name,
+                                symbol=sym,
+                                timeframe=tf,
+                                start_date=s_dt,
+                                end_date=e_dt,
+                                created_at=datetime.now(timezone.utc),
+                                config_snapshot=config_json,
+                                cagr=metrics.get('cagr', 0.0),
+                                sharpe_ratio=metrics.get('sharpe_ratio', 0.0),
+                                max_drawdown_pct=metrics.get('max_drawdown_pct', 0.0),
+                                win_rate=metrics.get('win_rate', 0.0),
+                                profit_factor=metrics.get('profit_factor', 0.0),
+                                total_trades=metrics.get('total_trades', 0),
+                                percent_profitable=metrics.get('win_rate', 0.0),
+                                average_trade_net_profit=0.0
+                            )
+                            db.add(run_record)
+                            db.commit()
+                            ui.notify(f"💾 Backtest '{val_name}' guardado exitosamente", type="positive")
+                            dialog.close()
+                        except Exception as ex:
+                            db.rollback()
+                            ui.notify(f"Error al guardar backtest: {ex}", type="negative")
+                        finally:
+                            db.close()
+                            
+                    ui.button('Guardar', icon='save', on_click=do_save).classes('bg-emerald-600 hover:bg-emerald-500 font-bold text-white px-4 rounded-xl')
+            dialog.open()
 
         # Header Compacto y Optimizado
         with ui.card().classes('w-full bg-slate-900 text-white rounded-xl shadow border border-slate-800 px-4 py-2.5 mb-3'):
@@ -1445,18 +1502,24 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                 cl_stop_input = ui.number('Stop Gain %', value=state['cl_stop'], step=1.0, min=0.0).bind_value(state, 'cl_stop').classes('w-full')
 
 
-        # -- Modo de entrada: Close actual vs Open siguiente --
-        if 'entry_on_next_open' not in state: state['entry_on_next_open'] = False
-        with ui.row().classes('w-full gap-3 items-center mt-2 bg-slate-900/50 p-2.5 rounded-xl border border-slate-800 flex-wrap'):
-            ui.icon('schedule', size='1.2rem').classes('text-sky-400')
-            with ui.column().classes('gap-0 flex-1'):
-                ui.label('Modo de Entrada al Mercado').classes('text-xs font-bold text-slate-200')
-                ui.label('Close Actual: entrada al cierre de la vela de la senal (optimista). Open Siguiente: entrada al open de la proxima vela (mas realista).').classes('text-[10px] text-slate-400')
-            entry_mode_select = ui.select(
-                {False: 'Close de la Vela (Predeterminado)', True: 'Open de la Vela Siguiente (Conservador)'},
-                label='Modo de Entrada',
-                value=state.get('entry_on_next_open', False)
-            ).bind_value(state, 'entry_on_next_open').classes('flex-1 min-w-[280px]')
+        # -- Tipos de Órdenes de Ejecución --
+        if 'entry_order_type' not in state: state['entry_order_type'] = 'MARKET'
+        if 'exit_order_type' not in state: state['exit_order_type'] = 'MARKET'
+        if 'sl_order_type' not in state: state['sl_order_type'] = 'LIMIT'
+        if 'tp_order_type' not in state: state['tp_order_type'] = 'LIMIT'
+
+        with ui.row().classes('w-full gap-3 items-center mt-2 bg-slate-900/60 p-2.5 rounded-xl border border-purple-900/40 flex-wrap'):
+            with ui.row().classes('items-center gap-2 min-w-[200px]'):
+                ui.icon('tune', size='1.2rem').classes('text-purple-400')
+                with ui.column().classes('gap-0'):
+                    ui.label('Tipos de Órdenes').classes('text-xs font-bold text-slate-200')
+                    ui.label('Predeterminado: Señales a Market / SL-TP a Limit').classes('text-[10px] text-slate-400')
+            
+            with ui.grid(columns=4).classes('flex-1 gap-2 min-w-[320px]'):
+                ui.select({'MARKET': '⚡ Entrada: Market', 'LIMIT': '🎯 Entrada: Limit'}, label='Entrada', value=state['entry_order_type']).bind_value(state, 'entry_order_type').classes('w-full text-xs')
+                ui.select({'MARKET': '⚡ Salida: Market', 'LIMIT': '🎯 Salida: Limit'}, label='Salida', value=state['exit_order_type']).bind_value(state, 'exit_order_type').classes('w-full text-xs')
+                ui.select({'LIMIT': '🛡️ SL: Limit (Predet.)', 'MARKET': '⚡ SL: Market'}, label='Stop Loss', value=state['sl_order_type']).bind_value(state, 'sl_order_type').classes('w-full text-xs')
+                ui.select({'LIMIT': '🎯 TP: Limit (Predet.)', 'MARKET': '⚡ TP: Market'}, label='Take Profit', value=state['tp_order_type']).bind_value(state, 'tp_order_type').classes('w-full text-xs')
 
         # -- Nota informativa SL/TP intrabarra --
         with ui.row().classes('w-full items-start gap-2 mt-2 bg-blue-950/30 border border-blue-900/40 rounded-lg p-2.5'):
