@@ -278,7 +278,7 @@ def create_gui(app):
                 menu_item('Filtro MLE', 'thermostat', 'mle')
                 menu_item('Análisis On-Chain', 'currency_exchange', 'onchain')
                 menu_item('Live Monitor', 'play_circle', 'live')
-                menu_item('Cuenta Binance (Exchange)', 'account_balance_wallet', 'binance_account')
+                menu_item('Cartera & Riesgo Binance', 'account_balance_wallet', 'binance_account')
 
             # Pie del Drawer Lateral
             with ui.column().classes('w-full gap-2 pt-3 border-t border-[#1e293b]/80 mt-auto'):

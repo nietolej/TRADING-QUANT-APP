@@ -12,9 +12,13 @@ class BinanceTestnetClient:
     """Cliente unificado para interactuar con Binance (Futures Testnet y Real Mainnet)."""
 
     def __init__(self, use_testnet: bool = False):
-        self.api_key = os.getenv("BINANCE_API_KEY", "").strip()
-        self.api_secret = os.getenv("BINANCE_SECRET_KEY", "").strip()
         self.use_testnet = use_testnet
+        if use_testnet:
+            self.api_key = os.getenv("BINANCE_TESTNET_API_KEY", "").strip() or os.getenv("BINANCE_API_KEY", "").strip()
+            self.api_secret = os.getenv("BINANCE_TESTNET_SECRET_KEY", "").strip() or os.getenv("BINANCE_SECRET_KEY", "").strip()
+        else:
+            self.api_key = os.getenv("BINANCE_REAL_API_KEY", "").strip() or os.getenv("BINANCE_API_KEY", "").strip()
+            self.api_secret = os.getenv("BINANCE_REAL_SECRET_KEY", "").strip() or os.getenv("BINANCE_SECRET_KEY", "").strip()
 
         # Inicialización de cliente Binance con timeout
         self.client = Client(
@@ -25,11 +29,66 @@ class BinanceTestnetClient:
         )
         if use_testnet:
             self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
+        else:
+            self.client.FUTURES_URL = 'https://fapi.binance.com/fapi/v1'
 
     def get_historical_klines(self, symbol: str, interval: str, lookback_str: str):
         """Obtiene velas históricas para inicializar indicadores."""
         binance_symbol = symbol.replace("/", "").upper()
         return self.client.get_historical_klines(binance_symbol, interval, lookback_str)
+
+    def verify_order_status(
+        self,
+        symbol: str,
+        order_id: int,
+        expected_statuses: Optional[List[str]] = None,
+        max_attempts: int = 4,
+        delay_seconds: float = 0.5
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+        """
+        Consulta activamente el estado de una orden en Binance Futures para verificar
+        si fue ejecutada (FILLED) o si falló/fue rechazada (REJECTED, CANCELED, EXPIRED, etc.).
+        
+        Returns:
+            Tuple[is_success, order_dict, error_message]
+        """
+        if expected_statuses is None:
+            expected_statuses = ["FILLED"]
+
+        binance_symbol = symbol.replace("/", "").upper()
+        last_order = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                order_info = self.client.futures_get_order(symbol=binance_symbol, orderId=order_id)
+                last_order = order_info
+                status = str(order_info.get("status", "")).upper()
+
+                if status in expected_statuses:
+                    logger.info("Orden %s verificada exitosamente en estado %s (Intento %d/%d)", order_id, status, attempt, max_attempts)
+                    return True, order_info, None
+
+                # Si está en estado terminal fallido
+                if status in ["REJECTED", "CANCELED", "EXPIRED"]:
+                    err = f"Orden {order_id} no se ejecutó en el exchange. Estado actual: {status}"
+                    logger.warning(err)
+                    return False, order_info, err
+
+                # Si aún está NEW o PARTIALLY_FILLED y esperamos FILLED, esperar antes del siguiente intento
+                if attempt < max_attempts:
+                    time.sleep(delay_seconds)
+
+            except Exception as e:
+                logger.warning("Error consultando estado de orden %s (Intento %d/%d): %s", order_id, attempt, max_attempts, e)
+                if attempt < max_attempts:
+                    time.sleep(delay_seconds)
+                else:
+                    return False, last_order, f"Error consultando orden {order_id}: {e}"
+
+        status = last_order.get("status", "UNKNOWN") if last_order else "UNKNOWN"
+        err = f"La orden {order_id} no alcanzó el estado requerido {expected_statuses} tras {max_attempts} intentos. Estado final: {status}"
+        logger.warning(err)
+        return False, last_order, err
 
     def place_futures_order(
         self,
@@ -37,9 +96,12 @@ class BinanceTestnetClient:
         side: str,
         quantity: float,
         order_type: str = "MARKET",
-        price: Optional[float] = None
+        price: Optional[float] = None,
+        verify_execution: bool = True
     ) -> Tuple[Optional[dict], Optional[str]]:
-        """Envía una orden (MARKET o LIMIT) a Binance Futures Testnet."""
+        """
+        Envía una orden (MARKET o LIMIT) a Binance Futures Testnet y verifica su ejecución en el exchange.
+        """
         if not self.use_testnet:
             return None, "Testnet desactivado en este bot"
         if not self.api_key or not self.api_secret:
@@ -48,9 +110,12 @@ class BinanceTestnetClient:
         binance_symbol = symbol.replace("/", "").upper()
         binance_side = "BUY" if side.lower() == "long" else "SELL"
 
-        qty = round(quantity, 3)
-        if qty < 0.001:
-            qty = 0.001
+        if quantity <= 0:
+            return None, "Cantidad inválida (debe ser mayor a 0)"
+
+        qty = round(quantity, 5)
+        if qty <= 0:
+            qty = quantity
 
         o_type = order_type.upper()
         try:
@@ -67,10 +132,29 @@ class BinanceTestnetClient:
                 params["timeInForce"] = "GTC"
 
             order = self.client.futures_create_order(**params)
-            logger.info("Orden %s enviada a Binance Futures Testnet: %s", o_type, order)
+            order_id = order.get("orderId")
+            initial_status = str(order.get("status", "")).upper()
+            logger.info("Orden %s (%s) creada en Binance Futures. ID: %s, Estado inicial: %s", o_type, binance_side, order_id, initial_status)
+
+            if verify_execution and order_id:
+                # Para órdenes MARKET, esperamos 'FILLED' inmediatamente o en los siguientes milisegundos
+                # Para órdenes LIMIT, 'NEW' o 'PARTIALLY_FILLED' o 'FILLED' son válidos
+                expected = ["FILLED"] if o_type == "MARKET" else ["NEW", "PARTIALLY_FILLED", "FILLED"]
+                
+                if initial_status not in expected:
+                    # Consultar activamente para confirmar si cambió a FILLED
+                    ok, verified_order, v_err = self.verify_order_status(
+                        symbol=binance_symbol, order_id=order_id, expected_statuses=expected, max_attempts=4, delay_seconds=0.5
+                    )
+                    if not ok:
+                        return verified_order or order, v_err or f"Orden rechazada o fallida en Binance (Estado: {initial_status})"
+                    return verified_order, None
+                else:
+                    return order, None
+
             return order, None
         except Exception as e:
-            logger.error("Error enviando orden %s a Binance Futures Testnet: %s", o_type, e)
+            logger.error("Error enviando orden %s a Binance Futures: %s", o_type, e)
             return None, str(e)
 
     def close_futures_position(
@@ -79,9 +163,12 @@ class BinanceTestnetClient:
         side: str,
         quantity: float,
         order_type: str = "MARKET",
-        price: Optional[float] = None
+        price: Optional[float] = None,
+        verify_execution: bool = True
     ) -> Tuple[Optional[dict], Optional[str]]:
-        """Cierra una posición en Binance Futures Testnet con orden contraria (MARKET o LIMIT)."""
+        """
+        Cierra una posición en Binance Futures con orden contraria y verifica su ejecución en el exchange.
+        """
         if not self.use_testnet:
             return None, "Testnet desactivado en este bot"
         if not self.api_key or not self.api_secret:
@@ -90,9 +177,12 @@ class BinanceTestnetClient:
         binance_symbol = symbol.replace("/", "").upper()
         close_side = "SELL" if side.lower() == "long" else "BUY"
 
-        qty = round(quantity, 3)
-        if qty < 0.001:
-            qty = 0.001
+        if quantity <= 0:
+            return None, "Cantidad inválida (debe ser mayor a 0)"
+
+        qty = round(quantity, 5)
+        if qty <= 0:
+            qty = quantity
 
         o_type = order_type.upper()
         try:
@@ -111,10 +201,25 @@ class BinanceTestnetClient:
                     params["type"] = "MARKET"
 
             order = self.client.futures_create_order(**params)
-            logger.info("Cierre de posición %s enviado a Binance Futures Testnet: %s", o_type, order)
+            order_id = order.get("orderId")
+            initial_status = str(order.get("status", "")).upper()
+            logger.info("Cierre de posición %s (%s) enviado a Binance Futures. ID: %s, Estado inicial: %s", o_type, close_side, order_id, initial_status)
+
+            if verify_execution and order_id:
+                expected = ["FILLED"] if params["type"] == "MARKET" else ["NEW", "PARTIALLY_FILLED", "FILLED"]
+                if initial_status not in expected:
+                    ok, verified_order, v_err = self.verify_order_status(
+                        symbol=binance_symbol, order_id=order_id, expected_statuses=expected, max_attempts=4, delay_seconds=0.5
+                    )
+                    if not ok:
+                        return verified_order or order, v_err or f"Orden de cierre rechazada o no completada (Estado: {initial_status})"
+                    return verified_order, None
+                else:
+                    return order, None
+
             return order, None
         except Exception as e:
-            logger.error("Error cerrando posición en Binance Futures Testnet: %s", e)
+            logger.error("Error cerrando posición en Binance Futures: %s", e)
             return None, str(e)
 
     def place_futures_sl_tp(
@@ -187,6 +292,25 @@ class BinanceTestnetClient:
                 results["errors"].append(f"SL Error: {e}")
 
         return results
+
+    def get_open_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Devuelve todas las posiciones actualmente abiertas con positionAmt != 0 en Binance Futures."""
+        if not self.api_key or not self.api_secret:
+            return []
+        try:
+            params = {}
+            if symbol:
+                params["symbol"] = symbol.replace("/", "").upper()
+            pos_list = self.client.futures_position_information(**params)
+            open_pos = []
+            for p in pos_list:
+                amt = float(p.get("positionAmt", 0.0))
+                if amt != 0:
+                    open_pos.append(p)
+            return open_pos
+        except Exception as e:
+            logger.debug("Error obteniendo posiciones abiertas de Binance: %s", e)
+            return []
 
     def cancel_all_open_orders(self, symbol: str) -> Tuple[bool, Optional[str]]:
         """Cancela todas las órdenes abiertas estándar y condicionales (algo SL/TP) pendientes en Binance Futures."""
@@ -432,10 +556,17 @@ class BinanceTestnetClient:
         - Órdenes abiertas pendientes
         - Historial reciente de órdenes ejecutadas
         """
+        if use_testnet:
+            api_k = os.getenv("BINANCE_TESTNET_API_KEY", "").strip() or os.getenv("BINANCE_API_KEY", "").strip()
+            api_s = os.getenv("BINANCE_TESTNET_SECRET_KEY", "").strip() or os.getenv("BINANCE_SECRET_KEY", "").strip()
+        else:
+            api_k = os.getenv("BINANCE_REAL_API_KEY", "").strip() or os.getenv("BINANCE_API_KEY", "").strip()
+            api_s = os.getenv("BINANCE_REAL_SECRET_KEY", "").strip() or os.getenv("BINANCE_SECRET_KEY", "").strip()
+
         data: Dict[str, Any] = {
             "network": "Binance Futures Testnet" if use_testnet else "Binance Real (Mainnet)",
             "use_testnet": use_testnet,
-            "api_keys_configured": bool(self.api_key and self.api_secret),
+            "api_keys_configured": bool(api_k and api_s),
             "total_wallet_balance": 0.0,
             "total_unrealized_pnl": 0.0,
             "available_balance": 0.0,
@@ -449,13 +580,16 @@ class BinanceTestnetClient:
         }
 
         if not data["api_keys_configured"]:
-            data["error"] = "No se han configurado BINANCE_API_KEY o BINANCE_SECRET_KEY en el archivo .env"
+            env_name = "BINANCE_TESTNET_API_KEY" if use_testnet else "BINANCE_REAL_API_KEY"
+            data["error"] = f"No se han configurado {env_name} o BINANCE_API_KEY en el archivo .env"
             return data
 
         try:
-            client = Client(self.api_key, self.api_secret, testnet=use_testnet, requests_params={'timeout': 10})
+            client = Client(api_k, api_s, testnet=use_testnet, requests_params={'timeout': 10})
             if use_testnet:
                 client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
+            else:
+                client.FUTURES_URL = 'https://fapi.binance.com/fapi/v1'
 
             # 1. Información de la cuenta de Futuros
             acc = client.futures_account()
@@ -536,6 +670,7 @@ class BinanceTestnetClient:
                         "symbol": sym,
                         "symbol_display": f"{sym} Perp",
                         "side": "LONG" if amt > 0 else "SHORT",
+                        "positionAmt": amt,
                         "amount": abs(amt),
                         "size_display": f"{abs(amt):.4f} {sym.replace('USDT', '').replace('USDC', '')}",
                         "entry_price": entry,

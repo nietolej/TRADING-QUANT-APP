@@ -238,31 +238,33 @@ class PaperTrader:
                             leverage = int(p_info.get('leverage', 1))
 
                             with self._lock:
-                                self.binance_position_info = {
-                                    "symbol": binance_symbol,
-                                    "amount": pos_amt,
-                                    "abs_amount": abs(pos_amt),
-                                    "entry_price": entry_p,
-                                    "break_even_price": be_p,
-                                    "mark_price": mark_p,
-                                    "unrealized_pnl": unrealized_pnl,
-                                    "initial_margin": im,
-                                    "leverage": leverage,
-                                    "margin_type": p_info.get('marginType', 'cross'),
-                                }
-
                                 # Si hay posición abierta en Binance y el bot tiene posición interna, sincronizar
                                 if pos_amt != 0:
+                                    self.binance_position_info = {
+                                        "symbol": binance_symbol,
+                                        "amount": pos_amt,
+                                        "abs_amount": abs(pos_amt),
+                                        "entry_price": entry_p,
+                                        "break_even_price": be_p,
+                                        "mark_price": mark_p,
+                                        "unrealized_pnl": unrealized_pnl,
+                                        "initial_margin": im,
+                                        "leverage": leverage,
+                                        "margin_type": p_info.get('marginType', 'cross'),
+                                    }
                                     self._had_open_binance_pos = True
                                     if self.position:
                                         if entry_p > 0:
                                             self.position.entry_price = entry_p
                                         self.position.quantity = abs(pos_amt)
 
-                                # Si se cerró en Binance (ej. TP/SL o cierre manual en la web de Binance)
+                                # Si se cerró en Binance (ej. TP/SL, liquidación o cierre manual en la web de Binance)
                                 elif pos_amt == 0:
-                                    if self.position and (time.time() - self._last_open_ts > 6):
+                                    self.binance_position_info = None
+                                    if self.position:
                                         exit_p = mark_p if mark_p > 0 else (self.current_bid if self.position.side == 'long' else self.current_ask)
+                                        if exit_p <= 0:
+                                            exit_p = self.position.entry_price
                                         self._close_position(exit_p, datetime.now(), reason="BINANCE_EXCHANGE_CLOSED")
 
                                     # Cancelar cualquier orden condicional huérfana restante si no hay posición abierta en el exchange
@@ -270,7 +272,7 @@ class PaperTrader:
                                         try:
                                             self._client.cancel_all_open_orders(binance_symbol)
                                             if getattr(self, '_had_open_binance_pos', False):
-                                                self._notify("🧹 Órdenes condicionales restantes (SL/TP) canceladas en Binance.")
+                                                self._notify("🧹 Posición cerrada en Binance. Órdenes condicionales (SL/TP) canceladas.")
                                         except Exception:
                                             pass
                                         self._had_open_binance_pos = False
@@ -557,12 +559,37 @@ class PaperTrader:
                 return "TP"
         return None
 
+    def _trigger_critical_order_alert(self, title: str, details: Optional[dict] = None):
+        """Genera una alerta crítica inmediata en logs, estado, Telegram y UI."""
+        details = details or {}
+        logger.error("[PaperTrader %s] 🚨 CRITICAL ALERT: %s | Detalles: %s", self.name, title, details)
+        
+        err_detail = details.get("error") or details.get("status") or ""
+        alert_msg = f"🚨 {title}" + (f" ({err_detail})" if err_detail else "")
+        self.status_message = alert_msg
+        
+        # Enviar notificación local y marcar como alerta
+        self._notify(alert_msg, is_alert=True)
+
+        # Telegram Alert enriquecida
+        if self.telegram:
+            try:
+                alert_payload = {
+                    "Bot": self.name,
+                    "Símbolo": self.symbol,
+                    "Timeframe": self.timeframe,
+                    **details
+                }
+                self.telegram.send_alert(title, alert_payload, is_critical=True)
+            except Exception as e:
+                logger.warning("Error enviando alerta de Telegram: %s", e)
+
     # ──────────────────────────────────────────────────────────────
     # Gestión de posiciones
     # ──────────────────────────────────────────────────────────────
 
     def _open_position(self, side: str, price: float, ts):
-        """Abre una nueva posición y calcula SL/TP."""
+        """Abre una nueva posición y calcula SL/TP, verificando ejecución en el exchange si aplica."""
         risk_mgr = self.strategy.risk_manager
 
         # Si la divisa de la cuenta es BTC o la base del par
@@ -589,9 +616,6 @@ class PaperTrader:
             self._notify(f"⚠️ Saldo insuficiente ({self.current_balance:.4f} {self.currency}) para abrir posición.")
             return
 
-        self.position = Position(side, price, quantity, ts)
-        self._last_open_ts = time.time()
-
         # Calcular SL y TP usando compute_sl_tp del RiskManager
         idx = len(self.klines_df) - 1
         try:
@@ -600,62 +624,95 @@ class PaperTrader:
             sl_price = price * (0.98 if side == "long" else 1.02)
             tp_price = price * (1.04 if side == "long" else 0.96)
 
-        self.position.sl_price = sl_price
-        self.position.tp_price = tp_price
-
         entry_type = self.order_types.get("entry", "MARKET").upper()
         sl_type = self.order_types.get("stop_loss", "LIMIT").upper()
         tp_type = self.order_types.get("take_profit", "LIMIT").upper()
+
+        # Envío y comprobación activa de ejecución en Binance Futures si está configurado
+        if self.use_testnet:
+            if not self._client:
+                self._trigger_critical_order_alert(
+                    "Modo Binance activo pero sin cliente conectado",
+                    {"error": "Cliente Binance no inicializado", "side": side, "symbol": self.symbol}
+                )
+                return
+
+            # Cancelar previamente cualquier orden residual antes de abrir una nueva
+            self._client.cancel_all_open_orders(self.symbol)
+
+            ext_order, err = self._client.place_futures_order(
+                self.symbol, side, quantity, order_type=entry_type, price=price, verify_execution=True
+            )
+
+            # Validar si se ejecutó en el exchange
+            if not ext_order or err:
+                self._trigger_critical_order_alert(
+                    f"Orden de Entrada {side.upper()} NO ejecutada en Binance",
+                    {
+                        "Tipo Orden": entry_type,
+                        "Lado": side.upper(),
+                        "Cantidad": f"{quantity:.4f}",
+                        "Precio Señal": f"{price:.2f}",
+                        "error": err or "Orden rechazada o no completada por Binance"
+                    }
+                )
+                # Abortar apertura para evitar desincronización con el exchange
+                return
+
+            order_status = str(ext_order.get("status", "")).upper()
+            if order_status not in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
+                self._trigger_critical_order_alert(
+                    f"Orden de Entrada {side.upper()} en estado inválido ({order_status})",
+                    {
+                        "ID Orden": ext_order.get("orderId"),
+                        "Estado": order_status,
+                        "error": f"Estado no operable: {order_status}"
+                    }
+                )
+                return
+
+            # Sincronizar precio real de ejecución (avgPrice) si Binance lo reporta
+            real_fill_price = float(ext_order.get('avgPrice', 0.0) or 0.0)
+            if real_fill_price > 0:
+                price = real_fill_price
+
+            real_qty = float(ext_order.get('executedQty', 0.0) or 0.0)
+            if real_qty > 0:
+                quantity = real_qty
+
+            self._notify(
+                f"⚡ ORDEN ENTRADA ({entry_type}) EJECUTADA en Binance | "
+                f"Precio Fill: {price:.2f} | ID: {ext_order.get('orderId')} | Status: {order_status}"
+            )
+
+            # Colocar órdenes condicionales de TP y SL en Binance (Por defecto LIMIT)
+            sl_tp_res = self._client.place_futures_sl_tp(
+                self.symbol, side, quantity,
+                sl_price=sl_price, tp_price=tp_price,
+                sl_order_type=sl_type, tp_order_type=tp_type
+            )
+            if sl_tp_res.get("tp_order"):
+                self._notify(f"🎯 ORDEN TP ({tp_type}) COLOCADA @ {tp_price:.4f} | ID: {sl_tp_res['tp_order'].get('orderId')}")
+            if sl_tp_res.get("sl_order"):
+                self._notify(f"🛡️ ORDEN SL ({sl_type}) COLOCADA @ {sl_price:.4f} | ID: {sl_tp_res['sl_order'].get('orderId')}")
+            if sl_tp_res.get("errors"):
+                self._notify(f"⚠️ Binance SL/TP Info: {', '.join(sl_tp_res['errors'])}")
+
+        # Abrir posición interna una vez confirmada la ejecución
+        self.position = Position(side, price, quantity, ts)
+        self.position.sl_price = sl_price
+        self.position.tp_price = tp_price
+        self._last_open_ts = time.time()
 
         self._notify(
             f"🟢 OPEN {side.upper()} [{entry_type}] | Precio: {price:.4f} | "
             f"SL ({sl_type}): {sl_price:.4f} | TP ({tp_type}): {tp_price:.4f} | "
             f"Qty: {quantity:.6f} {base_asset}"
         )
-
-        # Envío a Binance Futures Testnet si está configurado
-        if self.use_testnet:
-            if self._client:
-                # Cancelar previamente cualquier orden residual antes de abrir una nueva
-                self._client.cancel_all_open_orders(self.symbol)
-
-                ext_order, err = self._client.place_futures_order(
-                    self.symbol, side, quantity, order_type=entry_type, price=price
-                )
-                if ext_order:
-                    # Sincronizar precio real de ejecución (avgPrice) si Binance lo reporta
-                    real_fill_price = float(ext_order.get('avgPrice', 0.0) or 0.0)
-                    if real_fill_price > 0:
-                        self.position.entry_price = real_fill_price
-                        price = real_fill_price
-
-                    real_qty = float(ext_order.get('executedQty', 0.0) or 0.0)
-                    if real_qty > 0:
-                        self.position.quantity = real_qty
-                        quantity = real_qty
-
-                    self._notify(f"⚡ ORDEN ENTRADA ({entry_type}) EJECUTADA | Precio Fill: {price:.2f} | ID: {ext_order.get('orderId')} | Status: {ext_order.get('status')}")
-                elif err:
-                    self._notify(f"⚠️ Binance Testnet Entrada: {err}")
-
-                # Colocar órdenes condicionales de TP y SL en Binance (Por defecto LIMIT)
-                sl_tp_res = self._client.place_futures_sl_tp(
-                    self.symbol, side, quantity,
-                    sl_price=sl_price, tp_price=tp_price,
-                    sl_order_type=sl_type, tp_order_type=tp_type
-                )
-                if sl_tp_res.get("tp_order"):
-                    self._notify(f"🎯 ORDEN TP ({tp_type}) COLOCADA @ {tp_price:.4f} | ID: {sl_tp_res['tp_order'].get('orderId')}")
-                if sl_tp_res.get("sl_order"):
-                    self._notify(f"🛡️ ORDEN SL ({sl_type}) COLOCADA @ {sl_price:.4f} | ID: {sl_tp_res['sl_order'].get('orderId')}")
-                if sl_tp_res.get("errors"):
-                    self._notify(f"⚠️ Binance SL/TP Info: {', '.join(sl_tp_res['errors'])}")
-            else:
-                self._notify("⚠️ Modo Binance Testnet activo pero sin cliente conectado.")
         self._save_state()
 
     def _close_position(self, price: float, ts, reason: str):
-        """Cierra la posición abierta, calcula PNL y persiste el trade."""
+        """Cierra la posición abierta, calcula PNL y persiste el trade, verificando ejecución en el exchange."""
         pos = self.position
         if not pos:
             return
@@ -664,7 +721,7 @@ class PaperTrader:
         is_base_currency = (self.currency.upper() == base_asset)
         exit_type = self.order_types.get("exit", "MARKET").upper()
 
-        # Cierre en Binance Futures Testnet si está configurado
+        # Cierre en Binance Futures si está configurado
         if self.use_testnet:
             if self._client:
                 # 1. CANCELAR TODAS LAS ÓRDENES CONDICIONALES PENDIENTES PRIMERO (SL / TP)
@@ -673,22 +730,36 @@ class PaperTrader:
                 # 2. Si el cierre no se originó directamente en el exchange, enviar orden de salida a Binance
                 if reason != "BINANCE_EXCHANGE_CLOSED":
                     close_order, err = self._client.close_futures_position(
-                        self.symbol, pos.side, pos.quantity, order_type=exit_type, price=price
+                        self.symbol, pos.side, pos.quantity, order_type=exit_type, price=price, verify_execution=True
                     )
-                    if close_order:
+                    if close_order and not err:
                         # Sincronizar precio real de salida (avgPrice) si Binance lo reporta
                         real_fill_price = float(close_order.get('avgPrice', 0.0) or 0.0)
                         if real_fill_price > 0:
                             price = real_fill_price
 
-                        self._notify(f"⚡ CIERRE ({exit_type}) EJECUTADO | Precio Fill: {price:.2f} | ID: {close_order.get('orderId')} | Status: {close_order.get('status')}")
-                    elif err:
-                        self._notify(f"⚠️ Binance Testnet Cierre: {err}")
+                        self._notify(
+                            f"⚡ CIERRE ({exit_type}) EJECUTADO en Binance | "
+                            f"Precio Fill: {price:.2f} | ID: {close_order.get('orderId')} | Status: {close_order.get('status')}"
+                        )
+                    else:
+                        self._trigger_critical_order_alert(
+                            f"Fallo al ejecutar orden de CIERRE ({exit_type}) en Binance",
+                            {
+                                "Lado Cierre": "SELL" if pos.side == "long" else "BUY",
+                                "Cantidad": f"{pos.quantity:.4f}",
+                                "Razón": reason,
+                                "error": err or "Orden de cierre rechazada o no confirmada por Binance"
+                            }
+                        )
 
                 # 3. Cancelación de seguridad posterior para asegurar 0 órdenes residuales
                 self._client.cancel_all_open_orders(self.symbol)
             else:
-                self._notify("⚠️ Modo Binance Testnet activo pero sin cliente conectado.")
+                self._trigger_critical_order_alert(
+                    "Modo Binance activo pero sin cliente conectado al cerrar",
+                    {"error": "Cliente Binance no inicializado", "symbol": self.symbol}
+                )
 
         # PNL en cotizada (ej. USDT)
         if pos.side == "long":
@@ -832,16 +903,20 @@ class PaperTrader:
     # Notificaciones
     # ──────────────────────────────────────────────────────────────
 
-    def _notify(self, message: str = ""):
+    def _notify(self, message: str = "", is_alert: bool = False):
         if message:
-            logger.info("[PaperTrader %s] %s", self.name, message)
+            if is_alert:
+                logger.error("[PaperTrader %s] %s", self.name, message)
+            else:
+                logger.info("[PaperTrader %s] %s", self.name, message)
+
             timestamp_str = datetime.now().strftime("%H:%M:%S")
             self.log_lines.append(f"[{timestamp_str}] {message}")
             if len(self.log_lines) > 100:
                 self.log_lines = self.log_lines[-100:]
 
-            # Telegram (no-op si no está configurado)
-            if self.telegram:
+            # Telegram (solo si no es alerta crítica manejada por _trigger_critical_order_alert)
+            if self.telegram and not is_alert:
                 try:
                     self.telegram.send_message(f"<b>[PaperTrader - {self.name}]</b>\n{message}")
                 except Exception:
@@ -867,10 +942,13 @@ class PaperTrader:
                 "current_bid": getattr(self, 'current_bid', 0.0),
                 "current_ask": getattr(self, 'current_ask', 0.0),
                 "current_bid_qty": getattr(self, 'current_bid_qty', 0.0),
-                "current_ask_qty": getattr(self, 'current_ask_qty', 0.0)
+                "current_ask_qty": getattr(self, 'current_ask_qty', 0.0),
+                "is_alert": is_alert
             }
             if message:
                 state["message"] = message
+            if is_alert:
+                state["alert"] = message
                 
             try:
                 self.update_callback(state)

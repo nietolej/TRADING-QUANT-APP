@@ -3,12 +3,17 @@ import asyncio
 import os
 import glob
 import yaml
+import logging
+from datetime import datetime
 import pandas as pd
 import plotly.graph_objects as go
 from typing import Optional, Dict, Any
 
 from execution_engine.bot_manager import bot_manager, BotManager
 from execution_engine.paper_trader import PaperTrader
+from execution_engine.binance_client import BinanceTestnetClient
+
+logger = logging.getLogger("LiveMonitorPage")
 
 
 def _extract_base_currency(symbol: str) -> str:
@@ -74,6 +79,7 @@ class LiveMonitorPage:
         if is_active:
             self._last_chart_kline_len = -1
             self._last_trades_hash = None
+            asyncio.create_task(self._sync_exchange_positions(show_notify=False))
             self._refresh_ui_elements(force_dom_rebuild=True)
 
     def _get_available_strategies(self) -> list[str]:
@@ -153,6 +159,99 @@ class LiveMonitorPage:
         self._last_chart_kline_len = -1
         self._refresh_ui_elements(force_dom_rebuild=True)
 
+    def _get_selected_bot(self) -> Optional[PaperTrader]:
+        """Devuelve la instancia de PaperTrader del bot actualmente seleccionado."""
+        if not self.selected_bot_id:
+            return None
+        return bot_manager.get_bot(self.selected_bot_id)
+
+    async def _submit_manual_order(self):
+        """Ejecuta una orden manual directa hacia Binance Futures y verifica su llenado."""
+        sym = str(getattr(self, 'manual_symbol_input', None).value or '').strip().upper() if hasattr(self, 'manual_symbol_input') else 'BTC/USDT'
+        side = str(getattr(self, 'manual_side_select', None).value or 'BUY').upper() if hasattr(self, 'manual_side_select') else 'BUY'
+        o_type = str(getattr(self, 'manual_type_select', None).value or 'MARKET').upper() if hasattr(self, 'manual_type_select') else 'MARKET'
+        qty = float(getattr(self, 'manual_qty_input', None).value or 0.0) if hasattr(self, 'manual_qty_input') else 0.001
+        price = float(getattr(self, 'manual_price_input', None).value or 0.0) if (hasattr(self, 'manual_price_input') and o_type == 'LIMIT') else None
+
+        if not sym or qty <= 0:
+            ui.notify("Por favor especifica un símbolo y cantidad válida (>0)", type='warning')
+            return
+
+        bot = self._get_selected_bot()
+        use_testnet = bot.use_testnet if bot else True
+        client = BinanceTestnetClient(use_testnet=use_testnet)
+        
+        ui.notify(f"Enviando orden manual {side} {qty} {sym} [{o_type}] a Binance...", type='info')
+        loop = asyncio.get_event_loop()
+        order, err = await loop.run_in_executor(
+            None,
+            lambda: client.place_futures_order(
+                symbol=sym,
+                side="long" if side == "BUY" else "short",
+                quantity=qty,
+                order_type=o_type,
+                price=price,
+                verify_execution=True
+            )
+        )
+
+        if order and not err:
+            ui.notify(
+                f"✅ Orden {side} {qty} {sym} EJECUTADA exitosamente en Binance | ID: {order.get('orderId')} | Status: {order.get('status')}",
+                type='positive',
+                close_button=True,
+                duration=7000
+            )
+            if bot and bot.symbol.replace('/', '').upper() == sym.replace('/', '').upper():
+                bot._notify(f"⚡ Orden manual ({side} {o_type}) completada en Binance | ID: {order.get('orderId')}")
+            self._refresh_ui_elements(force_dom_rebuild=False)
+        else:
+            err_msg = err or (f"Estado no completado: {order.get('status')}" if order else "Desconocido")
+            ui.notify(
+                f"🚨 ALERTA: Orden manual {side} {sym} RECHAZADA en Binance: {err_msg}",
+                type='negative',
+                close_button=True,
+                duration=10000
+            )
+            if bot:
+                bot._trigger_critical_order_alert(
+                    f"Orden Manual {side} RECHAZADA en Binance",
+                    {"Símbolo": sym, "Cantidad": qty, "Tipo": o_type, "error": err_msg}
+                )
+
+    async def _trigger_deliberate_rejection_test(self):
+        """Envía intencionalmente una orden inválida a Binance para comprobar el sistema de alertas críticas."""
+        bot = self._get_selected_bot()
+        use_testnet = bot.use_testnet if bot else True
+        client = BinanceTestnetClient(use_testnet=use_testnet)
+
+        ui.notify("🧪 Iniciando prueba de rechazo deliberado con símbolo inválido...", type='info')
+        loop = asyncio.get_event_loop()
+        order, err = await loop.run_in_executor(
+            None,
+            lambda: client.place_futures_order(
+                symbol="INVALID_COIN/USDT",
+                side="long",
+                quantity=0.001,
+                order_type="MARKET",
+                verify_execution=True
+            )
+        )
+
+        err_msg = err or "Rechazada por Binance"
+        ui.notify(
+            f"🚨 [TEST ALERTA] Binance rechazó la orden correctamente: {err_msg}",
+            type='negative',
+            close_button=True,
+            duration=12000
+        )
+        if bot:
+            bot._trigger_critical_order_alert(
+                "Orden de Prueba RECHAZADA por Binance (Test)",
+                {"Símbolo": "INVALID_COIN/USDT", "Tipo": "MARKET", "error": err_msg}
+            )
+        self._refresh_ui_elements(force_dom_rebuild=False)
+
     def _stop_bot(self, bot_id: str):
         bot = bot_manager.get_bot(bot_id)
         if bot and bot.is_running:
@@ -177,16 +276,16 @@ class LiveMonitorPage:
             return
             
         ui.notify(f"Enviando orden de cierre a Binance Futures para {bot.symbol}...", type='info')
-        order, err = bot._client.close_futures_position(bot.symbol, side, amt, order_type="MARKET")
-        if order:
-            ui.notify(f"✅ Posición cerrada en Binance Futures | ID: {order.get('orderId')}", type='positive')
+        order, err = bot._client.close_futures_position(bot.symbol, side, amt, order_type="MARKET", verify_execution=True)
+        if order and not err:
+            ui.notify(f"✅ Posición cerrada en Binance Futures | ID: {order.get('orderId')} | Status: {order.get('status', 'FILLED')}", type='positive')
             bot._client.cancel_all_open_orders(bot.symbol)
             bot.binance_position_info = None
             if bot.position:
                 bot._close_position(float(order.get('avgPrice', bot.current_bid)), datetime.now(), reason="MANUAL_BINANCE_CLOSE")
             self._refresh_ui_elements(force_dom_rebuild=False)
         else:
-            ui.notify(f"❌ Error cerrando posición en Binance: {err}", type='negative')
+            ui.notify(f"🚨 Error cerrando posición en Binance: {err}", type='negative', close_button=True, duration=8000)
 
     async def _clean_orphan_orders(self):
         """Cancela todas las órdenes condicionales pendientes en Binance para el símbolo del bot."""
@@ -201,6 +300,107 @@ class LiveMonitorPage:
             self._refresh_ui_elements(force_dom_rebuild=False)
         else:
             ui.notify(f"⚠️ Error al cancelar órdenes: {err}", type='warning')
+
+    async def _sync_exchange_positions(self, show_notify: bool = False):
+        """Sincroniza el estado real de posiciones y órdenes con Binance Futures para todos los bots (incluso si están detenidos)."""
+        if getattr(self, '_is_syncing_exchange', False):
+            return
+        self._is_syncing_exchange = True
+        try:
+            has_api_key = bool(os.getenv("BINANCE_API_KEY", "").strip())
+            if not has_api_key:
+                if show_notify:
+                    ui.notify("API Key de Binance no configurada en .env", type='warning')
+                return
+
+            client = BinanceTestnetClient(use_testnet=True)
+            loop = asyncio.get_event_loop()
+            open_positions = await loop.run_in_executor(None, client.get_open_positions)
+
+            # Mapear posiciones abiertas por símbolo Binance (ej: 'BTCUSDT')
+            open_by_symbol = {
+                str(p.get('symbol', '')).upper(): p 
+                for p in (open_positions or []) 
+                if float(p.get('positionAmt', 0.0)) != 0
+            }
+
+            bots = bot_manager.get_all_bots()
+            changes_detected = False
+
+            for b in bots:
+                if not b.use_testnet:
+                    continue
+                binance_sym = b.symbol.replace('/', '').upper()
+                p_info = open_by_symbol.get(binance_sym)
+
+                if p_info:
+                    amt = float(p_info.get('positionAmt', 0.0))
+                    entry_p = float(p_info.get('entryPrice', 0.0))
+                    unrealized_pnl = float(p_info.get('unRealizedProfit', 0.0))
+                    mark_p = float(p_info.get('markPrice', 0.0))
+                    be_p = float(p_info.get('breakEvenPrice', 0.0) or entry_p)
+                    im = float(p_info.get('isolatedMargin', 0.0) or p_info.get('initialMargin', 0.0))
+                    leverage = int(p_info.get('leverage', 1))
+
+                    new_info = {
+                        "symbol": binance_sym,
+                        "amount": amt,
+                        "abs_amount": abs(amt),
+                        "entry_price": entry_p,
+                        "break_even_price": be_p,
+                        "mark_price": mark_p,
+                        "unrealized_pnl": unrealized_pnl,
+                        "initial_margin": im,
+                        "leverage": leverage,
+                        "margin_type": p_info.get('marginType', 'cross'),
+                    }
+                    if getattr(b, 'binance_position_info', None) != new_info:
+                        b.binance_position_info = new_info
+                        changes_detected = True
+
+                    if b.position:
+                        if entry_p > 0 and b.position.entry_price != entry_p:
+                            b.position.entry_price = entry_p
+                            changes_detected = True
+                        if b.position.quantity != abs(amt):
+                            b.position.quantity = abs(amt)
+                            changes_detected = True
+                else:
+                    # No hay posición abierta en Binance para este símbolo
+                    had_info = getattr(b, 'binance_position_info', None) is not None
+                    had_pos = b.position is not None
+
+                    if had_info or had_pos:
+                        b.binance_position_info = None
+                        if b.position:
+                            exit_p = b.position.entry_price
+                            if b.klines_df is not None and not b.klines_df.empty:
+                                exit_p = float(b.klines_df['close'].iloc[-1])
+                            b._close_position(exit_p, datetime.now(), reason="BINANCE_EXCHANGE_CLOSED")
+                            changes_detected = True
+
+                        # Limpiar órdenes condicionales huérfanas si existían
+                        try:
+                            if b._client:
+                                await loop.run_in_executor(None, lambda: b._client.cancel_all_open_orders(b.symbol))
+                        except Exception:
+                            pass
+                        changes_detected = True
+
+            if changes_detected:
+                self._last_trades_hash = None
+                self._refresh_ui_elements(force_dom_rebuild=False)
+
+            if show_notify:
+                count = len(open_by_symbol)
+                ui.notify(f"🔄 Sincronización completada con Binance: {count} posición(es) activa(s)", type='positive')
+
+        except Exception as e:
+            logger.warning(f"Error sincronizando posiciones con Binance: {e}")
+            if show_notify:
+                ui.notify(f"⚠️ Error al sincronizar con Binance: {e}", type='negative')
+        finally:
+            self._is_syncing_exchange = False
 
     async def _start_all_bots(self):
         bots = [b for b in bot_manager.get_all_bots() if not b.is_running]
@@ -964,6 +1164,11 @@ class LiveMonitorPage:
         if not getattr(self, 'is_active_page', False):
             return
         try:
+            self._sync_counter = getattr(self, '_sync_counter', 0) + 1
+            # Sincronizar activamente con Binance cada 2 ciclos (~3 segundos)
+            if self._sync_counter % 2 == 0:
+                asyncio.create_task(self._sync_exchange_positions(show_notify=False))
+
             self._refresh_ui_elements(force_dom_rebuild=False)
         except Exception:
             pass
@@ -1378,23 +1583,6 @@ class LiveMonitorPage:
                         'raw_pnl': raw_upnl,
                         'bot_name': b.name
                     })
-                elif b.position and b.use_testnet:
-                    # Fallback si aún no respondió el endpoint pero el bot tiene posición
-                    pos = b.position
-                    b_df = b.klines_df
-                    cur_p = b_df['close'].iloc[-1] if (b_df is not None and not b_df.empty) else pos.entry_price
-                    pnl_u = (cur_p - pos.entry_price) * pos.quantity if pos.side == 'long' else (pos.entry_price - cur_p) * pos.quantity
-                    b_rows.append({
-                        'symbol_display': f"{b.symbol.replace('/', '')} Perp (Syncing)",
-                        'size_display': f"{'📈 LONG' if pos.side == 'long' else '📉 SHORT'} {pos.quantity:.4f} {b.symbol.split('/')[0]}",
-                        'entry_price': f"{pos.entry_price:,.2f}",
-                        'break_even': f"{pos.entry_price:,.2f}",
-                        'mark_price': f"{cur_p:,.2f}",
-                        'margin_display': "En sincronización",
-                        'pnl_display': f"{pnl_u:+,.2f} USDT",
-                        'raw_pnl': pnl_u,
-                        'bot_name': b.name
-                    })
 
             self.binance_pos_grid.options['rowData'] = b_rows
             self.binance_pos_grid.update()
@@ -1402,13 +1590,13 @@ class LiveMonitorPage:
             if hasattr(self, 'binance_pos_badge'):
                 if has_any_binance_pos:
                     self.binance_pos_badge.set_text(f"🔴 Posición Activa en Exchange ({len(b_rows)})")
-                    self.binance_pos_badge.classes('bg-green-950 text-green-400 font-bold', remove='bg-yellow-950 text-yellow-300')
+                    self.binance_pos_badge.classes('bg-green-950 text-green-400 font-bold', remove='bg-yellow-950 text-yellow-300 bg-gray-800 text-gray-400')
                 else:
                     self.binance_pos_badge.set_text("⚪ Sin Posición en Exchange")
-                    self.binance_pos_badge.classes('bg-gray-800 text-gray-400', remove='bg-green-950 text-green-400')
+                    self.binance_pos_badge.classes('bg-gray-800 text-gray-400', remove='bg-green-950 text-green-400 bg-yellow-950 text-yellow-300')
 
             if hasattr(self, 'btn_close_binance_pos'):
-                self.btn_close_binance_pos.set_visibility(bool(getattr(bot, 'binance_position_info', None) and bot.binance_position_info.get('amount') != 0) or bool(bot.position and bot.use_testnet))
+                self.btn_close_binance_pos.set_visibility(has_any_binance_pos)
 
         # 6. Tabla de Trades (AG Grid) - Con Fecha/Hora en formato ultra compacto
         if hasattr(self, 'trades_grid'):
@@ -1689,6 +1877,11 @@ class LiveMonitorPage:
                     with ui.row().classes('items-center gap-2'):
                         self.binance_pos_badge = ui.badge('Sincronizando...', color='yellow-950').props('rounded').classes('text-yellow-300 text-xs font-bold')
                         ui.button(
+                            '🔄 Sincronizar Ahora',
+                            icon='sync',
+                            on_click=lambda: self._sync_exchange_positions(show_notify=True)
+                        ).props('dense outline color=yellow-400').classes('text-xs text-yellow-400 hover:bg-yellow-500/20 font-bold px-2.5 py-1 rounded shadow').tooltip('Fuerza la consulta en vivo de posiciones a Binance Futures')
+                        ui.button(
                             'Limpiar Órdenes Huérfanas',
                             icon='cleaning_services',
                             on_click=self._clean_orphan_orders
@@ -1718,6 +1911,24 @@ class LiveMonitorPage:
                         'text-red-400 font-semibold':   'data.raw_pnl < 0',
                     }
                 }).classes('h-28 text-white')
+
+            # ── TARJETA: TERMINAL DE ÓRDENES MANUALES & TEST DE ALERTAS ──
+            with ui.card().classes('bg-gray-900 p-4 w-full mb-6 rounded-xl border border-slate-700/80 shadow-xl'):
+                with ui.row().classes('w-full justify-between items-center mb-3 flex-wrap gap-2'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('touch_app', color='yellow-400', size='22px')
+                        ui.label('Terminal de Órdenes Manuales & Test de Alertas en Binance').classes('text-base font-bold text-white')
+                    ui.label('Envía órdenes manuales al exchange o simula un rechazo para verificar las alertas 🚨').classes('text-xs text-gray-400 italic')
+
+                with ui.row().classes('w-full gap-3 items-end flex-wrap bg-gray-950 p-3 rounded-lg border border-gray-800'):
+                    self.manual_symbol_input = ui.input(label='Símbolo', value='BTC/USDT').classes('w-36')
+                    self.manual_side_select = ui.select({'BUY': '🟢 BUY (Long)', 'SELL': '🔴 SELL (Short)'}, value='BUY', label='Lado').classes('w-36')
+                    self.manual_type_select = ui.select({'MARKET': '⚡ MARKET', 'LIMIT': '🎯 LIMIT'}, value='MARKET', label='Tipo').classes('w-32')
+                    self.manual_qty_input = ui.number(label='Cantidad', value=0.001, min=0.00001, step=0.001).classes('w-28')
+                    self.manual_price_input = ui.number(label='Precio Limit', value=0.0).classes('w-32')
+                    
+                    ui.button('🚀 Enviar a Binance', icon='send', on_click=self._submit_manual_order).props('dense').classes('bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold px-4 py-2.5 rounded-lg shadow')
+                    ui.button('🧪 Test: Rechazo Deliberado', icon='warning', on_click=self._trigger_deliberate_rejection_test).props('dense outline color=amber-400').classes('text-xs text-amber-400 hover:bg-amber-500/20 font-bold px-3 py-2.5 rounded-lg').tooltip('Envía una orden intencionalmente inválida a Binance para probar la alerta roja y Telegram')
 
             # Gráfico Plotly
             with ui.card().classes('bg-gray-900 p-4 w-full mb-6 rounded-xl border border-gray-700/80'):
