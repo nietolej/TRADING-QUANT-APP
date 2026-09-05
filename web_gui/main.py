@@ -23,6 +23,7 @@ from .pages.mle_thermometer_page import render_mle_thermometer_page
 from .pages.onchain_analyzer_page import render_onchain_analyzer
 from .pages.halving_analyzer_page import render_halving_analyzer
 from .pages.binance_account_page import render_binance_account_page
+from .components.api_credentials_dialog import open_api_credentials_dialog
 
 def create_gui(app):
     """
@@ -279,6 +280,13 @@ def create_gui(app):
                 menu_item('Análisis On-Chain', 'currency_exchange', 'onchain')
                 menu_item('Live Monitor', 'play_circle', 'live')
                 menu_item('Cartera & Riesgo Binance', 'account_balance_wallet', 'binance_account')
+                
+                # Acceso rápido para Conectar APIs
+                ui.button(
+                    'Conectar APIs Exchange', 
+                    icon='vpn_key', 
+                    on_click=lambda: open_api_credentials_dialog()
+                ).props('flat no-caps align=left').classes('w-full justify-start text-left text-amber-400 hover:text-amber-300 hover:bg-amber-500/15 font-bold text-xs py-2 px-3 rounded-lg transition-all border border-amber-500/25 mt-1')
 
             # Pie del Drawer Lateral
             with ui.column().classes('w-full gap-2 pt-3 border-t border-[#1e293b]/80 mt-auto'):
@@ -288,7 +296,11 @@ def create_gui(app):
                         ui.label('EN LÍNEA').classes('text-[11px] font-bold text-emerald-400 font-mono')
                     ui.label('v2.0').classes('text-xs text-slate-500 font-mono font-bold')
                 
-                ui.button('Configuración', icon='settings').props('flat no-caps align=left').classes('w-full justify-start text-left text-slate-300 hover:text-white hover:bg-slate-800/80 font-medium text-xs py-2 px-3 rounded-lg transition-all')
+                ui.button(
+                    'Configuración / APIs', 
+                    icon='settings',
+                    on_click=lambda: open_api_credentials_dialog()
+                ).props('flat no-caps align=left').classes('w-full justify-start text-left text-slate-300 hover:text-white hover:bg-slate-800/80 font-medium text-xs py-2 px-3 rounded-lg transition-all')
 
 
         # Contenedor principal

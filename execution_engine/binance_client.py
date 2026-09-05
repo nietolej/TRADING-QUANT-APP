@@ -8,12 +8,174 @@ from binance.client import Client
 load_dotenv()
 logger = logging.getLogger("BinanceClient")
 
+import dotenv
+
+def get_binance_credentials() -> Dict[str, Any]:
+    """Obtiene las credenciales actuales cargadas en variables de entorno."""
+    is_testnet = os.getenv("BINANCE_TESTNET", "true").lower() == "true"
+    
+    testnet_k = os.getenv("BINANCE_TESTNET_API_KEY", "").strip()
+    testnet_s = os.getenv("BINANCE_TESTNET_SECRET_KEY", "").strip()
+    if not testnet_k and is_testnet:
+        testnet_k = os.getenv("BINANCE_API_KEY", "").strip()
+    if not testnet_s and is_testnet:
+        testnet_s = os.getenv("BINANCE_SECRET_KEY", "").strip()
+
+    real_k = os.getenv("BINANCE_REAL_API_KEY", "").strip()
+    real_s = os.getenv("BINANCE_REAL_SECRET_KEY", "").strip()
+    if not real_k and not is_testnet:
+        real_k = os.getenv("BINANCE_API_KEY", "").strip()
+    if not real_s and not is_testnet:
+        real_s = os.getenv("BINANCE_SECRET_KEY", "").strip()
+
+    return {
+        "testnet_api_key": testnet_k,
+        "testnet_secret_key": testnet_s,
+        "real_api_key": real_k,
+        "real_secret_key": real_s,
+        "default_network": "testnet" if is_testnet else "mainnet",
+        "has_testnet": bool(testnet_k and testnet_s),
+        "has_real": bool(real_k and real_s)
+    }
+
+def save_binance_credentials(
+    testnet_key: str = "",
+    testnet_secret: str = "",
+    real_key: str = "",
+    real_secret: str = "",
+    default_network: str = "testnet"
+) -> Tuple[bool, Optional[str]]:
+    """Guarda las claves API en el archivo .env y las actualiza inmediatamente en os.environ."""
+    root_dir = os.path.dirname(os.path.dirname(__file__))
+    env_path = os.path.join(root_dir, ".env")
+    
+    if not os.path.exists(env_path):
+        try:
+            with open(env_path, "w", encoding="utf-8") as f:
+                f.write("# Archivo de entorno\n")
+        except Exception as e:
+            return False, f"No se pudo crear el archivo .env: {e}"
+
+    try:
+        t_key = testnet_key.strip()
+        t_sec = testnet_secret.strip()
+        r_key = real_key.strip()
+        r_sec = real_secret.strip()
+
+        # Guardar en .env y os.environ
+        if t_key:
+            dotenv.set_key(env_path, "BINANCE_TESTNET_API_KEY", t_key)
+            os.environ["BINANCE_TESTNET_API_KEY"] = t_key
+        if t_sec:
+            dotenv.set_key(env_path, "BINANCE_TESTNET_SECRET_KEY", t_sec)
+            os.environ["BINANCE_TESTNET_SECRET_KEY"] = t_sec
+
+        if r_key:
+            dotenv.set_key(env_path, "BINANCE_REAL_API_KEY", r_key)
+            os.environ["BINANCE_REAL_API_KEY"] = r_key
+        if r_sec:
+            dotenv.set_key(env_path, "BINANCE_REAL_SECRET_KEY", r_sec)
+            os.environ["BINANCE_REAL_SECRET_KEY"] = r_sec
+
+        is_testnet = (default_network.lower() == "testnet")
+        dotenv.set_key(env_path, "BINANCE_TESTNET", "true" if is_testnet else "false")
+        os.environ["BINANCE_TESTNET"] = "true" if is_testnet else "false"
+
+        # Mantener BINANCE_API_KEY y BINANCE_SECRET_KEY sincronizadas con la red activa
+        active_key = t_key if is_testnet else r_key
+        active_secret = t_sec if is_testnet else r_sec
+        if active_key:
+            dotenv.set_key(env_path, "BINANCE_API_KEY", active_key)
+            os.environ["BINANCE_API_KEY"] = active_key
+        if active_secret:
+            dotenv.set_key(env_path, "BINANCE_SECRET_KEY", active_secret)
+            os.environ["BINANCE_SECRET_KEY"] = active_secret
+
+        return True, None
+    except Exception as e:
+        logger.error("Error al guardar credenciales en .env: %s", e)
+        return False, f"Error al guardar credenciales en .env: {e}"
+
+def verify_binance_credentials(
+    use_testnet: bool, 
+    api_key: Optional[str] = None, 
+    api_secret: Optional[str] = None
+) -> Dict[str, Any]:
+    """Valida la conectividad, ping y autenticación de credenciales sin colocar órdenes."""
+    t0 = time.time()
+    network_label = "Binance Futures Testnet" if use_testnet else "Binance Real (Mainnet)"
+    
+    key = (api_key or "").strip()
+    sec = (api_secret or "").strip()
+    
+    if not key or not sec:
+        creds = get_binance_credentials()
+        if use_testnet:
+            key = creds["testnet_api_key"]
+            sec = creds["testnet_secret_key"]
+        else:
+            key = creds["real_api_key"]
+            sec = creds["real_secret_key"]
+
+    if not key or not sec:
+        return {
+            "success": False,
+            "network": network_label,
+            "latency_ms": 0,
+            "error": f"Claves no ingresadas. Por favor ingresa API Key y Secret Key para {network_label}."
+        }
+
+    try:
+        client = Client(key, sec, testnet=use_testnet, requests_params={'timeout': 8})
+        if use_testnet:
+            client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
+        else:
+            client.FUTURES_URL = 'https://fapi.binance.com/fapi/v1'
+
+        # 1. Ping
+        client.futures_ping()
+        latency = int((time.time() - t0) * 1000)
+
+        # 2. Consultar cuenta de futuros para verificar permisos y saldo
+        acc = client.futures_account()
+        wallet_bal = float(acc.get('totalWalletBalance', 0.0))
+        avail_bal = float(acc.get('availableBalance', 0.0))
+        can_trade = bool(acc.get('canTrade', True))
+
+        return {
+            "success": True,
+            "network": network_label,
+            "latency_ms": latency,
+            "wallet_balance": wallet_bal,
+            "available_balance": avail_bal,
+            "can_trade": can_trade,
+            "error": None
+        }
+    except Exception as e:
+        latency = int((time.time() - t0) * 1000)
+        err_msg = str(e)
+        if "-2015" in err_msg:
+            err_msg = "Clave API inválida, restricción de IP o faltan permisos de Futuros (Error -2015)."
+        elif "-1021" in err_msg:
+            err_msg = "Desincronización de reloj del sistema con el servidor de Binance (Error -1021)."
+        elif "-2014" in err_msg:
+            err_msg = "Formato de API-key inválido (Error -2014)."
+        return {
+            "success": False,
+            "network": network_label,
+            "latency_ms": latency,
+            "error": err_msg
+        }
+
 class BinanceTestnetClient:
     """Cliente unificado para interactuar con Binance (Futures Testnet y Real Mainnet)."""
 
-    def __init__(self, use_testnet: bool = False):
+    def __init__(self, use_testnet: bool = False, api_key: Optional[str] = None, api_secret: Optional[str] = None):
         self.use_testnet = use_testnet
-        if use_testnet:
+        if api_key is not None and api_secret is not None:
+            self.api_key = api_key.strip()
+            self.api_secret = api_secret.strip()
+        elif use_testnet:
             self.api_key = os.getenv("BINANCE_TESTNET_API_KEY", "").strip() or os.getenv("BINANCE_API_KEY", "").strip()
             self.api_secret = os.getenv("BINANCE_TESTNET_SECRET_KEY", "").strip() or os.getenv("BINANCE_SECRET_KEY", "").strip()
         else:

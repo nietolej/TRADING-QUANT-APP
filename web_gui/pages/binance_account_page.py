@@ -5,8 +5,13 @@ from typing import Dict, Any, Optional, List
 from nicegui import ui
 import plotly.graph_objects as go
 
-from execution_engine.binance_client import BinanceTestnetClient
+from execution_engine.binance_client import (
+    BinanceTestnetClient,
+    get_binance_credentials,
+    verify_binance_credentials,
+)
 from analytics.portfolio_risk_analyzer import PortfolioRiskAnalyzer
+from web_gui.components.api_credentials_dialog import open_api_credentials_dialog
 
 
 def _format_time(ts) -> str:
@@ -79,6 +84,13 @@ class BinanceAccountPage:
                         icon='refresh', 
                         on_click=self._refresh_account_data_async
                     ).classes('bg-gray-800 hover:bg-gray-700 text-white font-bold text-xs px-3 py-2 rounded-xl shadow border border-gray-700')
+
+                    # Botón para Conectar / Configurar APIs
+                    ui.button(
+                        '🔑 Conectar APIs (Test & Real)', 
+                        icon='vpn_key', 
+                        on_click=lambda: open_api_credentials_dialog(on_saved_callback=self._refresh_account_data_async)
+                    ).classes('bg-gradient-to-r from-amber-500 to-yellow-400 hover:from-amber-400 hover:to-yellow-300 text-black font-extrabold text-xs px-3 py-2 rounded-xl shadow-lg border border-amber-300/40 transition-all')
 
             # ──────────────────────────────────────────────────────────────
             # 2. KPIs de Alto Nivel de la Cartera y Exposición
@@ -273,22 +285,62 @@ class BinanceAccountPage:
                 }).classes('h-40 text-white')
 
             # ──────────────────────────────────────────────────────────────
-            # 8. Diagnóstico de Conexión y Credenciales Separadas
+            # 8. Centro de Conexión y Estado de APIs de Exchange (Testnet & Real)
             # ──────────────────────────────────────────────────────────────
-            with ui.card().classes('bg-gray-900/80 p-4 rounded-xl border border-gray-800 w-full shadow'):
-                with ui.row().classes('w-full justify-between items-center flex-wrap gap-3'):
-                    with ui.column().classes('gap-1'):
-                        with ui.row().classes('items-center gap-2'):
-                            ui.icon('vpn_key', color='yellow-400', size='20px')
-                            self.cred_title_label = ui.label('Credenciales API Activas:').classes('text-xs font-bold text-gray-300')
-                        self.cred_info_label = ui.label('Cargando...').classes('font-mono text-xs text-gray-400')
+            with ui.card().classes('bg-gray-900/90 p-5 rounded-2xl border border-gray-800 w-full shadow-xl'):
+                with ui.row().classes('w-full justify-between items-center mb-4 flex-wrap gap-2'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('hub', color='yellow-400', size='24px')
+                        ui.label('Centro de Conexión de APIs de Exchange (Testnet & Real)').classes('text-lg font-bold text-white font-heading')
                     
-                    with ui.row().classes('gap-2 items-center'):
-                        ui.button(
-                            '🧪 Test Diagnóstico de Conexión', 
-                            icon='speed', 
-                            on_click=self._run_network_diagnostic
-                        ).props('dense outline color=yellow-400').classes('text-xs text-yellow-400 hover:bg-yellow-500/20 px-3 py-1.5 rounded-lg')
+                    ui.button(
+                        '⚙️ Configurar / Editar Claves de API', 
+                        icon='vpn_key', 
+                        on_click=lambda: open_api_credentials_dialog(on_saved_callback=self._refresh_account_data_async)
+                    ).classes('bg-amber-500 hover:bg-amber-400 text-black font-extrabold text-xs px-3 py-2 rounded-xl shadow border border-amber-400/40 transition-all')
+
+                with ui.grid(columns=2).classes('w-full gap-4'):
+                    # Tarjeta Testnet
+                    with ui.card().classes('bg-gray-950 p-4 rounded-xl border border-gray-800 flex flex-col justify-between gap-3'):
+                        with ui.row().classes('w-full justify-between items-center'):
+                            with ui.row().classes('items-center gap-2'):
+                                ui.icon('science', color='amber-400', size='20px')
+                                ui.label('Binance Futures Testnet (Demo)').classes('text-sm font-bold text-amber-400')
+                            self.badge_testnet_status = ui.badge('Verificando...', color='gray-800').classes('text-[11px] font-bold px-2 py-0.5 rounded')
+                        
+                        with ui.column().classes('gap-1 text-xs'):
+                            self.label_testnet_key = ui.label('API Key: Cargando...').classes('font-mono text-gray-300')
+                            self.label_testnet_secret = ui.label('Secret: Cargando...').classes('font-mono text-gray-400')
+                            ui.label('Endpoint: testnet.binancefuture.com').classes('text-[10px] text-gray-500 font-mono')
+                        
+                        with ui.row().classes('w-full justify-between items-center pt-2 border-t border-gray-900'):
+                            self.label_testnet_diag_res = ui.label('').classes('text-xs font-mono')
+                            self.btn_test_testnet_quick = ui.button(
+                                '🧪 Probar Testnet',
+                                icon='speed',
+                                on_click=lambda: self._test_network_quick(True)
+                            ).props('dense outline color=amber-400').classes('text-xs text-amber-400 px-3 py-1.5 rounded-lg')
+
+                    # Tarjeta Real
+                    with ui.card().classes('bg-gray-950 p-4 rounded-xl border border-gray-800 flex flex-col justify-between gap-3'):
+                        with ui.row().classes('w-full justify-between items-center'):
+                            with ui.row().classes('items-center gap-2'):
+                                ui.icon('public', color='blue-400', size='20px')
+                                ui.label('Binance Real (Mainnet)').classes('text-sm font-bold text-blue-400')
+                            self.badge_real_status = ui.badge('Verificando...', color='gray-800').classes('text-[11px] font-bold px-2 py-0.5 rounded')
+                        
+                        with ui.column().classes('gap-1 text-xs'):
+                            self.label_real_key = ui.label('API Key: Cargando...').classes('font-mono text-gray-300')
+                            self.label_real_secret = ui.label('Secret: Cargando...').classes('font-mono text-gray-400')
+                            ui.label('Endpoint: fapi.binance.com').classes('text-[10px] text-gray-500 font-mono')
+                        
+                        with ui.row().classes('w-full justify-between items-center pt-2 border-t border-gray-900'):
+                            self.label_real_diag_res = ui.label('').classes('text-xs font-mono')
+                            self.btn_test_real_quick = ui.button(
+                                '🌐 Probar Real',
+                                icon='speed',
+                                on_click=lambda: self._test_network_quick(False)
+                            ).props('dense outline color=blue-400').classes('text-xs text-blue-400 px-3 py-1.5 rounded-lg')
 
             # Refresco periódico cada 3 segundos
             ui.timer(0.2, self._refresh_account_data_async, once=True)
@@ -338,18 +390,32 @@ class BinanceAccountPage:
         self.is_loading = False
 
     def _update_ui_with_account_data(self, data: Dict[str, Any], risk: Dict[str, Any]):
-        # Actualizar información de credenciales
-        use_test = (self.selected_network == "testnet")
-        if use_test:
-            k = os.getenv("BINANCE_TESTNET_API_KEY", "").strip() or os.getenv("BINANCE_API_KEY", "").strip()
-            s = os.getenv("BINANCE_TESTNET_SECRET_KEY", "").strip() or os.getenv("BINANCE_SECRET_KEY", "").strip()
-            self.cred_title_label.set_text('Credenciales API Activas (Binance Futures Testnet):')
-            self.cred_info_label.set_text(f"API Key: {_obfuscate_key(k)} | Secret: {_obfuscate_key(s)} | Endpoint: testnet.binancefuture.com")
-        else:
-            k = os.getenv("BINANCE_REAL_API_KEY", "").strip() or os.getenv("BINANCE_API_KEY", "").strip()
-            s = os.getenv("BINANCE_REAL_SECRET_KEY", "").strip() or os.getenv("BINANCE_SECRET_KEY", "").strip()
-            self.cred_title_label.set_text('Credenciales API Activas (Binance Real / Mainnet):')
-            self.cred_info_label.set_text(f"API Key: {_obfuscate_key(k)} | Secret: {_obfuscate_key(s)} | Endpoint: fapi.binance.com")
+        # Actualizar información de credenciales para ambas redes
+        creds = get_binance_credentials()
+        t_k = creds.get("testnet_api_key", "")
+        t_s = creds.get("testnet_secret_key", "")
+        r_k = creds.get("real_api_key", "")
+        r_s = creds.get("real_secret_key", "")
+
+        if hasattr(self, 'label_testnet_key'):
+            self.label_testnet_key.set_text(f"API Key: {_obfuscate_key(t_k)}")
+            self.label_testnet_secret.set_text(f"Secret: {_obfuscate_key(t_s)}")
+            if creds.get("has_testnet"):
+                self.badge_testnet_status.set_text('Configurada ✅')
+                self.badge_testnet_status.props('color=emerald-900')
+            else:
+                self.badge_testnet_status.set_text('Sin configurar ⚠️')
+                self.badge_testnet_status.props('color=gray-800')
+
+        if hasattr(self, 'label_real_key'):
+            self.label_real_key.set_text(f"API Key: {_obfuscate_key(r_k)}")
+            self.label_real_secret.set_text(f"Secret: {_obfuscate_key(r_s)}")
+            if creds.get("has_real"):
+                self.badge_real_status.set_text('Configurada ✅')
+                self.badge_real_status.props('color=blue-900')
+            else:
+                self.badge_real_status.set_text('Sin configurar ⚠️')
+                self.badge_real_status.props('color=gray-800')
 
         if not data.get("success"):
             err = data.get("error", "Error desconocido")
@@ -588,6 +654,37 @@ class BinanceAccountPage:
     # ──────────────────────────────────────────────────────────────
     # Diagnósticos y Acciones Rápidas
     # ──────────────────────────────────────────────────────────────
+
+    async def _test_network_quick(self, use_testnet: bool):
+        """Ejecuta una verificación rápida de autenticación y conectividad para la red especificada."""
+        btn = self.btn_test_testnet_quick if use_testnet else self.btn_test_real_quick
+        lbl = self.label_testnet_diag_res if use_testnet else self.label_real_diag_res
+        net_name = "Testnet" if use_testnet else "Real"
+        
+        btn.props('loading')
+        lbl.set_text(f"Probando {net_name}...")
+        lbl.classes('text-amber-400', remove='text-emerald-400 text-red-400')
+
+        loop = asyncio.get_event_loop()
+        res = await loop.run_in_executor(
+            None,
+            lambda: verify_binance_credentials(use_testnet=use_testnet)
+        )
+        btn.props(remove='loading')
+
+        if res.get("success"):
+            lat = res.get("latency_ms", 0)
+            bal = res.get("wallet_balance", 0.0)
+            lbl.set_text(f"✅ OK ({lat}ms | ${bal:,.0f})")
+            lbl.classes('text-emerald-400 font-bold', remove='text-amber-400 text-red-400')
+            ui.notify(f"✅ Conexión OK con Binance {net_name} | Latencia: {lat}ms | Saldo: ${bal:,.2f} USDT", type='positive')
+            if (self.selected_network == "testnet" and use_testnet) or (self.selected_network == "mainnet" and not use_testnet):
+                await self._refresh_account_data_async()
+        else:
+            err = res.get("error", "Error desconocido")
+            lbl.set_text("❌ Error")
+            lbl.classes('text-red-400 font-bold', remove='text-amber-400 text-emerald-400')
+            ui.notify(f"🚨 Error en Binance {net_name}: {err}", type='negative', duration=7000)
 
     async def _run_network_diagnostic(self):
         use_test = (self.selected_network == "testnet")
