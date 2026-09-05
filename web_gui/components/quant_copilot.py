@@ -117,7 +117,10 @@ class QuantCopilotChat:
         self.is_open = not self.is_open
         self.chat_card.set_visibility(self.is_open)
         if self.is_open:
-            ui.timer(0.1, lambda: self.messages_scroll.scroll_to(percent=1.0), once=True)
+            try:
+                self.messages_scroll.scroll_to(percent=1.0)
+            except Exception:
+                pass
 
     def _on_enter_press(self, e):
         self._handle_send_click()
@@ -136,13 +139,14 @@ class QuantCopilotChat:
             "time": datetime.now().strftime("%H:%M"),
             "text": text
         })
+        self.is_thinking = True
         self._render_messages_dom()
         asyncio.create_task(self._process_copilot_response(text))
 
     def _render_messages_dom(self):
-        """Reconstruye los mensajes dentro del contenedor."""
-        self.messages_container.clear()
+        """Reconstruye los mensajes dentro del contenedor de manera segura."""
         with self.messages_container:
+            self.messages_container.clear()
             for m in self.messages:
                 is_user = (m["sender"] == "user")
                 align = "justify-end" if is_user else "justify-start"
@@ -173,13 +177,13 @@ class QuantCopilotChat:
                     ui.spinner('dots', size='sm', color='amber-400')
                     ui.label('Consultando Binance MCP Server...').classes('text-[11px] text-amber-400 font-mono animate-pulse')
 
-        ui.timer(0.05, lambda: self.messages_scroll.scroll_to(percent=1.0), once=True)
+        try:
+            self.messages_scroll.scroll_to(percent=1.0)
+        except Exception:
+            pass
 
     async def _process_copilot_response(self, query: str):
         """Despachador agéntico que mapea la intención del usuario a las herramientas del MCP."""
-        self.is_thinking = True
-        self._render_messages_dom()
-
         q_lower = query.lower()
         loop = asyncio.get_event_loop()
 
@@ -188,7 +192,7 @@ class QuantCopilotChat:
 
         try:
             # 1. Saldo y Balances
-            if any(w in q_lower for w in ["saldo", "balance", "margen", "fondos", "cuenta", "capital"]):
+            if any(w in q_lower for w in ["saldo", "balance", "margen", "fondos", "cuenta", "ceunta", "capital", "dinero", "tengo", "plata"]):
                 raw = await loop.run_in_executor(None, lambda: binance_get_account_balance(use_testnet=True))
                 data = json.loads(raw)
                 if data.get("success"):
@@ -350,16 +354,17 @@ class QuantCopilotChat:
                 ]
 
         except Exception as err:
-            reply_text = f"🚨 **Error interno del Copiloto:** {err}"
-
-        self.is_thinking = False
-        self.messages.append({
-            "sender": "bot",
-            "time": datetime.now().strftime("%H:%M"),
-            "text": reply_text,
-            "chips": chips
-        })
-        self._render_messages_dom()
+            reply_text = f"🚨 **Error procesando la consulta:** {err}"
+        finally:
+            self.is_thinking = False
+            if reply_text:
+                self.messages.append({
+                    "sender": "bot",
+                    "time": datetime.now().strftime("%H:%M"),
+                    "text": reply_text,
+                    "chips": chips
+                })
+            self._render_messages_dom()
 
     def _clear_history(self):
         """Limpia el historial de chat conservando el saludo inicial."""
