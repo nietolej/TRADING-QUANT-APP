@@ -282,11 +282,14 @@ def create_gui(app):
                 menu_item('Live Monitor', 'play_circle', 'live')
                 menu_item('Cartera & Riesgo Binance', 'account_balance_wallet', 'binance_account')
                 
+                # Contenedor seguro para referencia del Copiloto
+                copilot_holder = [None]
+
                 # Acceso rápido para Abrir Copiloto Cuant
                 ui.button(
                     'Copiloto Cuant (IA)', 
                     icon='smart_toy', 
-                    on_click=lambda: copilot.toggle()
+                    on_click=lambda: copilot_holder[0].toggle() if copilot_holder[0] else None
                 ).props('flat no-caps align=left').classes('w-full justify-start text-left text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/15 font-bold text-xs py-2 px-3 rounded-lg transition-all border border-emerald-500/25 mt-1')
 
                 # Acceso rápido para Conectar APIs
@@ -409,7 +412,7 @@ def create_gui(app):
                 render_binance_account_page()
 
         # Renderizar Copiloto Cuantitativo Flotante (Conectado a Binance MCP)
-        copilot = render_quant_copilot()
+        copilot_holder[0] = render_quant_copilot()
         # Restaurar la última página activa desde localStorage (evita volver a builder tras reconexiones)
         async def restore_active_page():
             stored = await ui.run_javascript("localStorage.getItem('tqa_active_page') || 'analyzer'")
