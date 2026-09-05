@@ -413,13 +413,21 @@ def create_gui(app):
 
         # Renderizar Copiloto Cuantitativo Flotante (Conectado a Binance MCP)
         copilot_holder[0] = render_quant_copilot()
-        # Restaurar la última página activa desde localStorage (evita volver a builder tras reconexiones)
+        # Restaurar la última página activa desde localStorage de forma segura
         async def restore_active_page():
-            stored = await ui.run_javascript("localStorage.getItem('tqa_active_page') || 'analyzer'")
-            target = stored if stored in pages else 'analyzer'
-            show_page(target)
+            try:
+                await asyncio.sleep(0.5)
+                stored = await ui.run_javascript("localStorage.getItem('tqa_active_page') || 'analyzer'", timeout=6.0)
+                target = stored if stored in pages else 'analyzer'
+                show_page(target)
+            except Exception:
+                # Si el navegador tarda en responder o hay reconexión, mantener analyzer por defecto de forma segura
+                try:
+                    show_page('analyzer')
+                except Exception:
+                    pass
         
-        ui.timer(0, restore_active_page, once=True)
+        ui.timer(0.5, restore_active_page, once=True)
 
     # Run NiceGUI over the existing FastAPI app
     ui.run_with(

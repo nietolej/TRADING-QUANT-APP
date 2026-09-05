@@ -342,9 +342,9 @@ class BinanceAccountPage:
                                 on_click=lambda: self._test_network_quick(False)
                             ).props('dense outline color=blue-400').classes('text-xs text-blue-400 px-3 py-1.5 rounded-lg')
 
-            # Refresco periódico cada 3 segundos
-            ui.timer(0.2, self._refresh_account_data_async, once=True)
-            self.live_timer = ui.timer(3.0, self._refresh_account_data_async)
+            # Refresco periódico (cada 15s para no congestionar la conexión con Binance)
+            ui.timer(1.0, self._refresh_account_data_async, once=True)
+            self.live_timer = ui.timer(15.0, self._refresh_account_data_async)
             ui.context.client.on_disconnect(lambda: self.live_timer.deactivate() if hasattr(self, 'live_timer') and self.live_timer else None)
 
     # ──────────────────────────────────────────────────────────────
