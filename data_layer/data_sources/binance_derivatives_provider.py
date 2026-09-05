@@ -50,31 +50,40 @@ class BinanceDerivativesProvider:
         interval: str = "1d",
         start_time_ms: Optional[int] = None,
         end_time_ms: Optional[int] = None,
-        limit: int = 500
+        limit: int = 1500
     ) -> List[Dict[str, Any]]:
         """
-        Descarga velas OHLCV de Binance Futures.
-        Retorna lista con timestamp, open, high, low, close, volume.
+        Descarga velas OHLCV de Binance Futures con paginación automática.
+        Permite traer miles de velas en rangos de fechas extensos.
         """
         clean_sym = symbol.replace("/", "").upper()
         url = f"{FAPI_BASE_URL}/fapi/v1/klines"
-        params: Dict[str, Any] = {
-            "symbol": clean_sym,
-            "interval": interval,
-            "limit": min(limit, 1000)
-        }
-        if start_time_ms:
-            params["startTime"] = start_time_ms
-        if end_time_ms:
-            params["endTime"] = end_time_ms
+        all_klines: List[Dict[str, Any]] = []
+        cur_start = start_time_ms
+        target_limit = max(10, min(limit, 3000))
 
-        try:
-            res = self.session.get(url, params=params, timeout=self.timeout)
-            if res.status_code == 200:
+        while len(all_klines) < target_limit:
+            fetch_limit = min(1000, target_limit - len(all_klines))
+            params: Dict[str, Any] = {
+                "symbol": clean_sym,
+                "interval": interval,
+                "limit": fetch_limit
+            }
+            if cur_start:
+                params["startTime"] = cur_start
+            if end_time_ms:
+                params["endTime"] = end_time_ms
+
+            try:
+                res = self.session.get(url, params=params, timeout=self.timeout)
+                if res.status_code != 200:
+                    break
                 raw = res.json()
-                klines = []
+                if not raw or not isinstance(raw, list):
+                    break
+
                 for k in raw:
-                    klines.append({
+                    all_klines.append({
                         "timestamp": int(k[0]),
                         "open": float(k[1]),
                         "high": float(k[2]),
@@ -85,49 +94,84 @@ class BinanceDerivativesProvider:
                         "quote_volume": float(k[7]),
                         "trades_count": int(k[8])
                     })
-                return klines
-            logger.warning("Error descargando klines para %s: HTTP %d", clean_sym, res.status_code)
-            return []
-        except Exception as e:
-            logger.error("Excepción en get_historical_ohlcv_klines: %s", e)
-            return []
+
+                if len(raw) < fetch_limit:
+                    break
+
+                last_timestamp = int(raw[-1][0])
+                cur_start = last_timestamp + 1
+                if end_time_ms and cur_start >= end_time_ms:
+                    break
+            except Exception as e:
+                logger.error("Excepción en get_historical_ohlcv_klines: %s", e)
+                break
+
+        return all_klines
 
     def get_funding_rate_history(
         self,
         symbol: str = "BTCUSDT",
         start_time_ms: Optional[int] = None,
         end_time_ms: Optional[int] = None,
-        limit: int = 100
+        limit: int = 1000
     ) -> List[Dict[str, Any]]:
-        """Obtiene el histórico de Funding Rates con filtro de fechas opcional."""
+        """Obtiene el histórico de Funding Rates con paginación para rangos amplios."""
         clean_sym = symbol.replace("/", "").upper()
         url = f"{FAPI_BASE_URL}/fapi/v1/fundingRate"
-        params: Dict[str, Any] = {"symbol": clean_sym, "limit": min(limit, 1000)}
-        if start_time_ms:
-            params["startTime"] = start_time_ms
-        if end_time_ms:
-            params["endTime"] = end_time_ms
+        all_results: List[Dict[str, Any]] = []
+        cur_start = start_time_ms
+        target_limit = max(10, min(limit, 2000))
 
-        try:
-            res = self.session.get(url, params=params, timeout=self.timeout)
-            if res.status_code == 200:
+        while len(all_results) < target_limit:
+            fetch_limit = min(1000, target_limit - len(all_results))
+            params: Dict[str, Any] = {"symbol": clean_sym, "limit": fetch_limit}
+            if cur_start:
+                params["startTime"] = cur_start
+            if end_time_ms:
+                params["endTime"] = end_time_ms
+
+            try:
+                res = self.session.get(url, params=params, timeout=self.timeout)
+                if res.status_code != 200:
+                    break
                 data = res.json()
-                results = []
+                if not data or not isinstance(data, list):
+                    break
+
                 for item in data:
                     rate = float(item.get("fundingRate", 0.0))
                     annualized_apr = rate * 3 * 365 * 100.0
-                    results.append({
+                    all_results.append({
                         "funding_time": int(item.get("fundingTime", 0)),
                         "funding_rate": rate,
                         "funding_rate_pct": rate * 100.0,
                         "annualized_apr": annualized_apr,
                         "mark_price": float(item.get("markPrice", 0.0))
                     })
-                return results
-            return []
-        except Exception as e:
-            logger.error("Excepción en get_funding_rate_history: %s", e)
-            return []
+
+                if len(data) < fetch_limit:
+                    break
+
+                last_ftime = int(data[-1].get("fundingTime", 0))
+                cur_start = last_ftime + 1
+                if end_time_ms and cur_start >= end_time_ms:
+                    break
+            except Exception as e:
+                logger.error("Excepción en get_funding_rate_history: %s", e)
+                break
+
+        return all_results
+
+    def _get_safe_start_30d(self, start_time_ms: Optional[int]) -> Optional[int]:
+        """
+        Binance restringe las llamadas a /futures/data/* estrictamente a los últimos 30 días.
+        Esta función ajusta de forma segura el inicio para evitar el error HTTP 400 (-1130).
+        """
+        if not start_time_ms:
+            return None
+        now_ms = int(time.time() * 1000)
+        min_allowed = now_ms - (30 * 24 * 3600 * 1000) + (3600 * 1000)
+        return max(start_time_ms, min_allowed)
 
     def get_open_interest_history(
         self,
@@ -135,29 +179,32 @@ class BinanceDerivativesProvider:
         period: str = "1h",
         start_time_ms: Optional[int] = None,
         end_time_ms: Optional[int] = None,
-        limit: int = 50
+        limit: int = 500
     ) -> List[Dict[str, Any]]:
-        """Obtiene serie temporal de Open Interest con filtro de fechas."""
+        """Obtiene serie temporal de Open Interest con filtro de fechas seguro."""
         clean_sym = symbol.replace("/", "").upper()
         clean_period = period.strip().lower()
         url = f"{FAPI_BASE_URL}/futures/data/openInterestHist"
+        safe_start = self._get_safe_start_30d(start_time_ms)
         params: Dict[str, Any] = {"symbol": clean_sym, "period": clean_period, "limit": min(limit, 500)}
-        if start_time_ms:
-            params["startTime"] = start_time_ms
+        if safe_start:
+            params["startTime"] = safe_start
         if end_time_ms:
             params["endTime"] = end_time_ms
 
         try:
             res = self.session.get(url, params=params, timeout=self.timeout)
             if res.status_code == 200:
-                return [
-                    {
-                        "timestamp": int(item.get("timestamp", 0)),
-                        "sum_open_interest": float(item.get("sumOpenInterest", 0.0)),
-                        "sum_open_interest_usd": float(item.get("sumOpenInterestValue", 0.0))
-                    }
-                    for item in res.json()
-                ]
+                raw = res.json()
+                if isinstance(raw, list):
+                    return [
+                        {
+                            "timestamp": int(item.get("timestamp", 0)),
+                            "sum_open_interest": float(item.get("sumOpenInterest", 0.0)),
+                            "sum_open_interest_usd": float(item.get("sumOpenInterestValue", 0.0))
+                        }
+                        for item in raw
+                    ]
             return []
         except Exception as e:
             logger.error("Excepción en get_open_interest_history: %s", e)
@@ -169,30 +216,33 @@ class BinanceDerivativesProvider:
         period: str = "1h",
         start_time_ms: Optional[int] = None,
         end_time_ms: Optional[int] = None,
-        limit: int = 50
+        limit: int = 500
     ) -> List[Dict[str, Any]]:
         """Ratio Long/Short de cuentas de Top Traders (Ballenas)."""
         clean_sym = symbol.replace("/", "").upper()
         clean_period = period.strip().lower()
         url = f"{FAPI_BASE_URL}/futures/data/topLongShortAccountRatio"
+        safe_start = self._get_safe_start_30d(start_time_ms)
         params: Dict[str, Any] = {"symbol": clean_sym, "period": clean_period, "limit": min(limit, 500)}
-        if start_time_ms:
-            params["startTime"] = start_time_ms
+        if safe_start:
+            params["startTime"] = safe_start
         if end_time_ms:
             params["endTime"] = end_time_ms
 
         try:
             res = self.session.get(url, params=params, timeout=self.timeout)
             if res.status_code == 200:
-                return [
-                    {
-                        "timestamp": int(x.get("timestamp", 0)),
-                        "long_account_pct": float(x.get("longAccount", 0.0)) * 100.0,
-                        "short_account_pct": float(x.get("shortAccount", 0.0)) * 100.0,
-                        "long_short_ratio": float(x.get("longShortRatio", 1.0))
-                    }
-                    for x in res.json()
-                ]
+                raw = res.json()
+                if isinstance(raw, list):
+                    return [
+                        {
+                            "timestamp": int(x.get("timestamp", 0)),
+                            "long_account_pct": float(x.get("longAccount", 0.0)) * 100.0,
+                            "short_account_pct": float(x.get("shortAccount", 0.0)) * 100.0,
+                            "long_short_ratio": float(x.get("longShortRatio", 1.0))
+                        }
+                        for x in raw
+                    ]
             return []
         except Exception as e:
             logger.error("Excepción en get_top_long_short_account_ratio: %s", e)
@@ -204,30 +254,33 @@ class BinanceDerivativesProvider:
         period: str = "1h",
         start_time_ms: Optional[int] = None,
         end_time_ms: Optional[int] = None,
-        limit: int = 50
+        limit: int = 500
     ) -> List[Dict[str, Any]]:
         """Ratio Long/Short de cuentas globales (Retail)."""
         clean_sym = symbol.replace("/", "").upper()
         clean_period = period.strip().lower()
         url = f"{FAPI_BASE_URL}/futures/data/globalLongShortAccountRatio"
+        safe_start = self._get_safe_start_30d(start_time_ms)
         params: Dict[str, Any] = {"symbol": clean_sym, "period": clean_period, "limit": min(limit, 500)}
-        if start_time_ms:
-            params["startTime"] = start_time_ms
+        if safe_start:
+            params["startTime"] = safe_start
         if end_time_ms:
             params["endTime"] = end_time_ms
 
         try:
             res = self.session.get(url, params=params, timeout=self.timeout)
             if res.status_code == 200:
-                return [
-                    {
-                        "timestamp": int(x.get("timestamp", 0)),
-                        "long_account_pct": float(x.get("longAccount", 0.0)) * 100.0,
-                        "short_account_pct": float(x.get("shortAccount", 0.0)) * 100.0,
-                        "long_short_ratio": float(x.get("longShortRatio", 1.0))
-                    }
-                    for x in res.json()
-                ]
+                raw = res.json()
+                if isinstance(raw, list):
+                    return [
+                        {
+                            "timestamp": int(x.get("timestamp", 0)),
+                            "long_account_pct": float(x.get("longAccount", 0.0)) * 100.0,
+                            "short_account_pct": float(x.get("shortAccount", 0.0)) * 100.0,
+                            "long_short_ratio": float(x.get("longShortRatio", 1.0))
+                        }
+                        for x in raw
+                    ]
             return []
         except Exception as e:
             logger.error("Excepción en get_global_long_short_account_ratio: %s", e)
@@ -239,30 +292,33 @@ class BinanceDerivativesProvider:
         period: str = "1h",
         start_time_ms: Optional[int] = None,
         end_time_ms: Optional[int] = None,
-        limit: int = 50
+        limit: int = 500
     ) -> List[Dict[str, Any]]:
         """Volumen Taker (compras vs ventas agresivas)."""
         clean_sym = symbol.replace("/", "").upper()
         clean_period = period.strip().lower()
         url = f"{FAPI_BASE_URL}/futures/data/takerlongshortRatio"
+        safe_start = self._get_safe_start_30d(start_time_ms)
         params: Dict[str, Any] = {"symbol": clean_sym, "period": clean_period, "limit": min(limit, 500)}
-        if start_time_ms:
-            params["startTime"] = start_time_ms
+        if safe_start:
+            params["startTime"] = safe_start
         if end_time_ms:
             params["endTime"] = end_time_ms
 
         try:
             res = self.session.get(url, params=params, timeout=self.timeout)
             if res.status_code == 200:
-                return [
-                    {
-                        "timestamp": int(x.get("timestamp", 0)),
-                        "buy_volume": float(x.get("buyVol", 0.0)),
-                        "sell_volume": float(x.get("sellVol", 0.0)),
-                        "buy_sell_ratio": float(x.get("buySellRatio", 1.0))
-                    }
-                    for x in res.json()
-                ]
+                raw = res.json()
+                if isinstance(raw, list):
+                    return [
+                        {
+                            "timestamp": int(x.get("timestamp", 0)),
+                            "buy_volume": float(x.get("buyVol", 0.0)),
+                            "sell_volume": float(x.get("sellVol", 0.0)),
+                            "buy_sell_ratio": float(x.get("buySellRatio", 1.0))
+                        }
+                        for x in raw
+                    ]
             return []
         except Exception as e:
             logger.error("Excepción en get_taker_long_short_ratio: %s", e)
@@ -353,12 +409,12 @@ class BinanceDerivativesProvider:
         # 2. Descargar de Binance Futures
         logger.info("Descargando derivados de Binance API para %s (%s) [%s a %s]...", clean_sym, clean_period, s_tag, e_tag)
         premium = self.get_premium_index_and_basis(clean_sym)
-        klines = self.get_historical_ohlcv_klines(clean_sym, interval=clean_period, start_time_ms=start_ms, end_time_ms=end_ms, limit=300)
-        funding_hist = self.get_funding_rate_history(clean_sym, start_time_ms=start_ms, end_time_ms=end_ms, limit=100)
-        oi_hist = self.get_open_interest_history(clean_sym, period=clean_period, start_time_ms=start_ms, end_time_ms=end_ms, limit=200)
-        top_ls = self.get_top_long_short_account_ratio(clean_sym, period=clean_period, start_time_ms=start_ms, end_time_ms=end_ms, limit=200)
-        glob_ls = self.get_global_long_short_account_ratio(clean_sym, period=clean_period, start_time_ms=start_ms, end_time_ms=end_ms, limit=200)
-        taker_ls = self.get_taker_long_short_ratio(clean_sym, period=clean_period, start_time_ms=start_ms, end_time_ms=end_ms, limit=200)
+        klines = self.get_historical_ohlcv_klines(clean_sym, interval=clean_period, start_time_ms=start_ms, end_time_ms=end_ms, limit=2500)
+        funding_hist = self.get_funding_rate_history(clean_sym, start_time_ms=start_ms, end_time_ms=end_ms, limit=1000)
+        oi_hist = self.get_open_interest_history(clean_sym, period=clean_period, start_time_ms=start_ms, end_time_ms=end_ms, limit=500)
+        top_ls = self.get_top_long_short_account_ratio(clean_sym, period=clean_period, start_time_ms=start_ms, end_time_ms=end_ms, limit=500)
+        glob_ls = self.get_global_long_short_account_ratio(clean_sym, period=clean_period, start_time_ms=start_ms, end_time_ms=end_ms, limit=500)
+        taker_ls = self.get_taker_long_short_ratio(clean_sym, period=clean_period, start_time_ms=start_ms, end_time_ms=end_ms, limit=500)
 
         # 3. Guardar en disco local como Parquet estructurado
         try:
@@ -421,11 +477,11 @@ class BinanceDerivativesProvider:
         """Reconstruye el dashboard desde un DataFrame local de Parquet."""
         klines = df_k.to_dict(orient="records") if not df_k.empty else []
         premium = self.get_premium_index_and_basis(symbol)
-        funding = self.get_funding_rate_history(symbol, limit=60)
-        oi = self.get_open_interest_history(symbol, period=period, limit=60)
-        top_ls = self.get_top_long_short_account_ratio(symbol, period=period, limit=60)
-        glob_ls = self.get_global_long_short_account_ratio(symbol, period=period, limit=60)
-        taker_ls = self.get_taker_long_short_ratio(symbol, period=period, limit=60)
+        funding = self.get_funding_rate_history(symbol, limit=1000)
+        oi = self.get_open_interest_history(symbol, period=period, limit=500)
+        top_ls = self.get_top_long_short_account_ratio(symbol, period=period, limit=500)
+        glob_ls = self.get_global_long_short_account_ratio(symbol, period=period, limit=500)
+        taker_ls = self.get_taker_long_short_ratio(symbol, period=period, limit=500)
 
         latest_oi_usd = oi[-1]["sum_open_interest_usd"] if oi else 0.0
         prev_oi_usd = oi[-2]["sum_open_interest_usd"] if len(oi) > 1 else latest_oi_usd

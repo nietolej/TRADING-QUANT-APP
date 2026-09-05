@@ -102,6 +102,13 @@ class DerivativesAnalyzerPage:
                             on_click=self._export_csv_action
                         ).props('dense outline color=emerald-400').classes('text-xs text-emerald-400 px-3 py-1.5 rounded-lg')
 
+                # Nota informativa sobre límites de la API de Binance y cobertura
+                with ui.row().classes('w-full items-center justify-between text-[10px] font-mono text-slate-400 pt-1 flex-wrap gap-2'):
+                    with ui.row().classes('items-center gap-1.5'):
+                        ui.icon('info', size='xs', color='slate-400')
+                        ui.label('Cobertura: Velas OHLCV y Funding Rates tienen historial completo. Métricas de sentimiento (OI, Ratios y Taker) limitadas por Binance API a los últimos 30 días móviles.').classes('text-slate-400')
+                    ui.label('💾 Almacenamiento local Parquet activo').classes('text-emerald-400 font-bold')
+
             # ──────────────────────────────────────────────────────────
             # 2. Tarjetas de KPIs Cuantitativos Superiores
             # ──────────────────────────────────────────────────────────
