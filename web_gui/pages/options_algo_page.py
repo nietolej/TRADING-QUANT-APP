@@ -9,6 +9,7 @@ Ofrece dos módulos de nivel institucional:
    - Ejecución TWAP (repartición uniforme en tiempo con jitter)
    - Consola visual con barra de progreso, VWAP acumulado y slippage en bps
 """
+import os
 import logging
 import asyncio
 from datetime import datetime
@@ -106,9 +107,17 @@ class OptionsAlgoPage:
 
                     # Cadena de Opciones (Matrix)
                     with ui.column().classes('w-full bg-[#0d121f] p-4 rounded-xl border border-[#1e293b] shadow-md space-y-2'):
-                        with ui.row().classes('w-full justify-between items-center pb-2 border-b border-[#1e293b]'):
-                            ui.label('Cadena de Opciones Vanilla (Options Chain Matrix)').classes('text-xs font-bold font-mono text-emerald-400')
-                            ui.label('Calls (Izquierda) | Strikes ATM/OTM (Centro) | Puts (Derecha)').classes('text-[10px] text-slate-400 font-mono')
+                        with ui.row().classes('w-full justify-between items-center pb-2 border-b border-[#1e293b] flex-wrap gap-2'):
+                            with ui.row().classes('items-center gap-2'):
+                                ui.label('Cadena de Opciones Vanilla (Options Chain Matrix)').classes('text-xs font-bold font-mono text-emerald-400')
+                                ui.label('⚡ Persistencia Parquet').classes('text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-950/60 text-emerald-400 border border-emerald-800')
+                            with ui.row().classes('items-center gap-3'):
+                                ui.label('Calls (Izquierda) | Strikes ATM/OTM (Centro) | Puts (Derecha)').classes('text-[10px] text-slate-400 font-mono')
+                                ui.button(
+                                    'Descargar CSV', 
+                                    icon='download', 
+                                    on_click=self._export_options_csv
+                                ).props('dense outline color=emerald-400').classes('text-xs text-emerald-400 px-2.5 py-1 rounded-lg')
 
                         self.chain_container = ui.column().classes('w-full overflow-x-auto')
 
@@ -252,6 +261,23 @@ class OptionsAlgoPage:
         finally:
             self.btn_refresh.props(remove='loading')
             self.is_loading_options = False
+
+    def _export_options_csv(self):
+        """Exporta la cadena de opciones actual a CSV en data/options/ y lanza la descarga."""
+        if not self.options_data or not self.options_data.get("chain"):
+            ui.notify("No hay datos de opciones cargados para exportar.", type="warning")
+            return
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        expiry_tag = self.current_expiry or "chain"
+        filename = f"{self.current_asset}_options_{expiry_tag}_{timestamp_str}.csv"
+        os.makedirs(os.path.join("data", "options"), exist_ok=True)
+        filepath = os.path.join("data", "options", filename)
+        ok = self.options_provider.export_chain_to_csv(self.options_data, filepath)
+        if ok:
+            ui.notify(f"Archivo exportado: {filename}", type="positive")
+            ui.download(filepath, filename=filename)
+        else:
+            ui.notify("Error al exportar matriz de opciones a CSV", type="negative")
 
     def _update_options_ui(self, d: Dict[str, Any]):
         idx_p = d.get("index_price", 0.0)

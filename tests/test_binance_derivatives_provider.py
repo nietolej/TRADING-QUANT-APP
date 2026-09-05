@@ -8,7 +8,7 @@ from data_layer.data_sources.binance_derivatives_provider import BinanceDerivati
 
 def test_derivatives_provider_init():
     p = BinanceDerivativesProvider()
-    assert p.timeout == 8
+    assert p.timeout == 10
     assert isinstance(p._cache, dict)
 
 

@@ -6,16 +6,20 @@ Descarga y estructura datos cuantitativos de alta resolución:
 - Griegas completas: Delta, Gamma, Vega, Theta
 - Sonrisa de Volatilidad (Volatility Smile) y Skew
 """
+import os
 import logging
 import time
 import re
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 import requests
+import pandas as pd
 
 logger = logging.getLogger("BinanceOptionsProvider")
 
 EAPI_BASE_URL = "https://eapi.binance.com"
+OPTIONS_STORAGE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "options")
+os.makedirs(OPTIONS_STORAGE_DIR, exist_ok=True)
 
 
 class BinanceOptionsProvider:
@@ -179,12 +183,13 @@ class BinanceOptionsProvider:
             "contracts": contracts
         }
 
-    def get_options_chain_matrix(self, underlying_asset: str = "BTC", expiry_code: Optional[str] = None) -> Dict[str, Any]:
+    def get_options_chain_matrix(self, underlying_asset: str = "BTC", expiry_code: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         """
         Construye una matriz de Cadena de Opciones para un vencimiento específico:
         Strikes únicos ordenados con datos emparejados de CALL a la izquierda y PUT a la derecha.
         """
-        dataset = self.get_parsed_options_dataset(underlying_asset)
+        actual_asset = kwargs.get("asset", underlying_asset)
+        dataset = self.get_parsed_options_dataset(actual_asset)
         expirations = dataset.get("expirations", [])
         if not expirations:
             return {"error": "No hay opciones disponibles", "chain": []}
@@ -240,6 +245,31 @@ class BinanceOptionsProvider:
             gammas.append(c["gamma"] if c else (p["gamma"] if p else None))
             vegas.append(c["vega"] if c else (p["vega"] if p else None))
 
+        # Auto-guardar snapshot local en disco
+        try:
+            today_tag = datetime.now(timezone.utc).strftime("%Y%m%d")
+            snap_path = os.path.join(OPTIONS_STORAGE_DIR, f"options_{underlying_asset}_{today_tag}.parquet")
+            flat_rows = []
+            for r in chain_rows:
+                stk = r["strike"]
+                c = r["call"] or {}
+                p = r["put"] or {}
+                flat_rows.append({
+                    "strike": stk,
+                    "call_price": c.get("mark_price"),
+                    "call_iv": c.get("mark_iv"),
+                    "call_delta": c.get("delta"),
+                    "call_theta": c.get("theta"),
+                    "put_price": p.get("mark_price"),
+                    "put_iv": p.get("mark_iv"),
+                    "put_delta": p.get("delta"),
+                    "put_theta": p.get("theta")
+                })
+            if flat_rows:
+                pd.DataFrame(flat_rows).to_parquet(snap_path, index=False)
+        except Exception as e_snap:
+            logger.debug("No se pudo guardar snapshot de opciones: %s", e_snap)
+
         return {
             "underlying": underlying_asset,
             "index_price": dataset.get("index_price", 0.0),
@@ -259,3 +289,34 @@ class BinanceOptionsProvider:
                 "vega": vegas
             }
         }
+
+    def export_chain_to_csv(self, chain_matrix: Dict[str, Any], output_path: str) -> bool:
+        """Exporta la matriz de opciones a un archivo CSV estructurado."""
+        try:
+            chain_rows = chain_matrix.get("chain", [])
+            if not chain_rows:
+                return False
+            flat_rows = []
+            for r in chain_rows:
+                stk = r["strike"]
+                c = r["call"] or {}
+                p = r["put"] or {}
+                flat_rows.append({
+                    "Strike": stk,
+                    "Call_MarkPrice": c.get("mark_price"),
+                    "Call_IV_Pct": c.get("mark_iv"),
+                    "Call_Delta": c.get("delta"),
+                    "Call_Theta": c.get("theta"),
+                    "Call_Vega": c.get("vega"),
+                    "Put_MarkPrice": p.get("mark_price"),
+                    "Put_IV_Pct": p.get("mark_iv"),
+                    "Put_Delta": p.get("delta"),
+                    "Put_Theta": p.get("theta"),
+                    "Put_Vega": p.get("vega"),
+                })
+            df = pd.DataFrame(flat_rows)
+            df.to_csv(output_path, index=False)
+            return True
+        except Exception as e:
+            logger.error("Error exportando opciones a CSV: %s", e)
+            return False

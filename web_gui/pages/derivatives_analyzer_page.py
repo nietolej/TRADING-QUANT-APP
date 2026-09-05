@@ -1,14 +1,17 @@
 """
 Página de Análisis Gráfico de Derivados (Futuros USDⓈ-M y COIN-M) de Binance.
 Visualiza métricas cuantitativas en tiempo real con gráficos Plotly:
+- Historial de Precios OHLCV (Velas Japonesas) y Volumen
 - Funding Rate actual e histórico con APR proyectado
 - Open Interest (Interés Abierto) vs Precio
 - Ratios Long/Short de Top Traders (Ballenas) vs Retail
 - Presión de Grandes Tomadores (Taker Buy/Sell Volume)
+- Soporte para rango de fechas personalizado y persistencia local en Parquet/CSV.
 """
+import os
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 import plotly.graph_objects as go
 from nicegui import ui
@@ -25,6 +28,13 @@ class DerivativesAnalyzerPage:
         self.provider = BinanceDerivativesProvider()
         self.current_symbol = "BTCUSDT"
         self.current_period = "1h"
+        
+        # Rango de fechas por defecto: últimos 30 días a hoy
+        today = datetime.now()
+        thirty_days_ago = today - timedelta(days=30)
+        self.start_date_str = thirty_days_ago.strftime("%Y-%m-%d")
+        self.end_date_str = today.strftime("%Y-%m-%d")
+        
         self.data: Dict[str, Any] = {}
         self.is_loading = False
 
@@ -32,30 +42,65 @@ class DerivativesAnalyzerPage:
         """Construye la interfaz visual en NiceGUI."""
         with ui.column().classes('w-full h-full p-4 lg:p-6 space-y-4 bg-[#080c14] text-slate-200'):
             # ──────────────────────────────────────────────────────────
-            # 1. Header con Controles de Activo y Refresco
+            # 1. Header con Controles de Activo, Temporalidad y Fechas
             # ──────────────────────────────────────────────────────────
-            with ui.row().classes('w-full justify-between items-center bg-[#0d121f] p-4 rounded-xl border border-[#1e293b]'):
-                with ui.row().classes('items-center gap-3'):
-                    ui.icon('query_stats', size='md', color='amber-400')
-                    with ui.column().classes('gap-0'):
-                        ui.label('ANÁLISIS CUANTITATIVO DE DERIVADOS').classes('text-base font-bold tracking-wider text-amber-400 font-mono')
-                        ui.label('Binance Futures USDⓈ-M • Funding Rate • Open Interest • Ratios Ballenas/Retail • Flujo Taker').classes('text-xs text-slate-400')
+            with ui.column().classes('w-full bg-[#0d121f] p-4 rounded-xl border border-[#1e293b] gap-3'):
+                # Fila superior: Título y selectores de símbolo/periodo
+                with ui.row().classes('w-full justify-between items-center flex-wrap gap-2'):
+                    with ui.row().classes('items-center gap-3'):
+                        ui.icon('query_stats', size='md', color='amber-400')
+                        with ui.column().classes('gap-0'):
+                            ui.label('ANÁLISIS CUANTITATIVO DE DERIVADOS').classes('text-base font-bold tracking-wider text-amber-400 font-mono')
+                            ui.label('Binance Futures USDⓈ-M • Funding Rate • Open Interest • Ratios Ballenas/Retail • Flujo Taker').classes('text-xs text-slate-400')
 
-                with ui.row().classes('items-center gap-2'):
-                    # Selector dinámico de Símbolo
-                    self.symbol_buttons_row = ui.row().classes('bg-[#151c2e] p-1 rounded-lg border border-[#1e293b]')
-                    self._render_symbol_buttons()
+                    with ui.row().classes('items-center gap-2 flex-wrap'):
+                        # Selector dinámico de Símbolo
+                        self.symbol_buttons_row = ui.row().classes('bg-[#151c2e] p-1 rounded-lg border border-[#1e293b]')
+                        self._render_symbol_buttons()
 
-                    # Selector dinámico de Periodo para Ratios y OI
-                    self.period_buttons_row = ui.row().classes('bg-[#151c2e] p-1 rounded-lg border border-[#1e293b]')
-                    self._render_period_buttons()
+                        # Selector dinámico de Periodo para Ratios y OI
+                        self.period_buttons_row = ui.row().classes('bg-[#151c2e] p-1 rounded-lg border border-[#1e293b]')
+                        self._render_period_buttons()
 
-                    # Botón de Actualizar
-                    self.btn_refresh = ui.button(
-                        'Actualizar', 
-                        icon='refresh', 
-                        on_click=self._refresh_data_async
-                    ).props('dense outline color=amber-400').classes('text-xs text-amber-400 px-3 py-1.5 rounded-lg')
+                        # Botón de Actualizar
+                        self.btn_refresh = ui.button(
+                            'Actualizar', 
+                            icon='refresh', 
+                            on_click=self._refresh_data_async
+                        ).props('dense outline color=amber-400').classes('text-xs text-amber-400 px-3 py-1.5 rounded-lg')
+
+                # Fila inferior: Rango de Fechas, Presets y Exportación Local
+                with ui.row().classes('w-full justify-between items-center pt-2 border-t border-[#1e293b]/70 flex-wrap gap-3'):
+                    with ui.row().classes('items-center gap-3 flex-wrap'):
+                        ui.icon('date_range', size='xs', color='slate-400')
+                        ui.label('Rango:').classes('text-xs font-mono text-slate-400 font-bold')
+                        
+                        ui.label('Desde:').classes('text-xs font-mono text-slate-500')
+                        self.input_start_date = ui.input(value=self.start_date_str).props('type=date dense outlined').classes('w-36 text-xs bg-[#151c2e] text-slate-200 border-[#1e293b]')
+                        self.input_start_date.on('change', self._on_date_changed)
+
+                        ui.label('Hasta:').classes('text-xs font-mono text-slate-500')
+                        self.input_end_date = ui.input(value=self.end_date_str).props('type=date dense outlined').classes('w-36 text-xs bg-[#151c2e] text-slate-200 border-[#1e293b]')
+                        self.input_end_date.on('change', self._on_date_changed)
+
+                        # Presets de fecha rápidos
+                        with ui.row().classes('bg-[#151c2e] p-1 rounded-lg border border-[#1e293b] gap-1'):
+                            for preset in ["7D", "30D", "90D", "YTD", "1A"]:
+                                ui.button(
+                                    preset, 
+                                    on_click=lambda p=preset: self._apply_preset(p)
+                                ).props('dense flat no-caps').classes('text-[11px] text-slate-300 hover:text-white px-2 py-0.5 rounded')
+
+                    with ui.row().classes('items-center gap-3'):
+                        # Badge de almacenamiento (Caché Parquet vs API)
+                        self.badge_cache = ui.label('🌐 Binance API').classes('text-[11px] font-mono px-2.5 py-1 rounded-full bg-blue-950/60 text-blue-400 border border-blue-800')
+
+                        # Botón exportar CSV
+                        ui.button(
+                            'Descargar CSV', 
+                            icon='download', 
+                            on_click=self._export_csv_action
+                        ).props('dense outline color=emerald-400').classes('text-xs text-emerald-400 px-3 py-1.5 rounded-lg')
 
             # ──────────────────────────────────────────────────────────
             # 2. Tarjetas de KPIs Cuantitativos Superiores
@@ -90,20 +135,31 @@ class DerivativesAnalyzerPage:
                     self.kpi_basis_val = ui.label('Basis: -- %').classes('text-[10px] text-slate-400 font-mono')
 
             # ──────────────────────────────────────────────────────────
-            # 3. Gráficos Plotly Interactivos (Grid 2x2)
+            # 3. Gráfico Principal de Precio Histórico OHLCV & Volumen
+            # ──────────────────────────────────────────────────────────
+            with ui.column().classes('w-full bg-[#0d121f] p-4 rounded-xl border border-[#1e293b] shadow-md'):
+                with ui.row().classes('w-full justify-between items-center pb-2 border-b border-[#1e293b]'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('candlestick_chart', size='sm', color='amber-400')
+                        self.lbl_chart_price_title = ui.label('HISTORIAL DE PRECIO OHLCV & VOLUMEN').classes('text-xs font-bold font-mono text-amber-400')
+                    ui.label('Velas Japonesas y volumen sincronizados con el periodo y rango de fechas').classes('text-[10px] text-slate-500 font-mono')
+                self.chart_price = ui.plotly(self._empty_fig('Cargando Historial OHLCV...')).classes('w-full h-80')
+
+            # ──────────────────────────────────────────────────────────
+            # 4. Gráficos Plotly Interactivos (Grid 2x2)
             # ──────────────────────────────────────────────────────────
             with ui.grid(columns=2).classes('w-full gap-4'):
                 # Gráfico 1: Funding Rate Histórico
                 with ui.column().classes('bg-[#0d121f] p-4 rounded-xl border border-[#1e293b] shadow-md'):
                     with ui.row().classes('w-full justify-between items-center pb-2 border-b border-[#1e293b]'):
-                        ui.label('Evolución de Funding Rate (Últimos 60 Cobros)').classes('text-xs font-bold font-mono text-slate-300')
+                        ui.label('Evolución de Funding Rate (Cobros en Rango)').classes('text-xs font-bold font-mono text-slate-300')
                         ui.label('Verde = Longs pagan a Shorts | Rojo = Shorts pagan').classes('text-[10px] text-slate-500')
                     self.chart_funding = ui.plotly(self._empty_fig('Cargando Funding Rate...')).classes('w-full h-80')
 
                 # Gráfico 2: Open Interest vs Mark Price
                 with ui.column().classes('bg-[#0d121f] p-4 rounded-xl border border-[#1e293b] shadow-md'):
                     with ui.row().classes('w-full justify-between items-center pb-2 border-b border-[#1e293b]'):
-                        ui.label('Interés Abierto (OI en USD) vs Precio de Marca').classes('text-xs font-bold font-mono text-slate-300')
+                        ui.label('Interés Abierto (OI en USD) vs Tiempo').classes('text-xs font-bold font-mono text-slate-300')
                         ui.label('Acumulación y desapalancamiento').classes('text-[10px] text-slate-500')
                     self.chart_oi = ui.plotly(self._empty_fig('Cargando Open Interest...')).classes('w-full h-80')
 
@@ -166,8 +222,54 @@ class DerivativesAnalyzerPage:
         self._render_period_buttons()
         asyncio.create_task(self._refresh_data_async())
 
+    def _on_date_changed(self):
+        """Manejador cuando el usuario cambia manualmente las fechas en los inputs."""
+        if hasattr(self, 'input_start_date') and self.input_start_date.value:
+            self.start_date_str = self.input_start_date.value
+        if hasattr(self, 'input_end_date') and self.input_end_date.value:
+            self.end_date_str = self.input_end_date.value
+        asyncio.create_task(self._refresh_data_async())
+
+    def _apply_preset(self, preset: str):
+        """Aplica rangos temporales rápidos (7D, 30D, 90D, YTD, 1A)."""
+        today = datetime.now()
+        if preset == "7D":
+            self.start_date_str = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+        elif preset == "30D":
+            self.start_date_str = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+        elif preset == "90D":
+            self.start_date_str = (today - timedelta(days=90)).strftime("%Y-%m-%d")
+        elif preset == "YTD":
+            self.start_date_str = f"{today.year}-01-01"
+        elif preset == "1A":
+            self.start_date_str = (today - timedelta(days=365)).strftime("%Y-%m-%d")
+        self.end_date_str = today.strftime("%Y-%m-%d")
+
+        if hasattr(self, 'input_start_date'):
+            self.input_start_date.value = self.start_date_str
+        if hasattr(self, 'input_end_date'):
+            self.input_end_date.value = self.end_date_str
+
+        asyncio.create_task(self._refresh_data_async())
+
+    def _export_csv_action(self):
+        """Exporta los datos a CSV en data/derivatives/ y lanza la descarga en el navegador."""
+        if not self.data or not self.data.get("klines"):
+            ui.notify("No hay datos cargados para exportar.", type="warning")
+            return
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{self.current_symbol}_derivatives_{self.current_period}_{timestamp_str}.csv"
+        os.makedirs(os.path.join("data", "derivatives"), exist_ok=True)
+        filepath = os.path.join("data", "derivatives", filename)
+        ok = self.provider.export_dashboard_to_csv(self.data, filepath)
+        if ok:
+            ui.notify(f"Archivo exportado: {filename}", type="positive")
+            ui.download(filepath, filename=filename)
+        else:
+            ui.notify("Error al exportar archivo CSV", type="negative")
+
     async def _refresh_data_async(self):
-        """Descarga los datos de derivados en background y actualiza Plotly con el periodo seleccionado."""
+        """Descarga los datos de derivados en background y actualiza Plotly con el periodo y rango seleccionados."""
         if self.is_loading:
             return
         self.is_loading = True
@@ -176,14 +278,30 @@ class DerivativesAnalyzerPage:
         loop = asyncio.get_event_loop()
         clean_sym = self.current_symbol
         period = self.current_period
+        s_date = self.start_date_str
+        e_date = self.end_date_str
 
         try:
             # Llamada síncrona en hilo separado para no bloquear event loop
             data = await loop.run_in_executor(
                 None, 
-                lambda: self.provider.get_aggregated_derivatives_dashboard(clean_sym, period=period)
+                lambda: self.provider.get_aggregated_derivatives_dashboard(
+                    clean_sym, 
+                    period=period,
+                    start_date_str=s_date,
+                    end_date_str=e_date
+                )
             )
             self.data = data
+
+            # Actualizar badge de caché vs red
+            if data.get("from_cache"):
+                self.badge_cache.set_text("⚡ Caché Local (Parquet)")
+                self.badge_cache.classes(replace="text-[11px] font-mono px-2.5 py-1 rounded-full bg-emerald-950/60 text-emerald-400 border border-emerald-800")
+            else:
+                self.badge_cache.set_text("🌐 Binance API")
+                self.badge_cache.classes(replace="text-[11px] font-mono px-2.5 py-1 rounded-full bg-blue-950/60 text-blue-400 border border-blue-800")
+
             self._update_kpis(data)
             self._update_charts(data)
         except Exception as e:
@@ -239,7 +357,59 @@ class DerivativesAnalyzerPage:
         self.kpi_basis_val.set_text(f"Basis Spread: {basis:+.3f}%")
 
     def _update_charts(self, d: Dict[str, Any]):
-        # 1. Chart Funding
+        # 0. Chart Principal OHLCV Candlestick + Volume
+        klines = d.get("klines", [])
+        if klines:
+            times_k = [datetime.fromtimestamp(x["timestamp"] / 1000.0) for x in klines]
+            opens = [x["open"] for x in klines]
+            highs = [x["high"] for x in klines]
+            lows = [x["low"] for x in klines]
+            closes = [x["close"] for x in klines]
+            volumes = [x["volume"] for x in klines]
+
+            fig_p = go.Figure()
+            fig_p.add_trace(go.Candlestick(
+                x=times_k,
+                open=opens,
+                high=highs,
+                low=lows,
+                close=closes,
+                name='Precio (USDT)',
+                increasing_line_color='#10b981',
+                decreasing_line_color='#f43f5e',
+                yaxis='y1'
+            ))
+            vol_colors = ['rgba(16, 185, 129, 0.4)' if c >= o else 'rgba(244, 63, 94, 0.4)' for o, c in zip(opens, closes)]
+            fig_p.add_trace(go.Bar(
+                x=times_k,
+                y=volumes,
+                name='Volumen',
+                marker_color=vol_colors,
+                yaxis='y2',
+                opacity=0.6,
+                hovertemplate='%{x|%d %b %H:%M}<br>Volumen: %{y:,.2f}<extra></extra>'
+            ))
+
+            max_vol = max(volumes) if volumes else 1.0
+            fig_p.update_layout(
+                paper_bgcolor='#0d121f',
+                plot_bgcolor='#0d121f',
+                margin=dict(l=50, r=50, t=20, b=30),
+                font=dict(color='#94a3b8', family='monospace', size=10),
+                xaxis=dict(gridcolor='#1e293b', rangeslider=dict(visible=False)),
+                yaxis=dict(gridcolor='#1e293b', title='Precio (USDT)', side='left'),
+                yaxis2=dict(
+                    title='Volumen',
+                    side='right',
+                    overlaying='y',
+                    showgrid=False,
+                    range=[0, max_vol * 4]
+                ),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            self.chart_price.update_figure(fig_p)
+
+        # 1. Chart Funding Rate
         funding_hist = d.get("funding_hist", [])
         if funding_hist:
             times = [datetime.fromtimestamp(x["funding_time"]/1000.0) for x in funding_hist]

@@ -103,6 +103,8 @@ class RiskManager:
         # 2. CÁLCULO DE TAKE PROFIT (TP)
         # ═════════════════════════════════════════════════════════════
         raw_tp_type = str(self.tp_config.get("type", "fixed")).lower().strip().replace(" ", "_")
+        if raw_tp_type == "dynamic":
+            raw_tp_type = str(self.tp_config.get("dynamic_method", self.tp_config.get("method", "risk_reward"))).lower().strip().replace(" ", "_")
         tp_val = float(self.tp_config.get("value", 4.0))
         tp_price = None
 
