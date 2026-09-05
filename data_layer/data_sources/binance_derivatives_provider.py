@@ -260,15 +260,16 @@ class BinanceDerivativesProvider:
             logger.error("Excepción en get_premium_index_and_basis: %s", e)
             return {}
 
-    def get_aggregated_derivatives_dashboard(self, symbol: str = "BTCUSDT") -> Dict[str, Any]:
+    def get_aggregated_derivatives_dashboard(self, symbol: str = "BTCUSDT", period: str = "1h") -> Dict[str, Any]:
         """Consolida todas las métricas en una única estructura para el Dashboard."""
         clean_sym = symbol.replace("/", "").upper()
+        clean_period = period.strip().lower()
         premium = self.get_premium_index_and_basis(clean_sym)
         funding_hist = self.get_funding_rate_history(clean_sym, limit=60)
-        oi_hist = self.get_open_interest_history(clean_sym, period="1h", limit=48)
-        top_ls = self.get_top_long_short_account_ratio(clean_sym, period="1h", limit=48)
-        glob_ls = self.get_global_long_short_account_ratio(clean_sym, period="1h", limit=48)
-        taker_ls = self.get_taker_long_short_ratio(clean_sym, period="1h", limit=48)
+        oi_hist = self.get_open_interest_history(clean_sym, period=clean_period, limit=48)
+        top_ls = self.get_top_long_short_account_ratio(clean_sym, period=clean_period, limit=48)
+        glob_ls = self.get_global_long_short_account_ratio(clean_sym, period=clean_period, limit=48)
+        taker_ls = self.get_taker_long_short_ratio(clean_sym, period=clean_period, limit=48)
 
         # Últimas lecturas
         latest_top_ratio = top_ls[-1]["long_short_ratio"] if top_ls else 1.0

@@ -42,23 +42,13 @@ class DerivativesAnalyzerPage:
                         ui.label('Binance Futures USDⓈ-M • Funding Rate • Open Interest • Ratios Ballenas/Retail • Flujo Taker').classes('text-xs text-slate-400')
 
                 with ui.row().classes('items-center gap-2'):
-                    # Selector de Símbolo
-                    with ui.row().classes('bg-[#151c2e] p-1 rounded-lg border border-[#1e293b]'):
-                        for s in ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]:
-                            btn_style = 'bg-amber-500 text-black font-bold' if s == self.current_symbol else 'text-slate-400 hover:text-white'
-                            ui.button(
-                                s.replace("USDT", ""), 
-                                on_click=lambda sym=s: self._change_symbol(sym)
-                            ).props('dense flat no-caps').classes(f'text-xs px-2.5 py-1 rounded {btn_style}')
+                    # Selector dinámico de Símbolo
+                    self.symbol_buttons_row = ui.row().classes('bg-[#151c2e] p-1 rounded-lg border border-[#1e293b]')
+                    self._render_symbol_buttons()
 
-                    # Selector de Periodo para Ratios y OI
-                    with ui.row().classes('bg-[#151c2e] p-1 rounded-lg border border-[#1e293b]'):
-                        for p in ["15m", "1h", "4h", "1d"]:
-                            btn_style = 'bg-blue-600 text-white font-bold' if p == self.current_period else 'text-slate-400 hover:text-white'
-                            ui.button(
-                                p, 
-                                on_click=lambda per=p: self._change_period(per)
-                            ).props('dense flat no-caps').classes(f'text-xs px-2 py-1 rounded {btn_style}')
+                    # Selector dinámico de Periodo para Ratios y OI
+                    self.period_buttons_row = ui.row().classes('bg-[#151c2e] p-1 rounded-lg border border-[#1e293b]')
+                    self._render_period_buttons()
 
                     # Botón de Actualizar
                     self.btn_refresh = ui.button(
@@ -138,16 +128,46 @@ class DerivativesAnalyzerPage:
     # Métodos y Actualizaciones
     # ──────────────────────────────────────────────────────────────
 
+    def _render_symbol_buttons(self):
+        """Renderiza los botones de selección de activo con el estado activo actualizado."""
+        self.symbol_buttons_row.clear()
+        with self.symbol_buttons_row:
+            for s in ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]:
+                is_active = (s == self.current_symbol)
+                btn_style = 'bg-amber-500 text-black font-bold' if is_active else 'text-slate-400 hover:text-white'
+                ui.button(
+                    s.replace("USDT", ""), 
+                    on_click=lambda sym=s: self._change_symbol(sym)
+                ).props('dense flat no-caps').classes(f'text-xs px-2.5 py-1 rounded {btn_style}')
+
+    def _render_period_buttons(self):
+        """Renderiza los botones de timeframe con el estado activo actualizado."""
+        self.period_buttons_row.clear()
+        with self.period_buttons_row:
+            for p in ["15m", "1h", "4h", "1d"]:
+                is_active = (p == self.current_period)
+                btn_style = 'bg-blue-600 text-white font-bold' if is_active else 'text-slate-400 hover:text-white'
+                ui.button(
+                    p, 
+                    on_click=lambda per=p: self._change_period(per)
+                ).props('dense flat no-caps').classes(f'text-xs px-2.5 py-1 rounded {btn_style}')
+
     def _change_symbol(self, sym: str):
+        if self.current_symbol == sym:
+            return
         self.current_symbol = sym
+        self._render_symbol_buttons()
         asyncio.create_task(self._refresh_data_async())
 
     def _change_period(self, per: str):
+        if self.current_period == per:
+            return
         self.current_period = per
+        self._render_period_buttons()
         asyncio.create_task(self._refresh_data_async())
 
     async def _refresh_data_async(self):
-        """Descarga los datos de derivados en background y actualiza Plotly."""
+        """Descarga los datos de derivados en background y actualiza Plotly con el periodo seleccionado."""
         if self.is_loading:
             return
         self.is_loading = True
@@ -161,7 +181,7 @@ class DerivativesAnalyzerPage:
             # Llamada síncrona en hilo separado para no bloquear event loop
             data = await loop.run_in_executor(
                 None, 
-                lambda: self.provider.get_aggregated_derivatives_dashboard(clean_sym)
+                lambda: self.provider.get_aggregated_derivatives_dashboard(clean_sym, period=period)
             )
             self.data = data
             self._update_kpis(data)
