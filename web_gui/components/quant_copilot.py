@@ -18,6 +18,7 @@ from api.mcp.binance_mcp_server import (
     binance_get_market_price,
     binance_analyze_portfolio_risk,
     binance_cancel_all_orders,
+    binance_get_daily_trades,
 )
 
 
@@ -85,6 +86,7 @@ class QuantCopilotChat:
 
                 quick_pill('💰 Saldo', '¿Cuál es mi saldo en Testnet?')
                 quick_pill('📈 Posiciones', '¿Qué posiciones tengo abiertas?')
+                quick_pill('📜 Trades Hoy', '¿Cuántas operaciones he hecho hoy?')
                 quick_pill('🛡️ VaR & Riesgo', 'Analiza el riesgo de mi cartera')
                 quick_pill('⚡ BTC & Funding', 'Precio y funding de BTCUSDT')
                 quick_pill('🗑️ Limpiar Órdenes', 'Cancela todas las órdenes de BTCUSDT')
@@ -217,11 +219,43 @@ class QuantCopilotChat:
 
                 chips = [
                     {"label": "🛡️ Calcular VaR de Riesgo", "query": "Analiza el riesgo de mi cartera"},
+                    {"label": "📈 Ver Posiciones", "query": "¿Qué posiciones tengo abiertas?"},
+                    {"label": "📜 Operaciones de Hoy", "query": "¿Cuántas operaciones he hecho hoy?"}
+                ]
+
+            # 2. Operaciones y Trades Ejecutados (Hoy o Recientes)
+            elif any(w in q_lower for w in ["operacion", "operaciones", "trades", "hice", "hecho", "cuantas", "historial", "ejecutad"]):
+                raw = await loop.run_in_executor(None, lambda: binance_get_daily_trades(symbol="BTCUSDT", use_testnet=True))
+                data = json.loads(raw)
+                if data.get("success"):
+                    cnt = data.get("trades_count", 0)
+                    pnl = data.get("total_realized_pnl_usd", 0.0)
+                    comm = data.get("total_commission_usd", 0.0)
+                    sign = "+" if pnl >= 0 else ""
+                    tag = "de hoy" if data.get("is_today_only") else "recientes registradas"
+                    reply_text = (
+                        f"📊 **Auditoría de Operaciones ({data.get('network', 'Testnet')}):**\n\n"
+                        f"• **Operaciones {tag}:** `{cnt}` ejecuciones\n"
+                        f"• **Compras (BUY):** `{data.get('buy_trades', 0)}` | **Ventas (SELL):** `{data.get('sell_trades', 0)}`\n"
+                        f"• **PnL Realizado Neto:** `{sign}${pnl:,.4f} USDT`\n"
+                        f"• **Comisiones Pagadas:** `${comm:,.4f} USDT`\n\n"
+                    )
+                    recent = data.get("recent_trades", [])
+                    if recent:
+                        reply_text += "**Últimas Ejecuciones:**\n"
+                        for r in recent[-4:]:
+                            s_icon = "🟢 COMPRA" if r['side'] == 'BUY' else "🔴 VENTA"
+                            reply_text += f"- `{r['time']}` **{s_icon}** {r['qty']} BTC @ `${r['price']:,.2f}` (PnL: `{r['pnl']:+.4f}`)\n"
+                else:
+                    reply_text = f"⚠️ **Error consultando operaciones:** {data.get('error')}"
+
+                chips = [
+                    {"label": "💰 Ver Saldo", "query": "¿Cuál es mi saldo actual?"},
                     {"label": "📈 Ver Posiciones", "query": "¿Qué posiciones tengo abiertas?"}
                 ]
 
-            # 2. Posiciones Abiertas
-            elif any(w in q_lower for w in ["posicion", "posiciones", "trades", "abiertas", "contratos"]):
+            # 3. Posiciones Abiertas
+            elif any(w in q_lower for w in ["posicion", "posiciones", "abiertas", "contratos"]):
                 raw = await loop.run_in_executor(None, lambda: binance_get_positions(use_testnet=True))
                 data = json.loads(raw)
                 if data.get("success"):

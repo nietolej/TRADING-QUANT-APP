@@ -23,6 +23,8 @@ from .pages.mle_thermometer_page import render_mle_thermometer_page
 from .pages.onchain_analyzer_page import render_onchain_analyzer
 from .pages.halving_analyzer_page import render_halving_analyzer
 from .pages.binance_account_page import render_binance_account_page
+from .pages.derivatives_analyzer_page import render_derivatives_analyzer_page
+from .pages.options_algo_page import render_options_algo_page
 from .components.api_credentials_dialog import open_api_credentials_dialog
 from .components.quant_copilot import render_quant_copilot
 
@@ -281,6 +283,8 @@ def create_gui(app):
                 menu_item('Análisis On-Chain', 'currency_exchange', 'onchain')
                 menu_item('Live Monitor', 'play_circle', 'live')
                 menu_item('Cartera & Riesgo Binance', 'account_balance_wallet', 'binance_account')
+                menu_item('Derivados & Futuros', 'query_stats', 'derivatives')
+                menu_item('Opciones & TWAP/POV', 'hub', 'options_algo')
                 
                 # Contenedor seguro para referencia del Copiloto
                 copilot_holder = [None]
@@ -410,6 +414,12 @@ def create_gui(app):
 
             with ui.column().classes('w-full h-full') as pages['binance_account']:
                 render_binance_account_page()
+
+            with ui.column().classes('w-full h-full') as pages['derivatives']:
+                render_derivatives_analyzer_page()
+
+            with ui.column().classes('w-full h-full') as pages['options_algo']:
+                render_options_algo_page()
 
         # Renderizar Copiloto Cuantitativo Flotante (Conectado a Binance MCP)
         copilot_holder[0] = render_quant_copilot()

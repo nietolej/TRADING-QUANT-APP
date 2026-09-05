@@ -8,6 +8,7 @@ import sys
 import os
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 # Asegurar que el directorio raíz del proyecto esté en el PYTHONPATH
@@ -295,6 +296,60 @@ def binance_cancel_all_orders(symbol: str = "BTCUSDT", use_testnet: bool = True)
             "symbol": sym_clean,
             "network": "Testnet" if use_testnet else "Real",
             "message": f"Órdenes canceladas para {sym_clean}" if ok else f"Fallo al cancelar: {err}"
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+def binance_get_daily_trades(symbol: str = "BTCUSDT", use_testnet: bool = True, limit: int = 50) -> str:
+    """
+    Obtiene las operaciones y trades ejecutados hoy en Binance Futures.
+    Calcula total de operaciones, PnL realizado neto, comisiones y detalle de últimas ejecuciones.
+    """
+    client = BinanceTestnetClient(use_testnet=use_testnet)
+    try:
+        clean_sym = symbol.replace("/", "").upper()
+        raw_trades = client.client.futures_account_trades(symbol=clean_sym, limit=limit)
+        
+        # Filtrar trades del día actual (UTC)
+        now_dt = datetime.now(timezone.utc)
+        today_start_ms = int(datetime(now_dt.year, now_dt.month, now_dt.day, 0, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        
+        today_trades = [t for t in raw_trades if int(t.get("time", 0)) >= today_start_ms]
+        # Si hoy no hay trades, mostrar los más recientes para dar información útil
+        display_trades = today_trades if today_trades else raw_trades[-10:]
+        is_today_only = bool(today_trades)
+
+        total_realized_pnl = sum(float(t.get("realizedPnl", 0.0)) for t in display_trades)
+        total_commission = sum(float(t.get("commission", 0.0)) for t in display_trades)
+        buy_count = sum(1 for t in display_trades if t.get("side") == "BUY")
+        sell_count = sum(1 for t in display_trades if t.get("side") == "SELL")
+
+        formatted_trades = []
+        for t in display_trades[-5:]:
+            t_time = datetime.fromtimestamp(int(t.get("time", 0)) / 1000.0, tz=timezone.utc).strftime("%H:%M:%S")
+            formatted_trades.append({
+                "time": t_time,
+                "side": t.get("side"),
+                "price": float(t.get("price", 0.0)),
+                "qty": float(t.get("qty", 0.0)),
+                "pnl": float(t.get("realizedPnl", 0.0)),
+                "commission": float(t.get("commission", 0.0))
+            })
+
+        return json.dumps({
+            "success": True,
+            "network": "Testnet" if use_testnet else "Real",
+            "symbol": clean_sym,
+            "is_today_only": is_today_only,
+            "trades_count": len(display_trades),
+            "today_count": len(today_trades),
+            "buy_trades": buy_count,
+            "sell_trades": sell_count,
+            "total_realized_pnl_usd": round(total_realized_pnl, 4),
+            "total_commission_usd": round(total_commission, 4),
+            "recent_trades": formatted_trades
         }, indent=2)
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)}, indent=2)
