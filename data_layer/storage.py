@@ -1,5 +1,5 @@
 import os
-from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, UniqueConstraint
+from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, UniqueConstraint, event
 from sqlalchemy.orm import declarative_base, sessionmaker
 from dotenv import load_dotenv
 
@@ -11,7 +11,25 @@ db_path = db_url.replace("sqlite:///", "")
 if db_path and not db_path.startswith(":memory:"):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
-engine = create_engine(db_url)
+connect_args = {}
+if db_url.startswith("sqlite"):
+    connect_args["check_same_thread"] = False
+    connect_args["timeout"] = 15
+
+engine = create_engine(db_url, connect_args=connect_args)
+
+if db_url.startswith("sqlite"):
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, connection_record):
+        try:
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=10000")
+            cursor.close()
+        except Exception:
+            pass
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

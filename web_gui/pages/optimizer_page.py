@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 
 from data_layer.storage import SessionLocal, OHLCV
 from data_layer.market_data import MarketDataManager, normalize_timeframe
-from backtest_engine.optimizer import run_grid_search, count_combinations, _build_range, run_walk_forward
+from backtest_engine.optimizer import run_grid_search, count_combinations, _build_range, run_walk_forward, MAX_GRID_COMBINATIONS
 from backtest_engine.robustness_analyzer import analyze_robustness
 from sqlalchemy import func
 from data_layer.export_utils import format_date_display, format_dt_display, parse_flexible_date
@@ -1217,6 +1217,13 @@ def render_optimizer_page(on_go_to_analyzer=None):
             if total_combos == 0:
                 ui.notify('El rango configurado produce 0 combinaciones.', type='warning')
                 return
+            if total_combos > MAX_GRID_COMBINATIONS:
+                ui.notify(
+                    f'⛔ {total_combos:,} combinaciones excede el máximo permitido '
+                    f'({MAX_GRID_COMBINATIONS:,}). Reduce el rango o aumenta el paso de los parámetros.',
+                    type='negative', timeout=8000
+                )
+                return
 
             # Preparar Token de Cancelación y UI
             cancel_token['event'] = threading.Event()
@@ -1364,6 +1371,20 @@ def render_optimizer_page(on_go_to_analyzer=None):
                 opt_progress.value = 1.0
                 total_duration = max(0.1, time.time() - start_time)
                 lbl_progress.set_text(f'✅ Completado: {len(rows):,} combinaciones en {total_duration:.1f}s ({len(rows)/total_duration:.1f} combos/s)')
+
+                # El ranking ordena solo por la métrica elegida (in-sample) y no penaliza
+                # combinaciones con pocas operaciones, donde un Sharpe/PF alto puede ser puro
+                # ruido estadístico en vez de una ventaja real. Se advierte explícitamente en
+                # vez de dejar que el usuario confíe en el top 1 sin ese contexto.
+                MIN_TRADES_FOR_CONFIDENCE = 10
+                top_result = results[0] if results else None
+                if top_result and not top_result.get('error') and top_result.get('total_trades', 0) < MIN_TRADES_FOR_CONFIDENCE:
+                    ui.notify(
+                        f"⚠️ El mejor resultado (#1) tiene solo {top_result.get('total_trades', 0)} operaciones — "
+                        "la métrica puede no ser estadísticamente significativa (riesgo de sobreajuste). "
+                        "Considera validarlo con Walk-Forward antes de usarlo en real.",
+                        type='warning', timeout=10000
+                    )
 
                 # 6. Renderizar Gráfico Plotly Top 5
                 top_5 = [r for r in results[:5] if r.get('equity_curve')]

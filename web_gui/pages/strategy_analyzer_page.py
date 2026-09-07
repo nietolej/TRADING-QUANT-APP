@@ -623,9 +623,21 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
             import logging as _logging
             _logging.info("run_backtest: started")
 
+            # Guarda de aplicación contra doble-clic: btn_run.disable() no es instantáneo
+            # en el cliente (viaja por WebSocket), así que un doble clic muy rápido puede
+            # disparar dos tareas asíncronas concurrentes antes de que el botón se refleje
+            # como deshabilitado en el navegador. Esta bandera en memoria corta la segunda
+            # ejecución inmediatamente, evitando que ambas mezclen resultados en el mismo
+            # gráfico/tabla compartidos.
+            if state.get('_backtest_running'):
+                ui.notify("Ya hay un backtest en ejecución. Espera a que termine.", type="warning")
+                return
+
             if not state['strategy_name']:
                 ui.notify("No hay estrategia seleccionada", type="warning")
                 return
+
+            state['_backtest_running'] = True
 
             # Obtain client from the button element directly (avoids slot context issues in background tasks)
             client = btn_run.client
@@ -886,7 +898,9 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
 
                             except Exception as _me:
                                 import traceback as _tb
-                                ui.notify(f"Error métricas: {_me}\n{_tb.format_exc()[:400]}", type='negative', timeout=15000)
+                                import logging as _log_me
+                                _log_me.error("Error calculando métricas del backtest:\n%s", _tb.format_exc())
+                                ui.notify(f"Error calculando métricas: {_me}", type='negative', timeout=15000)
     
                         else:
                             lbl_cagr.set_text("0.00%"); lbl_maxdd.set_text("0.00%")
@@ -1027,10 +1041,14 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                                         await asyncio.sleep(0)
                                     v_pnl = trow.get('pnl', 0)
                                     pnl_quote   = float(v_pnl) if v_pnl is not None and v_pnl == v_pnl else 0.0
-                                    v_ent = trow.get('entry_price', 1)
-                                    entry_price = float(v_ent) if v_ent is not None and v_ent == v_ent else 1.0
-                                    v_ex = trow.get('exit_price', 1)
-                                    exit_price  = float(v_ex) if v_ex is not None and v_ex == v_ex else 1.0
+                                    # Default 0 (no 1): un precio faltante/NaN debe anular los cálculos
+                                    # de pnl/balance que dependen de él (guardados por los checks
+                                    # `entry_price > 0` / `exit_price > 0` de abajo), en vez de simular
+                                    # un precio de 1.0 que podría pasar por un dato real válido.
+                                    v_ent = trow.get('entry_price', 0)
+                                    entry_price = float(v_ent) if v_ent is not None and v_ent == v_ent else 0.0
+                                    v_ex = trow.get('exit_price', 0)
+                                    exit_price  = float(v_ex) if v_ex is not None and v_ex == v_ex else 0.0
                                     side        = str(trow.get('side', '')).upper()
                                     pnl_base    = pnl_quote / exit_price if exit_price > 0 else 0
         
@@ -1234,6 +1252,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                     btn_run.set_text("EJECUTAR PRUEBA RETROSPECTIVA")
                 except Exception:
                     pass
+                state['_backtest_running'] = False
 
  
 

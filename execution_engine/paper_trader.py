@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 import asyncio
 import threading
@@ -7,12 +8,14 @@ import pandas as pd
 from datetime import datetime, timezone
 from typing import Optional, Callable
 
-from .binance_client import BinanceTestnetClient
+from .binance_client import BinanceTestnetClient, format_binance_error
 from strategy_engine.base_strategy import BaseStrategy
 from strategy_engine.conditions import ConditionEvaluator
 from data_layer.storage import SessionLocal, PaperTrade
 
 logger = logging.getLogger(__name__)
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 
 
 class Position:
@@ -91,6 +94,8 @@ class PaperTrader:
         self.is_running = False
         self.status = "STOPPED"  # STOPPED, STARTING, RUNNING, ERROR
         self.status_message = "Detenido"
+        self.started_at: Optional[str] = None
+        self.unexecuted_orders: list[dict] = []
         self.log_lines: list[str] = []
         
         self.current_bid = 0.0
@@ -115,7 +120,7 @@ class PaperTrader:
     # Ciclo de vida
     # ──────────────────────────────────────────────────────────────
 
-    def start(self):
+    def start(self, reset_started_at: bool = True):
         """Descarga histórico de velas y conecta el polling de Binance."""
         if self.is_running:
             return
@@ -123,6 +128,8 @@ class PaperTrader:
         self.status = "STARTING"
         self.status_message = "Iniciando..."
         self.is_running = True
+        if reset_started_at or not self.started_at:
+            self.started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         self._notify(
             f"🚀 Iniciando Bot '{self.name}' | {self.symbol} {self.timeframe} | "
@@ -132,10 +139,10 @@ class PaperTrader:
         try:
             self._client = BinanceTestnetClient(use_testnet=self.use_testnet)
         except Exception as e:
-            err_msg = f"❌ Error conectando a Binance: {e}"
-            self._notify(err_msg)
+            friendly_msg = format_binance_error(e)
+            self._notify(f"❌ Error conectando a Binance: {friendly_msg}")
             self.status = "ERROR"
-            self.status_message = str(e)
+            self.status_message = friendly_msg
             self.is_running = False
             return
 
@@ -147,10 +154,10 @@ class PaperTrader:
                 symbol=binance_symbol, interval=self.timeframe, limit=300
             )
         except Exception as e:
-            err_msg = f"❌ Error descargando histórico: {e}"
-            self._notify(err_msg)
+            friendly_msg = format_binance_error(e)
+            self._notify(f"❌ Error descargando histórico: {friendly_msg}")
             self.status = "ERROR"
-            self.status_message = str(e)
+            self.status_message = friendly_msg
             self.is_running = False
             return
 
@@ -182,9 +189,10 @@ class PaperTrader:
             )
         except Exception as e:
             logger.error("Exception processing klines: %s", e, exc_info=True)
-            self._notify(f"❌ Error procesando histórico: {e}")
+            friendly_msg = format_binance_error(e)
+            self._notify(f"❌ Error procesando histórico: {friendly_msg}")
             self.status = "ERROR"
-            self.status_message = str(e)
+            self.status_message = friendly_msg
             self.is_running = False
             return
 
@@ -414,6 +422,8 @@ class PaperTrader:
             "status": self.status,
             "status_message": self.status_message,
             "is_running": bool(self.is_running),
+            "started_at": self.started_at,
+            "unexecuted_orders": self.unexecuted_orders[-100:],
             "custom_parameters": self.custom_parameters,
             "order_types": self.order_types,
             "position": pos_data,
@@ -430,11 +440,45 @@ class PaperTrader:
         self.use_testnet = bool(data.get("use_testnet", self.use_testnet))
         self.status = data.get("status", "STOPPED")
         self.status_message = data.get("status_message", "Detenido")
+        self.started_at = data.get("started_at")
+        if not self.started_at:
+            for line in reversed(data.get("log_lines", [])):
+                if "Iniciando Bot" in line and line.startswith("["):
+                    t_str = line[1:9]
+                    self.started_at = f"{datetime.now().strftime('%Y-%m-%d')} {t_str}"
+                    break
         self.custom_parameters = data.get("custom_parameters", {})
         self.order_types = data.get("order_types", self.order_types)
         self.stats = data.get("stats", self.stats)
         self.trade_history = data.get("trade_history", [])
         self.log_lines = data.get("log_lines", [])
+        self.unexecuted_orders = data.get("unexecuted_orders", [])
+
+        # Si no había historial de órdenes no ejecutadas explícito, extraer fallos históricos de log_lines
+        if not self.unexecuted_orders:
+            for line in self.log_lines:
+                if "NO ejecutada en Binance" in line or "Fallo al ejecutar orden" in line:
+                    t_match = line[1:9] if line.startswith("[") else datetime.now().strftime("%H:%M:%S")
+                    reason_part = line.split("(", 1)[1].rstrip(")") if "(" in line else line
+                    self.unexecuted_orders.append({
+                        "order_id": f"unexec_hist_{len(self.unexecuted_orders)}",
+                        "bot_id": self.bot_id,
+                        "bot_name": self.name,
+                        "symbol": self.symbol,
+                        "timeframe": self.timeframe,
+                        "strategy_name": self.strategy_name,
+                        "network": "Testnet" if self.use_testnet else "Real (Mainnet)",
+                        "timestamp": f"{datetime.now().strftime('%Y-%m-%d')} {t_match}",
+                        "action": "ENTRY" if "Entrada" in line else "EXIT",
+                        "side": "LONG" if "LONG" in line else ("SHORT" if "SHORT" in line else "BUY"),
+                        "order_type": self.order_types.get("entry", "MARKET"),
+                        "price": 0.0,
+                        "quantity": 0.0,
+                        "parameters": dict(self.custom_parameters or {}),
+                        "parameters_summary": " | ".join(f"{k}: {v}" for k, v in (self.custom_parameters or {}).items()) or "Estándar",
+                        "reason": reason_part,
+                        "details": {"raw_log": line}
+                    })
 
         # Restaurar posición abierta si existía
         pos_data = data.get("position")
@@ -584,6 +628,67 @@ class PaperTrader:
             except Exception as e:
                 logger.warning("Error enviando alerta de Telegram: %s", e)
 
+    def record_unexecuted_order(
+        self,
+        action: str,
+        side: str,
+        order_type: str,
+        price: float,
+        quantity: float,
+        reason: str,
+        details: Optional[dict] = None
+    ) -> dict:
+        """Registra de forma estructurada y persistente una orden no ejecutada/rechazada."""
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        active_params = self.custom_parameters or (self.strategy.parameters if self.strategy else {})
+        params_snapshot = dict(active_params) if isinstance(active_params, dict) else {}
+
+        record = {
+            "order_id": f"unexec_{int(time.time() * 1000)}_{len(self.unexecuted_orders)}",
+            "bot_id": self.bot_id,
+            "bot_name": self.name,
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "strategy_name": self.strategy_name,
+            "network": "Testnet" if self.use_testnet else "Real (Mainnet)",
+            "timestamp": now_str,
+            "action": action.upper(),
+            "side": side.upper(),
+            "order_type": order_type.upper(),
+            "price": float(price or 0.0),
+            "quantity": float(quantity or 0.0),
+            "parameters": params_snapshot,
+            "parameters_summary": " | ".join(f"{k}: {v}" for k, v in params_snapshot.items()) if params_snapshot else "Estándar",
+            "reason": str(reason),
+            "details": details or {}
+        }
+        self.unexecuted_orders.append(record)
+        self._append_to_global_unexecuted_log(record)
+        self._save_state()
+        return record
+
+    def _append_to_global_unexecuted_log(self, record: dict):
+        """Almacena la orden no ejecutada en un archivo de auditoría histórico global."""
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            audit_path = os.path.join(DATA_DIR, "unexecuted_orders_history.json")
+            history = []
+            if os.path.exists(audit_path):
+                try:
+                    with open(audit_path, "r", encoding="utf-8") as f:
+                        history = json.load(f)
+                    if not isinstance(history, list):
+                        history = []
+                except Exception:
+                    history = []
+            history.append(record)
+            if len(history) > 1000:
+                history = history[-1000:]
+            with open(audit_path, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.warning("Error guardando orden no ejecutada en log global: %s", e)
+
     # ──────────────────────────────────────────────────────────────
     # Gestión de posiciones
     # ──────────────────────────────────────────────────────────────
@@ -613,7 +718,17 @@ class PaperTrader:
             quantity = risk_mgr.compute_position_size(self.current_balance, price)
 
         if quantity <= 0:
-            self._notify(f"⚠️ Saldo insuficiente ({self.current_balance:.4f} {self.currency}) para abrir posición.")
+            err_msg = f"Saldo insuficiente ({self.current_balance:.4f} {self.currency}) para abrir posición"
+            self.record_unexecuted_order(
+                action="ENTRY",
+                side=side,
+                order_type=entry_type,
+                price=price,
+                quantity=quantity,
+                reason=err_msg,
+                details={"balance": self.current_balance, "currency": self.currency}
+            )
+            self._notify(f"⚠️ {err_msg}.")
             return
 
         # Calcular SL y TP usando compute_sl_tp del RiskManager
@@ -631,8 +746,18 @@ class PaperTrader:
         # Envío y comprobación activa de ejecución en Binance Futures si está configurado
         if self.use_testnet:
             if not self._client:
+                err_msg = "Modo Binance activo pero sin cliente conectado"
+                self.record_unexecuted_order(
+                    action="ENTRY",
+                    side=side,
+                    order_type=entry_type,
+                    price=price,
+                    quantity=quantity,
+                    reason=err_msg,
+                    details={"side": side, "symbol": self.symbol}
+                )
                 self._trigger_critical_order_alert(
-                    "Modo Binance activo pero sin cliente conectado",
+                    err_msg,
                     {"error": "Cliente Binance no inicializado", "side": side, "symbol": self.symbol}
                 )
                 return
@@ -646,6 +771,22 @@ class PaperTrader:
 
             # Validar si se ejecutó en el exchange
             if not ext_order or err:
+                err_msg = str(err or "Orden rechazada o no completada por Binance")
+                self.record_unexecuted_order(
+                    action="ENTRY",
+                    side=side,
+                    order_type=entry_type,
+                    price=price,
+                    quantity=quantity,
+                    reason=err_msg,
+                    details={
+                        "Tipo Orden": entry_type,
+                        "Lado": side.upper(),
+                        "Cantidad": f"{quantity:.4f}",
+                        "Precio Señal": f"{price:.2f}",
+                        "error": err_msg
+                    }
+                )
                 self._trigger_critical_order_alert(
                     f"Orden de Entrada {side.upper()} NO ejecutada en Binance",
                     {
@@ -653,7 +794,7 @@ class PaperTrader:
                         "Lado": side.upper(),
                         "Cantidad": f"{quantity:.4f}",
                         "Precio Señal": f"{price:.2f}",
-                        "error": err or "Orden rechazada o no completada por Binance"
+                        "error": err_msg
                     }
                 )
                 # Abortar apertura para evitar desincronización con el exchange
@@ -661,12 +802,26 @@ class PaperTrader:
 
             order_status = str(ext_order.get("status", "")).upper()
             if order_status not in ["FILLED", "PARTIALLY_FILLED", "NEW"]:
+                err_msg = f"Estado no operable devuelto por exchange: {order_status}"
+                self.record_unexecuted_order(
+                    action="ENTRY",
+                    side=side,
+                    order_type=entry_type,
+                    price=price,
+                    quantity=quantity,
+                    reason=err_msg,
+                    details={
+                        "ID Orden": ext_order.get("orderId"),
+                        "Estado": order_status,
+                        "error": err_msg
+                    }
+                )
                 self._trigger_critical_order_alert(
                     f"Orden de Entrada {side.upper()} en estado inválido ({order_status})",
                     {
                         "ID Orden": ext_order.get("orderId"),
                         "Estado": order_status,
-                        "error": f"Estado no operable: {order_status}"
+                        "error": err_msg
                     }
                 )
                 return
@@ -743,21 +898,46 @@ class PaperTrader:
                             f"Precio Fill: {price:.2f} | ID: {close_order.get('orderId')} | Status: {close_order.get('status')}"
                         )
                     else:
+                        err_msg = str(err or "Orden de cierre rechazada o no confirmada por Binance")
+                        self.record_unexecuted_order(
+                            action="EXIT",
+                            side="SELL" if pos.side == "long" else "BUY",
+                            order_type=exit_type,
+                            price=price,
+                            quantity=pos.quantity,
+                            reason=err_msg,
+                            details={
+                                "Lado Cierre": "SELL" if pos.side == "long" else "BUY",
+                                "Cantidad": f"{pos.quantity:.4f}",
+                                "Razón": reason,
+                                "error": err_msg
+                            }
+                        )
                         self._trigger_critical_order_alert(
                             f"Fallo al ejecutar orden de CIERRE ({exit_type}) en Binance",
                             {
                                 "Lado Cierre": "SELL" if pos.side == "long" else "BUY",
                                 "Cantidad": f"{pos.quantity:.4f}",
                                 "Razón": reason,
-                                "error": err or "Orden de cierre rechazada o no confirmada por Binance"
+                                "error": err_msg
                             }
                         )
 
                 # 3. Cancelación de seguridad posterior para asegurar 0 órdenes residuales
                 self._client.cancel_all_open_orders(self.symbol)
             else:
+                err_msg = "Modo Binance activo pero sin cliente conectado al cerrar"
+                self.record_unexecuted_order(
+                    action="EXIT",
+                    side="SELL" if pos.side == "long" else "BUY",
+                    order_type=exit_type,
+                    price=price,
+                    quantity=pos.quantity,
+                    reason=err_msg,
+                    details={"error": "Cliente Binance no inicializado", "symbol": self.symbol}
+                )
                 self._trigger_critical_order_alert(
-                    "Modo Binance activo pero sin cliente conectado al cerrar",
+                    err_msg,
                     {"error": "Cliente Binance no inicializado", "symbol": self.symbol}
                 )
 
@@ -817,6 +997,29 @@ class PaperTrader:
 
         # Persistir en BD
         self._save_trade_to_db(trade)
+
+        # ── Guardarraíl 3: Circuit Breaker de Pérdida Diaria (solo cuentas reales) ──
+        if not self.use_testnet:
+            today = datetime.now().date()
+            daily_pnl = sum(
+                t.get("pnl", 0.0) for t in self.trade_history
+                if isinstance(t.get("exit_time"), datetime) and t["exit_time"].date() == today
+            )
+            daily_pnl_pct = (daily_pnl / self.initial_balance * 100.0) if self.initial_balance > 0 else 0.0
+            from execution_engine.security_manager import check_circuit_breaker
+            breaker_tripped, cb_msg = check_circuit_breaker(daily_pnl_pct, bot_name=self.name)
+            if breaker_tripped:
+                self.stop()
+                if cb_msg:
+                    self._notify(cb_msg)
+                    self._trigger_critical_order_alert(
+                        "Circuit Breaker de Pérdida Diaria Activado",
+                        {
+                            "Bot": self.name,
+                            "PnL Diario": f"{daily_pnl_pct:.2f}%",
+                            "Acción": "Bot detenido y candado de trading real cerrado"
+                        }
+                    )
 
         emoji = "✅" if net_pnl > 0 else "❌"
         dec = 4 if is_base_currency else 2

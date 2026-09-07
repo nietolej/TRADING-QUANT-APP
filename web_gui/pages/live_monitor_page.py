@@ -9,7 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from typing import Optional, Dict, Any
 
-from execution_engine.bot_manager import bot_manager, BotManager
+from execution_engine.daemon_client import daemon_client as bot_manager, daemon_client, BotProxy
 from execution_engine.paper_trader import PaperTrader
 from execution_engine.binance_client import BinanceTestnetClient
 
@@ -638,7 +638,8 @@ class LiveMonitorPage:
             with ui.row().classes('w-full justify-between items-center mb-4'):
                 with ui.column().classes('gap-0'):
                     ui.label(f'⚙️ Configuración del Bot: {bot.name}').classes('text-xl font-bold text-yellow-400')
-                    status_sub = "🟢 Bot Corriendo (Cambios aplicados en caliente)" if bot.is_running else "🔴 Bot Detenido"
+                    started_info = f" (Activo desde: {bot.started_at})" if getattr(bot, 'started_at', None) else ""
+                    status_sub = f"🟢 Bot Corriendo{started_info}" if bot.is_running else "🔴 Bot Detenido"
                     ui.label(status_sub).classes('text-xs text-green-400 font-semibold' if bot.is_running else 'text-xs text-gray-400')
                 ui.button(icon='close', on_click=self.edit_bot_dialog.close).props('flat round dense text-color=gray-400')
 
@@ -1174,6 +1175,7 @@ class LiveMonitorPage:
             pass
 
     def _refresh_ui_elements(self, force_dom_rebuild: bool = False):
+        self._update_daemon_status_pill()
         bots = bot_manager.get_all_bots()
 
         # 1. Actualizar KPIs globales en sitio
@@ -1188,6 +1190,28 @@ class LiveMonitorPage:
             self.kpi_pnl_label.classes('text-green-400' if pnl_val >= 0 else 'text-red-400', remove='text-green-400 text-red-400')
         if hasattr(self, 'kpi_positions_label'):
             self.kpi_positions_label.set_text(f"{summary['active_positions']} activas | WR: {summary['win_rate']:.1f}%")
+
+        # Notificación emergente flotante en tiempo real si surge una nueva orden rechazada
+        all_unexec = bot_manager.get_unexecuted_orders("all")
+        curr_unexec_len = len(all_unexec)
+        if getattr(self, '_seen_unexec_count', None) is None:
+            self._seen_unexec_count = curr_unexec_len
+        elif curr_unexec_len > self._seen_unexec_count:
+            new_orders = all_unexec[:(curr_unexec_len - self._seen_unexec_count)]
+            self._seen_unexec_count = curr_unexec_len
+            for u in new_orders[:2]:
+                b_name = u.get("bot_name", "Bot")
+                act = u.get("action", "ORDEN")
+                side = u.get("side", "")
+                reason = u.get("reason", "Rechazada")
+                ui.notify(
+                    f"🚨 {b_name}: {act} {side} NO EJECUTADA — {reason}",
+                    type='negative',
+                    icon='warning',
+                    timeout=10000,
+                    position='top',
+                    close_button=True
+                )
 
         # 2. Renderizar / Actualizar Lista de Tarjetas de bots
         # Solo reconstruir el DOM completo si la cantidad de bots cambió o se forzó rebuild
@@ -1232,13 +1256,16 @@ class LiveMonitorPage:
                                 ui.label(b.name).classes('font-bold text-base text-white truncate max-w-[180px]')
                             
                             with ui.row().classes('items-center gap-1.5'):
+                                unexec_badge = ui.badge('', color='red-900').props('rounded').classes('text-[10px] font-bold text-red-300 border border-red-600')
+                                unexec_badge.set_visibility(False)
+                                widgets['unexec_badge'] = unexec_badge
                                 sel_badge = ui.badge('🎯 EN INSPECCIÓN' if is_selected else '👆 CLIC PARA SELECCIONAR', color='yellow-900' if is_selected else 'slate-800').props('rounded').classes('text-[10px] font-bold text-yellow-300' if is_selected else 'text-[10px] text-gray-400')
                                 widgets['sel_badge'] = sel_badge
                                 status_badge = ui.badge(b.status, color='gray').props('rounded outline').classes('text-xs font-bold')
                                 widgets['status_badge'] = status_badge
 
                         # Info técnica & Red
-                        with ui.row().classes('w-full gap-2 items-center mb-2 text-xs text-gray-400'):
+                        with ui.row().classes('w-full gap-2 items-center mb-2 text-xs text-gray-400 flex-wrap'):
                             ui.badge(b.symbol, color='blue-900').props('rounded').classes('text-blue-300 font-mono')
                             ui.badge(b.timeframe, color='purple-900').props('rounded').classes('text-purple-300 font-mono')
                             ui.badge(b.strategy_name.upper(), color='indigo-900').props('rounded').classes('text-indigo-300 font-bold')
@@ -1246,6 +1273,21 @@ class LiveMonitorPage:
                             net_col = 'text-yellow-400' if b.use_testnet else 'text-green-400'
                             net_label = ui.label(f"🌐 {net_txt}").classes(f'text-[11px] {net_col}')
                             widgets['net_label'] = net_label
+
+                            # Fecha y Hora de inicio/activación
+                            started_val = getattr(b, 'started_at', None)
+                            if b.is_running and started_val:
+                                started_badge_txt = f"⏱️ Activo: {started_val}"
+                                started_cls = 'bg-emerald-950/80 text-emerald-300 border-emerald-700/60 font-semibold'
+                            elif started_val:
+                                started_badge_txt = f"⏱️ Inicio: {started_val}"
+                                started_cls = 'bg-gray-800/80 text-gray-400 border-gray-700'
+                            else:
+                                started_badge_txt = "⏱️ Sin inicio"
+                                started_cls = 'bg-gray-900 text-gray-500 border-gray-800'
+
+                            started_badge = ui.badge(started_badge_txt).props('rounded outline').classes(f'text-[11px] font-mono border px-2 py-0.5 ml-auto {started_cls}')
+                            widgets['started_badge'] = started_badge
 
                         # PARÁMETROS DE LA ESTRATEGIA (Pills)
                         params_dict = b.custom_parameters or (b.strategy.parameters if b.strategy else {})
@@ -1324,6 +1366,30 @@ class LiveMonitorPage:
                     badge.set_text("DETENIDO")
                     badge.props('color=gray')
 
+            # Actualizar badge de alerta de órdenes rechazadas en la tarjeta
+            u_badge = w.get('unexec_badge')
+            if u_badge:
+                u_orders = getattr(b, 'unexecuted_orders', [])
+                if u_orders:
+                    u_badge.set_text(f"🚨 {len(u_orders)} RECHAZO{'S' if len(u_orders) > 1 else ''}")
+                    u_badge.set_visibility(True)
+                else:
+                    u_badge.set_visibility(False)
+
+            # Actualizar badge de fecha y hora de inicio
+            st_badge = w.get('started_badge')
+            if st_badge:
+                started_val = getattr(b, 'started_at', None)
+                if b.is_running and started_val:
+                    st_badge.set_text(f"⏱️ Activo: {started_val}")
+                    st_badge.classes('bg-emerald-950/80 text-emerald-300 border-emerald-700/60 font-semibold', remove='bg-gray-800/80 bg-gray-900 text-gray-400 text-gray-500 border-gray-700 border-gray-800')
+                elif started_val:
+                    st_badge.set_text(f"⏱️ Inicio: {started_val}")
+                    st_badge.classes('bg-gray-800/80 text-gray-400 border-gray-700', remove='bg-emerald-950/80 text-emerald-300 border-emerald-700/60 bg-gray-900 text-gray-500 border-gray-800 font-semibold')
+                else:
+                    st_badge.set_text("⏱️ Sin inicio")
+                    st_badge.classes('bg-gray-900 text-gray-500 border-gray-800', remove='bg-emerald-950/80 text-emerald-300 border-emerald-700/60 bg-gray-800/80 text-gray-400 border-gray-700 font-semibold')
+
             # Balance
             is_base = (b.currency.upper() == b.symbol.split("/")[0].upper() if "/" in b.symbol else False)
             dec = 4 if is_base else 2
@@ -1401,6 +1467,15 @@ class LiveMonitorPage:
                 self.btn_view_all.classes('bg-yellow-500 text-black font-bold', remove='flat text-gray-300 font-medium')
                 self.btn_view_selected.classes('flat text-gray-300 font-medium', remove='bg-yellow-500 text-black font-bold')
         self._last_trades_hash = None
+        self._last_unexec_hash = None
+        self._update_selected_bot_inspector()
+
+    def _clear_unexecuted_history(self):
+        """Limpia el historial de órdenes no ejecutadas para el bot o la cartera."""
+        target_id = self.selected_bot_id if self.trades_view_mode == "selected" else "all"
+        bot_manager.clear_unexecuted_orders(target_id)
+        ui.notify("Historial de órdenes no ejecutadas eliminado.", type='positive')
+        self._last_unexec_hash = None
         self._update_selected_bot_inspector()
 
     def _clear_trade_highlight(self):
@@ -1495,6 +1570,27 @@ class LiveMonitorPage:
             self.inspector_status_label.set_text(f"{bot.status} {status_emoji}")
         if hasattr(self, 'inspector_balance_label'):
             self.inspector_balance_label.set_text(f"Saldo: {bot.current_balance:,.{dec}f} {bot.currency}")
+        if hasattr(self, 'inspector_started_label'):
+            started_val = getattr(bot, 'started_at', None)
+            if bot.is_running and started_val:
+                self.inspector_started_label.set_text(f"⏱️ Activo: {started_val}")
+                self.inspector_started_label.classes('text-emerald-400 font-semibold', remove='text-gray-400')
+            elif started_val:
+                self.inspector_started_label.set_text(f"⏱️ Inicio: {started_val}")
+                self.inspector_started_label.classes('text-gray-400', remove='text-emerald-400 font-semibold')
+            else:
+                self.inspector_started_label.set_text("⏱️ No iniciado")
+                self.inspector_started_label.classes('text-gray-400', remove='text-emerald-400 font-semibold')
+
+        # Actualizar banner de alerta del inspector si hay fallas en el bot
+        if hasattr(self, 'inspector_alert_banner') and hasattr(self, 'inspector_alert_label'):
+            u_list = getattr(bot, 'unexecuted_orders', [])
+            if u_list:
+                latest = u_list[-1]
+                self.inspector_alert_label.set_text(f"🚨 ÚLTIMA ORDEN {latest.get('action', '')} {latest.get('side', '')} RECHAZADA: {latest.get('reason', '')}")
+                self.inspector_alert_banner.set_visibility(True)
+            else:
+                self.inspector_alert_banner.set_visibility(False)
         
         if hasattr(self, 'inspector_winrate_label'):
             self.inspector_winrate_label.set_text(f"{stats.get('win_rate', 0.0):.1f}% ({stats.get('wins', 0)}G / {stats.get('losses', 0)}P)")
@@ -1666,7 +1762,42 @@ class LiveMonitorPage:
                 self.trades_grid.update()
                 self._last_trades_hash = trades_fingerprint
 
-        # 6. Consola de logs
+        # 7. Tabla de Órdenes No Ejecutadas / Rechazadas (AG Grid)
+        if hasattr(self, 'unexecuted_grid'):
+            unexec_target_id = self.selected_bot_id if self.trades_view_mode == "selected" else "all"
+            unexec_orders = bot_manager.get_unexecuted_orders(unexec_target_id)
+            unexec_rows = []
+            for u in unexec_orders:
+                side_icon = "📈 " if "LONG" in str(u.get('side', '')) or "BUY" in str(u.get('side', '')) else "📉 "
+                act_str = f"{side_icon}{u.get('action', 'ENTRY')} {u.get('side', '')}"
+                price_val = float(u.get('price', 0.0))
+                qty_val = float(u.get('quantity', 0.0))
+                pq_str = f"{price_val:,.2f} | {qty_val:.4f}" if (price_val > 0 or qty_val > 0) else "-"
+                params_str = u.get('parameters_summary') or "Estándar"
+
+                unexec_rows.append({
+                    'timestamp': u.get('timestamp', ''),
+                    'bot_name': u.get('bot_name', ''),
+                    'symbol': f"{u.get('symbol', '')} ({u.get('timeframe', '')})",
+                    'action_side': act_str,
+                    'order_type': u.get('order_type', 'MARKET'),
+                    'price_qty': pq_str,
+                    'parameters': params_str,
+                    'reason': u.get('reason', 'Sin motivo especificado'),
+                })
+
+            unexec_fingerprint = f"{unexec_target_id}_{len(unexec_rows)}"
+            if getattr(self, '_last_unexec_hash', None) != unexec_fingerprint:
+                self.unexecuted_grid.options['rowData'] = unexec_rows
+                self.unexecuted_grid.update()
+                self._last_unexec_hash = unexec_fingerprint
+
+            if hasattr(self, 'tab_unexec_btn'):
+                cnt = len(unexec_rows)
+                tab_txt = f"🚨 Órdenes No Ejecutadas ({cnt})" if cnt > 0 else "🚨 Órdenes No Ejecutadas"
+                self.tab_unexec_btn.set_text(tab_txt)
+
+        # 8. Consola de logs
         if hasattr(self, 'log_label'):
             lines = bot.log_lines if bot.log_lines else ["Esperando eventos del bot..."]
             self.log_label.set_text('\n'.join(lines[-40:]))
@@ -1743,6 +1874,38 @@ class LiveMonitorPage:
                 btn_txt = '⚡ Aplicar Parámetros en Caliente' if bot.is_running else '💾 Guardar Parámetros'
                 ui.button(btn_txt, icon='bolt' if bot.is_running else 'save', on_click=save_inspector_params).classes('bg-yellow-500 hover:bg-yellow-600 text-black font-bold text-xs py-1 px-3 rounded shadow')
 
+    def _update_daemon_status_pill(self):
+        if not hasattr(self, 'daemon_status_pill') or self.daemon_status_pill is None:
+            return
+        is_online = daemon_client.is_daemon_online()
+        self.daemon_status_pill.clear()
+        with self.daemon_status_pill:
+            if is_online:
+                st = daemon_client.get_system_status()
+                pid = st.get('pid', '-')
+                mem = st.get('memory_mb', 0)
+                self.daemon_status_pill.classes(remove='bg-amber-950/80 text-amber-300 border-amber-600', add='bg-emerald-950/80 text-emerald-300 border border-emerald-500')
+                ui.icon('cloud_done', size='15px', color='emerald-400')
+                ui.label(f'DAEMON 24/7 ONLINE (PID: {pid} | {mem}MB)').tooltip('Trading Daemon Core activo (Puerto 8001) y operando de forma autónoma')
+            else:
+                self.daemon_status_pill.classes(remove='bg-emerald-950/80 text-emerald-300 border-emerald-500', add='bg-amber-950/80 text-amber-300 border border-amber-600')
+                ui.icon('cloud_off', size='15px', color='amber-400')
+                ui.label('MODO EMBEBIDO (DAEMON OFFLINE)').tooltip('El bot corre en el servidor web. Inicia start_bot_daemon.bat para desacoplarlo 24/7')
+
+    def _confirm_emergency_kill(self):
+        with ui.dialog() as dlg, ui.card().classes('bg-gray-900 border-2 border-red-500 p-6 rounded-2xl max-w-md'):
+            ui.label('🚨 PARADA DE EMERGENCIA (KILL SWITCH)').classes('text-lg font-bold text-red-400')
+            ui.label('Esta acción detendrá de inmediato todos los bots activos en el Daemon y cerrará el candado de trading real. ¿Confirmar parada inmediata?').classes('text-sm text-gray-300')
+            with ui.row().classes('w-full justify-end gap-3 mt-4'):
+                ui.button('Cancelar', on_click=dlg.close).props('outline text-color=gray-400')
+                def _do_kill():
+                    dlg.close()
+                    daemon_client.emergency_kill()
+                    ui.notify('🚨 KILL SWITCH ACTIVADO: Todos los bots detenidos.', type='negative', close_button=True)
+                    self._refresh_ui_elements(force_dom_rebuild=True)
+                ui.button('DETENER TODO AHORA', color='red', on_click=_do_kill).classes('font-bold')
+        dlg.open()
+
     # ──────────────────────────────────────────────────────────────
     # Render Principal
     # ──────────────────────────────────────────────────────────────
@@ -1751,7 +1914,11 @@ class LiveMonitorPage:
         # 1. Header principal
         with ui.row().classes('w-full justify-between items-center mb-6'):
             with ui.column().classes('gap-1'):
-                ui.label('Live Monitor (Paper Trading Multi-Bot)').classes('text-3xl font-bold text-white tracking-tight')
+                with ui.row().classes('items-center gap-3'):
+                    ui.label('Live Monitor (Paper Trading Multi-Bot)').classes('text-3xl font-bold text-white tracking-tight')
+                    self.daemon_status_pill = ui.row().classes('items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold shadow-sm border cursor-pointer')
+                    self._update_daemon_status_pill()
+                    self.daemon_status_pill.on('click', lambda: (self._update_daemon_status_pill(), ui.notify('Estado de Trading Daemon actualizado', type='info')))
                 ui.label('Ejecución simultánea y monitoreo cuantitativo en tiempo real de múltiples estrategias').classes('text-sm text-gray-400')
             
             with ui.row().classes('gap-3 flex-wrap items-center'):
@@ -1759,6 +1926,7 @@ class LiveMonitorPage:
                 ui.button('➕ Crear Nuevo Bot', on_click=self._open_new_bot_dialog).classes('bg-yellow-500 hover:bg-yellow-600 text-black font-bold px-4 py-2 rounded-lg shadow-lg')
                 ui.button('▶ Iniciar Todos', on_click=self._start_all_bots).classes('bg-green-600 hover:bg-green-700 text-white font-semibold px-4 py-2 rounded-lg shadow')
                 ui.button('⏹ Detener Todos', on_click=self._stop_all_bots).classes('bg-red-600 hover:bg-red-700 text-white font-semibold px-4 py-2 rounded-lg shadow')
+                ui.button('🚨 Kill Switch', icon='dangerous', on_click=self._confirm_emergency_kill).classes('bg-red-900 hover:bg-red-950 text-white font-bold px-3 py-2 rounded-lg shadow border border-red-500').tooltip('Parada de Emergencia: Detiene todos los bots y bloquea el candado de trading')
 
         # 2. Tarjetas Resumen Global (KPIs de Cartera)
         init_summary = bot_manager.get_portfolio_summary()
@@ -1794,6 +1962,15 @@ class LiveMonitorPage:
 
         # 4. Sección: Panel de Inspección y Monitoreo del Bot Seleccionado
         with ui.card().classes('bg-gray-800/90 border border-gray-700 p-6 rounded-2xl w-full mb-6 shadow-xl'):
+            # Banner de Alerta Crítica si hay órdenes rechazadas
+            with ui.row().classes('w-full items-center justify-between p-3 bg-red-950/80 border border-red-500 rounded-xl mb-4') as alert_banner_el:
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('report_problem', color='red-400', size='22px')
+                    self.inspector_alert_label = ui.label('').classes('text-xs font-bold text-red-200 truncate max-w-[700px]')
+                ui.button('Ver Órdenes Rechazadas', on_click=lambda: getattr(self, 'tab_unexec_btn', None) and self.tab_unexec_btn.run_method('click')).props('dense flat text-color=red-300').classes('text-xs underline')
+                self.inspector_alert_banner = alert_banner_el
+            self.inspector_alert_banner.set_visibility(False)
+
             with ui.row().classes('w-full justify-between items-center mb-6 pb-4 border-b border-gray-700 flex-wrap gap-4'):
                 with ui.column().classes('gap-1'):
                     with ui.row().classes('items-center gap-3'):
@@ -1829,6 +2006,7 @@ class LiveMonitorPage:
                         ui.label('ESTADO & SALDO').classes('text-[10px] font-semibold text-gray-400 uppercase tracking-wider')
                         self.inspector_status_label = ui.label('DETENIDO 🔴').classes('text-base font-bold text-white mt-1')
                         self.inspector_balance_label = ui.label('10,000.00 USDT').classes('text-xs font-semibold text-green-400')
+                        self.inspector_started_label = ui.label('⏱️ Inicio: -').classes('text-[10px] font-mono text-gray-400 mt-0.5')
 
                     # Tarjeta 2: Win Rate y Operaciones
                     with ui.card().classes('bg-gray-900 text-white p-3 rounded-xl border border-gray-700/80 flex flex-col justify-between shadow'):
@@ -1938,38 +2116,65 @@ class LiveMonitorPage:
                     self.btn_clear_highlight.set_visibility(False)
                 self.chart = ui.plotly(self._build_empty_chart()).classes('w-full h-96')
 
-            # Historial de Trades con Selector de Vista (Individual vs Cartera) y Fecha/Hora Compacta
+            # Sección de Historiales con Pestañas: Trades vs Órdenes No Ejecutadas
             with ui.card().classes('bg-gray-900 p-4 w-full mb-6 rounded-xl border border-gray-700/80'):
                 with ui.row().classes('w-full justify-between items-center mb-4 flex-wrap gap-2'):
-                    with ui.column().classes('gap-0'):
-                        self.trades_title_label = ui.label('Historial de Trades (Sesión)').classes('text-lg font-bold text-white')
-                        ui.label('💡 Haz clic en cualquier fila para enfocarla y señalarla en la gráfica').classes('text-xs text-gray-400 italic')
-                    
+                    with ui.tabs().classes('text-yellow-400 bg-gray-950/80 rounded-lg p-1 border border-gray-800') as history_tabs:
+                        self.tab_trades_btn = ui.tab('trades', label='📋 Historial de Trades').classes('text-xs font-bold')
+                        self.tab_unexec_btn = ui.tab('unexec', label='🚨 Órdenes No Ejecutadas').classes('text-xs font-bold text-red-400')
+
                     with ui.row().classes('gap-1 bg-gray-950 p-1 rounded-lg border border-gray-800'):
                         self.btn_view_selected = ui.button('🎯 Bot Seleccionado', on_click=lambda: self._set_trades_view_mode("selected")).props('dense').classes('bg-yellow-500 text-black text-xs font-bold px-3 py-1 rounded')
                         self.btn_view_all = ui.button('🌐 Cartera Completa (Todos)', on_click=lambda: self._set_trades_view_mode("all")).props('dense flat').classes('text-gray-300 text-xs font-medium px-3 py-1 rounded hover:text-white')
 
-                self.trades_grid = ui.aggrid({
-                    'defaultColDef': {'flex': 1, 'sortable': True, 'resizable': True},
-                    'columnDefs': [
-                        {'headerName': 'Bot',            'field': 'bot_name',     'maxWidth': 140},
-                        {'headerName': 'Fecha/Hora',     'field': 'time_compact', 'maxWidth': 130, 'cellClass': 'font-mono text-xs text-gray-300 text-center'},
-                        {'headerName': 'Lado',           'field': 'side',         'maxWidth': 105},
-                        {'headerName': 'Entrada',        'field': 'entry_price',  'maxWidth': 115},
-                        {'headerName': 'Salida',         'field': 'exit_price',   'maxWidth': 115},
-                        {'headerName': 'SL',             'field': 'sl_price',     'maxWidth': 115},
-                        {'headerName': 'TP',             'field': 'tp_price',     'maxWidth': 115},
-                        {'headerName': 'PNL',            'field': 'pnl',          'maxWidth': 160},
-                        {'headerName': 'Gatillo/Razón',  'field': 'reason'},
-                    ],
-                    'rowData': [],
-                    'rowSelection': 'single',
-                    'rowClassRules': {
-                        'text-green-400 font-semibold cursor-pointer': 'parseFloat(data.pnl) > 0',
-                        'text-red-400 font-semibold cursor-pointer':   'parseFloat(data.pnl) <= 0',
-                    }
-                }).classes('h-64 text-white')
-                self.trades_grid.on('rowClicked', self._on_trade_row_clicked)
+                with ui.tab_panels(history_tabs, value='trades').classes('w-full bg-transparent p-0'):
+                    with ui.tab_panel('trades').classes('p-0'):
+                        with ui.row().classes('w-full justify-between items-center mb-2'):
+                            self.trades_title_label = ui.label('Historial de Trades (Sesión)').classes('text-sm font-bold text-white')
+                            ui.label('💡 Haz clic en cualquier fila para enfocarla y señalarla en la gráfica').classes('text-xs text-gray-400 italic')
+
+                        self.trades_grid = ui.aggrid({
+                            'defaultColDef': {'flex': 1, 'sortable': True, 'resizable': True},
+                            'columnDefs': [
+                                {'headerName': 'Bot',            'field': 'bot_name',     'maxWidth': 140},
+                                {'headerName': 'Fecha/Hora',     'field': 'time_compact', 'maxWidth': 130, 'cellClass': 'font-mono text-xs text-gray-300 text-center'},
+                                {'headerName': 'Lado',           'field': 'side',         'maxWidth': 105},
+                                {'headerName': 'Entrada',        'field': 'entry_price',  'maxWidth': 115},
+                                {'headerName': 'Salida',         'field': 'exit_price',   'maxWidth': 115},
+                                {'headerName': 'SL',             'field': 'sl_price',     'maxWidth': 115},
+                                {'headerName': 'TP',             'field': 'tp_price',     'maxWidth': 115},
+                                {'headerName': 'PNL',            'field': 'pnl',          'maxWidth': 160},
+                                {'headerName': 'Gatillo/Razón',  'field': 'reason'},
+                            ],
+                            'rowData': [],
+                            'rowSelection': 'single',
+                            'rowClassRules': {
+                                'text-green-400 font-semibold cursor-pointer': 'parseFloat(data.pnl) > 0',
+                                'text-red-400 font-semibold cursor-pointer':   'parseFloat(data.pnl) <= 0',
+                            }
+                        }).classes('h-64 text-white')
+                        self.trades_grid.on('rowClicked', self._on_trade_row_clicked)
+
+                    with ui.tab_panel('unexec').classes('p-0'):
+                        with ui.row().classes('w-full justify-between items-center mb-2'):
+                            ui.label('Historial de Órdenes No Ejecutadas / Rechazadas (con Bot, Fecha, Parámetros y Motivo):').classes('text-sm font-bold text-red-400')
+                            ui.button('Limpiar Historial Fallas', icon='delete_sweep', on_click=self._clear_unexecuted_history).props('dense flat text-color=red-400').classes('text-xs hover:bg-red-950/40 rounded px-2.5 py-1')
+
+                        self.unexecuted_grid = ui.aggrid({
+                            'defaultColDef': {'flex': 1, 'sortable': True, 'resizable': True},
+                            'columnDefs': [
+                                {'headerName': 'Fecha/Hora',     'field': 'timestamp',    'maxWidth': 160, 'cellClass': 'font-mono text-xs text-gray-300 text-center'},
+                                {'headerName': 'Bot',            'field': 'bot_name',     'maxWidth': 140, 'cellClass': 'font-semibold text-white'},
+                                {'headerName': 'Par / TF',       'field': 'symbol',       'maxWidth': 120, 'cellClass': 'font-mono text-xs text-blue-300'},
+                                {'headerName': 'Acción / Lado',  'field': 'action_side',  'maxWidth': 130, 'cellClass': 'text-xs font-bold text-yellow-400'},
+                                {'headerName': 'Tipo',           'field': 'order_type',   'maxWidth': 95,  'cellClass': 'text-xs text-purple-300'},
+                                {'headerName': 'Precio / Cant',  'field': 'price_qty',    'maxWidth': 140, 'cellClass': 'font-mono text-xs text-gray-300'},
+                                {'headerName': 'Parámetros',     'field': 'parameters',   'maxWidth': 230, 'cellClass': 'font-mono text-xs text-yellow-300'},
+                                {'headerName': 'Motivo / Error', 'field': 'reason',       'cellClass': 'text-xs text-red-400 font-semibold'},
+                            ],
+                            'rowData': [],
+                            'rowSelection': 'single',
+                        }).classes('h-64 text-white')
 
             # Consola de Logs del Bot Seleccionado
             with ui.card().classes('bg-black/90 text-green-400 p-4 w-full h-44 overflow-y-auto font-mono rounded-xl border border-gray-800 shadow-inner'):

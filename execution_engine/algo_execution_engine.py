@@ -86,12 +86,27 @@ class AlgoExecutionEngine:
     def __init__(self):
         self.active_tasks: Dict[str, AlgoExecutionTask] = {}
         self.history_tasks: List[AlgoExecutionTask] = []
-        self._testnet_client = BinanceTestnetClient(use_testnet=True)
+        self._testnet_client = None
+
+    @property
+    def testnet_client(self):
+        """Inicialización diferida y tolerante a fallos del cliente Binance."""
+        if self._testnet_client is None:
+            try:
+                from execution_engine.binance_client import BinanceTestnetClient
+                self._testnet_client = BinanceTestnetClient(use_testnet=True)
+            except Exception as e:
+                logger.warning("No se pudo inicializar BinanceTestnetClient en AlgoExecutionEngine: %s", e)
+        return self._testnet_client
 
     def get_current_price(self, symbol: str) -> float:
         """Obtiene precio actual de mercado."""
         try:
-            return self._testnet_client.get_symbol_price(symbol)
+            if self.testnet_client:
+                price = self.testnet_client.get_symbol_price(symbol)
+                if price and price > 0:
+                    return price
+            return 80000.0
         except Exception:
             return 80000.0
 
@@ -157,17 +172,20 @@ class AlgoExecutionEngine:
             # Si es modo testnet, enviar orden real
             if task.mode == "BINANCE_TESTNET":
                 try:
-                    order, err = self._testnet_client.place_futures_order(
-                        symbol=task.symbol,
-                        side=task.side,
-                        quantity=slice_qty,
-                        order_type="MARKET",
-                        verify_execution=True
-                    )
-                    if err:
-                        logger.warning("Fallo en tajada %d TWAP Testnet: %s", i+1, err)
-                    if order and order.get("avgPrice"):
-                        fill_price = float(order.get("avgPrice"))
+                    if not self.testnet_client:
+                        logger.warning("Cliente Binance no disponible para tajada %d TWAP Testnet", i+1)
+                    else:
+                        order, err = self.testnet_client.place_futures_order(
+                            symbol=task.symbol,
+                            side=task.side,
+                            quantity=slice_qty,
+                            order_type="MARKET",
+                            verify_execution=True
+                        )
+                        if err:
+                            logger.warning("Fallo en tajada %d TWAP Testnet: %s", i+1, err)
+                        if order and order.get("avgPrice"):
+                            fill_price = float(order.get("avgPrice"))
                 except Exception as e:
                     logger.error("Error enviando tajada a Binance: %s", e)
 

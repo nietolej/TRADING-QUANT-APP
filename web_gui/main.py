@@ -27,6 +27,7 @@ from .pages.derivatives_analyzer_page import render_derivatives_analyzer_page
 from .pages.options_algo_page import render_options_algo_page
 from .components.api_credentials_dialog import open_api_credentials_dialog
 from .components.quant_copilot import render_quant_copilot
+from execution_engine.daemon_client import daemon_client as bot_manager
 
 def create_gui(app):
     """

@@ -96,7 +96,7 @@ class BotManager:
                     # Si estaba operando al momento del guardado, reanudar
                     if auto_start_running_bots and bot_dict.get("is_running") is True:
                         logger.info("Reanudando ejecución automática del bot %s tras reinicio/recarga...", bot.name)
-                        bot.start()
+                        bot.start(reset_started_at=False)
 
             except Exception as e:
                 logger.error("Error al cargar estado de bots desde disco: %s", e)
@@ -257,6 +257,71 @@ class BotManager:
                 "active_positions": active_positions,
                 "win_rate": win_rate,
             }
+
+    def get_unexecuted_orders(self, bot_id: Optional[str] = None) -> List[dict]:
+        """
+        Retorna el historial de órdenes no ejecutadas / rechazadas.
+        Si se especifica bot_id, retorna las del bot seleccionado.
+        Si es None o 'all', retorna las de toda la cartera agregadas y ordenadas cronológicamente (más recientes primero).
+        """
+        with self._lock:
+            if bot_id and bot_id != "all":
+                bot = self._bots.get(bot_id)
+                if bot and hasattr(bot, 'unexecuted_orders'):
+                    return list(reversed(bot.unexecuted_orders))
+                return []
+
+            # Cartera completa: agregar de todos los bots + archivo global si existe
+            all_orders = []
+            seen_ids = set()
+
+            for b in self._bots.values():
+                if hasattr(b, 'unexecuted_orders'):
+                    for ord_item in b.unexecuted_orders:
+                        oid = ord_item.get('order_id')
+                        if oid and oid not in seen_ids:
+                            seen_ids.add(oid)
+                            all_orders.append(ord_item)
+
+            # Cargar del archivo global si hay registros adicionales
+            audit_path = os.path.join(DATA_DIR, "unexecuted_orders_history.json")
+            if os.path.exists(audit_path):
+                try:
+                    with open(audit_path, "r", encoding="utf-8") as f:
+                        hist = json.load(f)
+                    if isinstance(hist, list):
+                        for ord_item in hist:
+                            oid = ord_item.get('order_id')
+                            if oid and oid not in seen_ids:
+                                seen_ids.add(oid)
+                                all_orders.append(ord_item)
+                except Exception:
+                    pass
+
+            # Ordenar por timestamp descendente
+            all_orders.sort(key=lambda x: str(x.get('timestamp', '')), reverse=True)
+            return all_orders
+
+    def clear_unexecuted_orders(self, bot_id: Optional[str] = None):
+        """Limpia el historial de órdenes no ejecutadas."""
+        with self._lock:
+            if bot_id and bot_id != "all":
+                bot = self._bots.get(bot_id)
+                if bot and hasattr(bot, 'unexecuted_orders'):
+                    bot.unexecuted_orders.clear()
+                    bot._save_state()
+            else:
+                for b in self._bots.values():
+                    if hasattr(b, 'unexecuted_orders'):
+                        b.unexecuted_orders.clear()
+                        b._save_state()
+                audit_path = os.path.join(DATA_DIR, "unexecuted_orders_history.json")
+                if os.path.exists(audit_path):
+                    try:
+                        with open(audit_path, "w", encoding="utf-8") as f:
+                            json.dump([], f)
+                    except Exception:
+                        pass
 
 
 # Instancia singleton compartida en toda la aplicación

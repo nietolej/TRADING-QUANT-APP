@@ -1,6 +1,7 @@
 from nicegui import ui
 import yaml
 import os
+import re
 import glob
 import time
 
@@ -8,6 +9,80 @@ import time
 _PAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.abspath(os.path.join(_PAGE_DIR, '..', '..'))
 STRATEGIES_DIR = os.path.join(BASE_DIR, 'config', 'strategies')
+
+
+def _sanitize_strategy_filename(name: str) -> str:
+    """
+    Convierte el nombre de estrategia (texto libre ingresado por el usuario) en un nombre
+    de archivo seguro. Solo permite letras, números, guion y guion bajo, eliminando
+    separadores de ruta u otros caracteres que permitirían escribir/leer/borrar archivos
+    fuera de STRATEGIES_DIR (path traversal), p.ej. "../../otra_carpeta/archivo".
+    """
+    safe = re.sub(r'[^a-zA-Z0-9_-]+', '_', (name or '').strip().lower().replace(' ', '_')).strip('_')
+    return safe or 'unnamed_strategy'
+
+
+def _strategy_filepath(name: str) -> str:
+    return os.path.join(STRATEGIES_DIR, f"{_sanitize_strategy_filename(name)}.yaml")
+
+
+def _validate_strategy_config(state: dict) -> str:
+    """
+    Valida la configuración antes de guardarla a disco, para detectar errores obvios
+    (nombre vacío, sin condiciones de entrada, valores de TP/SL inválidos) en el momento
+    de guardar en vez de que fallen silenciosamente más tarde en el backtest o el bot en vivo.
+    Retorna un mensaje de error, o cadena vacía si la configuración es válida.
+    """
+    if not (state.get('strategy_name') or '').strip():
+        return "El nombre de la estrategia no puede estar vacío."
+
+    if not state.get('entry_rules'):
+        return "La estrategia necesita al menos una condición de entrada (pestaña 'Rules')."
+
+    def _positive_float(value, field_label):
+        try:
+            if float(value) <= 0:
+                return f"El valor de '{field_label}' debe ser mayor a 0 (actual: {value})."
+        except (TypeError, ValueError):
+            return f"El valor de '{field_label}' no es un número válido: {value!r}."
+        return None
+
+    tp_type = state.get('tp_type', 'fixed')
+    if tp_type in ('fixed', 'partial'):
+        err = _positive_float(state.get('tp_value'), 'Take Profit (%)')
+    elif tp_type == 'risk_reward':
+        err = _positive_float(state.get('tp_rr_ratio'), 'Ratio Riesgo/Beneficio')
+    elif tp_type == 'atr':
+        err = _positive_float(state.get('tp_atr_mult'), 'Multiplicador ATR (TP)') \
+            or _positive_float(state.get('tp_atr_period'), 'Período ATR (TP)')
+    else:
+        err = None
+    if err:
+        return err
+
+    sl_type = state.get('sl_type', 'fixed')
+    if sl_type == 'fixed':
+        err = _positive_float(state.get('sl_value'), 'Stop Loss (%)')
+    elif sl_type == 'trailing_percent':
+        err = _positive_float(state.get('sl_trailing_pct'), 'Trailing Stop (%)')
+    elif sl_type == 'break_even':
+        err = _positive_float(state.get('sl_value'), 'Stop Loss (%)') \
+            or _positive_float(state.get('sl_be_trigger'), 'Gatillo Break-Even (%)')
+    elif sl_type == 'atr':
+        err = _positive_float(state.get('sl_atr_mult'), 'Multiplicador ATR (SL)') \
+            or _positive_float(state.get('sl_atr_period'), 'Período ATR (SL)')
+    elif sl_type == 'chandelier':
+        err = _positive_float(state.get('sl_chandelier_mult'), 'Multiplicador Chandelier') \
+            or _positive_float(state.get('sl_chandelier_lookback'), 'Lookback Chandelier') \
+            or _positive_float(state.get('sl_atr_period'), 'Período ATR (SL)')
+    elif sl_type == 'swing':
+        err = _positive_float(state.get('sl_swing_lookback'), 'Lookback Swing')
+    else:
+        err = None
+    if err:
+        return err
+
+    return ''
 
 # Descripciones didácticas de cada tipo de Take Profit y Stop Loss
 TP_EXPLANATIONS = {
@@ -70,6 +145,7 @@ def render_strategy_builder():
             'parameters': [],
             'entry_rules': [],
             'exit_rules': [],
+            '_rule_counter': 0,
             'ec_enabled': False,
             'ec_start_dd': '30.0',
             'ec_stop_dd': '0.0',
@@ -189,11 +265,22 @@ def render_strategy_builder():
                 }
             }
             
-            filename = os.path.join(STRATEGIES_DIR, f"{state['strategy_name'].lower().replace(' ', '_')}.yaml")
+            validation_error = _validate_strategy_config(state)
+            if validation_error:
+                ui.notify(f"⚠️ {validation_error}", type='warning', icon='warning')
+                return
+
+            filename = _strategy_filepath(state['strategy_name'])
             os.makedirs(os.path.dirname(filename), exist_ok=True)
             try:
-                with open(filename, 'w', encoding='utf-8') as f:
+                # Escritura atómica: se escribe primero a un archivo temporal y luego se
+                # reemplaza el destino final con os.replace (operación atómica del SO),
+                # para no dejar un YAML corrupto/a medias si el proceso falla o hay dos
+                # guardados concurrentes de la misma estrategia.
+                tmp_filename = f"{filename}.{os.getpid()}.{int(time.time() * 1000)}.tmp"
+                with open(tmp_filename, 'w', encoding='utf-8') as f:
                     yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+                os.replace(tmp_filename, filename)
                 ui.notify(f"Estrategia guardada exitosamente en {filename}", type='positive', icon='check_circle')
             except Exception as e:
                 ui.notify(f"Error guardando: {str(e)}", type='negative', icon='error')
@@ -245,11 +332,14 @@ def render_strategy_builder():
                             except ValueError:
                                 return v
                                 
+                        state['_rule_counter'] = state.get('_rule_counter', 0) + 1
+                        rule_name = f"Rule_{state['_rule_counter']}"
+
                         if r_type == 'technical_indicator':
                             p1_val = _parse_val(p1_input.value)
                             p2_val = _parse_val(p2_input.value)
                             rule_obj = {
-                                "name": f"Rule_{len(active_target_list)+1}",
+                                "name": rule_name,
                                 "type": "technical_indicator",
                                 "indicator_1": {"name": ind1_select.value, "period": p1_val},
                                 "operator": op_select.value,
@@ -259,7 +349,7 @@ def render_strategy_builder():
                         else:
                             val_parsed = _parse_val(val_input.value)
                             rule_obj = {
-                                "name": f"Rule_{len(active_target_list)+1}",
+                                "name": rule_name,
                                 "type": "onchain_threshold",
                                 "metric": metric_input.value,
                                 "condition": cond_select.value,
@@ -752,8 +842,8 @@ def render_strategy_builder():
                             except Exception:
                                 pass
                         if not matched_file:
-                            matched_file = os.path.join(STRATEGIES_DIR, f"{strategy_name.lower().replace(' ', '_')}.yaml")
-                            
+                            matched_file = _strategy_filepath(strategy_name)
+
                         try:
                             with open(matched_file, 'r', encoding='utf-8') as f:
                                 data = yaml.safe_load(f)
@@ -861,7 +951,7 @@ def render_strategy_builder():
                             except Exception:
                                 pass
                         if not matched_file:
-                            matched_file = os.path.join(STRATEGIES_DIR, f"{strategy_name.lower().replace(' ', '_')}.yaml")
+                            matched_file = _strategy_filepath(strategy_name)
 
                         try:
                             if os.path.exists(matched_file):

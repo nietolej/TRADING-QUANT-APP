@@ -1,10 +1,12 @@
 import math
 import logging
-from typing import Dict, Any, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger("PortfolioRiskAnalyzer")
 
-# Estimación típica de volatilidad diaria de activos crypto para cálculo paramétrico de VaR
+# Estimación típica de volatilidad diaria de activos crypto, usada SOLO como último recurso
+# cuando no hay histórico local real suficiente para calcularla (ver _get_symbol_volatility).
 DEFAULT_DAILY_VOLATILITIES = {
     "BTC": 0.035,   # ~3.5% volatilidad diaria
     "ETH": 0.045,   # ~4.5%
@@ -14,6 +16,60 @@ DEFAULT_DAILY_VOLATILITIES = {
     "DOGE": 0.075,  # ~7.5%
     "DEFAULT": 0.050 # 5.0% para otras altcoins
 }
+
+# Ventana de histórico diario a leer de la base de datos local para estimar volatilidad/correlación reales.
+HISTORICAL_LOOKBACK_DAYS = 90
+# Mínimo de retornos diarios superpuestos requeridos para confiar en un cálculo real (evita ruido estadístico).
+MIN_HISTORY_POINTS = 20
+
+
+def _symbol_variants(symbol: str) -> List[str]:
+    """
+    La tabla OHLCV local mezcla símbolos guardados con formato ccxt ('BTC/USDT', desde
+    backtests) y sin separador ('BTCUSDT', formato nativo de Binance Futures que reportan
+    las posiciones de la cuenta). Genera ambas variantes para no fallar por un simple
+    desajuste de formato al buscar histórico ya descargado.
+    """
+    sym = symbol.upper().strip()
+    variants = {sym}
+    if "/" in sym:
+        variants.add(sym.replace("/", ""))
+    else:
+        for quote in ("USDT", "BUSD", "USDC", "BTC", "ETH", "BNB"):
+            if sym.endswith(quote) and len(sym) > len(quote):
+                variants.add(f"{sym[:-len(quote)]}/{quote}")
+                break
+    return list(variants)
+
+
+def _get_daily_close_series(symbol: str, lookback_days: int = HISTORICAL_LOOKBACK_DAYS):
+    """
+    Lee velas diarias (timeframe '1d') ya almacenadas localmente (sin llamadas de red)
+    y retorna una Serie de pandas (timestamp -> close). Retorna None si no hay datos
+    o si ocurre cualquier error, para que el llamador pueda degradar a un valor estimado.
+    """
+    try:
+        import pandas as pd
+        from data_layer.storage import SessionLocal, OHLCV
+
+        db = SessionLocal()
+        try:
+            since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=lookback_days + 5)
+            rows = (
+                db.query(OHLCV.timestamp, OHLCV.close)
+                .filter(OHLCV.symbol.in_(_symbol_variants(symbol)), OHLCV.timeframe == "1d", OHLCV.timestamp >= since)
+                .order_by(OHLCV.timestamp.asc())
+                .all()
+            )
+        finally:
+            db.close()
+
+        if not rows:
+            return None
+        return pd.Series({r.timestamp: float(r.close) for r in rows}).sort_index()
+    except Exception as e:
+        logger.debug("No se pudo leer histórico local de %s para análisis de riesgo: %s", symbol, e)
+        return None
 
 
 class PortfolioRiskAnalyzer:
@@ -180,57 +236,154 @@ class PortfolioRiskAnalyzer:
         time_horizon_days: int = 1
     ) -> Dict[str, Any]:
         """
-        Calcula el Value at Risk (VaR) paramétrico al 95% y 99% a 1 día
-        y el Conditional VaR (CVaR / Expected Shortfall).
+        Calcula el Value at Risk (VaR) al 95%/99% a 1 día y el Conditional VaR (CVaR).
+
+        Estrategia de dos niveles:
+        1. Simulación Histórica sobre precios reales (captura la correlación real entre
+           activos de forma implícita, sin necesitar una matriz de covarianza explícita).
+        2. Si no hay histórico local suficiente, cae a un modelo paramétrico usando
+           volatilidad real cuando esté disponible por símbolo, y un valor estimado por
+           defecto en caso contrario — dejando explícito en el resultado qué método y
+           qué fuente de datos se usó, en vez de presentarlo como un cálculo exacto.
         """
         if total_equity <= 0 or not positions:
-            return {
-                "var_95_usd": 0.0,
-                "var_95_pct": 0.0,
-                "var_99_usd": 0.0,
-                "var_99_pct": 0.0,
-                "cvar_95_usd": 0.0,
-                "cvar_95_pct": 0.0,
-                "portfolio_daily_volatility_pct": 0.0,
-                "risk_category": "BAJO"
-            }
+            return cls._empty_var_result()
 
-        # Calcular exposición nocional ponderada por volatilidad
-        weighted_vol_sum = 0.0
-        total_active_notional = 0.0
-
+        # Agregar exposición nocional firmada por símbolo (long positivo, short negativo);
+        # si hay posiciones long y short del mismo símbolo (hedge mode) se netean primero.
+        signed_notional_by_symbol: Dict[str, float] = {}
         for p in positions:
             amt = float(p.get("positionAmt", 0.0))
             if amt == 0:
                 continue
             mark_p = float(p.get("markPrice", 0.0) or p.get("entryPrice", 0.0))
-            notional = abs(amt) * mark_p
-            total_active_notional += notional
-
-            # Extraer moneda base para inferir volatilidad
             sym = p.get("symbol", "").upper()
-            base = sym.replace("USDT", "").replace("BUSD", "").replace("USDC", "")
-            vol = DEFAULT_DAILY_VOLATILITIES.get(base, DEFAULT_DAILY_VOLATILITIES["DEFAULT"])
+            signed_notional_by_symbol[sym] = signed_notional_by_symbol.get(sym, 0.0) + (amt * mark_p)
+
+        total_active_notional = sum(abs(v) for v in signed_notional_by_symbol.values())
+        if total_active_notional <= 0:
+            return cls._empty_var_result()
+
+        hist_result = cls._historical_simulation_var(signed_notional_by_symbol, total_equity, time_horizon_days)
+        if hist_result is not None:
+            return hist_result
+
+        return cls._parametric_var_fallback(signed_notional_by_symbol, total_active_notional, total_equity, time_horizon_days)
+
+    @classmethod
+    def _historical_simulation_var(
+        cls,
+        signed_notional_by_symbol: Dict[str, float],
+        total_equity: float,
+        time_horizon_days: int
+    ) -> Optional[Dict[str, Any]]:
+        """
+        VaR por Simulación Histórica: aplica los retornos diarios REALES de cada símbolo
+        (leídos de la base de datos local) a su exposición nocional actual, día por día.
+        Al sumar los P&L simulados de todos los símbolos en las mismas fechas, la
+        correlación real entre activos queda incorporada de forma natural (sin asumir
+        arbitrariamente que todo se mueve junto). Retorna None si no hay histórico local
+        suficiente para al menos un símbolo, para que el llamador use el fallback paramétrico.
+        """
+        try:
+            import numpy as np
+            import pandas as pd
+        except Exception:
+            return None
+
+        returns_by_symbol = {}
+        for sym in signed_notional_by_symbol:
+            closes = _get_daily_close_series(sym)
+            if closes is None or len(closes) < (MIN_HISTORY_POINTS + 1):
+                continue
+            rets = (closes / closes.shift(1)).apply(lambda x: math.log(x) if x and x > 0 else None).dropna()
+            if len(rets) >= MIN_HISTORY_POINTS:
+                returns_by_symbol[sym] = rets
+
+        if not returns_by_symbol:
+            return None
+
+        df = pd.DataFrame(returns_by_symbol).dropna(how="any")
+        if len(df) < MIN_HISTORY_POINTS:
+            return None
+
+        # P&L diario simulado de la cartera = suma de (retorno_real_del_día * exposición_nocional_firmada)
+        pnl_series = sum(df[sym] * signed_notional_by_symbol[sym] for sym in df.columns)
+        sqrt_t = math.sqrt(time_horizon_days)
+        pnl_scaled = pnl_series * sqrt_t
+
+        var_95_usd = max(0.0, float(-np.percentile(pnl_scaled, 5)))
+        var_99_usd = max(0.0, float(-np.percentile(pnl_scaled, 1)))
+        tail_95 = pnl_scaled[pnl_scaled <= np.percentile(pnl_scaled, 5)]
+        cvar_95_usd = max(0.0, float(-tail_95.mean())) if len(tail_95) > 0 else var_95_usd
+
+        portfolio_daily_vol_pct = float(pnl_series.std() / total_equity * 100.0) if total_equity > 0 else 0.0
+
+        correlation_matrix = None
+        avg_correlation = None
+        if len(df.columns) >= 2:
+            corr = df.corr()
+            correlation_matrix = corr.round(3).to_dict()
+            off_diag = [corr.iloc[i, j] for i in range(len(corr)) for j in range(len(corr)) if i != j]
+            avg_correlation = float(np.mean(off_diag)) if off_diag else None
+
+        var_95_pct = (var_95_usd / total_equity) * 100.0
+        var_99_pct = (var_99_usd / total_equity) * 100.0
+        cvar_95_pct = (cvar_95_usd / total_equity) * 100.0
+
+        excluded = [s for s in signed_notional_by_symbol if s not in df.columns]
+
+        return {
+            "var_95_usd": var_95_usd,
+            "var_95_pct": var_95_pct,
+            "var_99_usd": var_99_usd,
+            "var_99_pct": var_99_pct,
+            "cvar_95_usd": cvar_95_usd,
+            "cvar_95_pct": cvar_95_pct,
+            "portfolio_daily_volatility_pct": portfolio_daily_vol_pct,
+            "risk_category": cls._categorize_risk(var_95_pct),
+            "method": "historical_simulation",
+            "data_source": "real_historical_prices",
+            "history_days_used": int(len(df)),
+            "symbols_used": list(df.columns),
+            "symbols_excluded_insufficient_data": excluded,
+            "correlation_matrix": correlation_matrix,
+            "avg_pairwise_correlation": avg_correlation,
+            "warning": (
+                f"Símbolo(s) sin histórico local suficiente, excluidos del cálculo de correlación: {', '.join(excluded)}."
+                if excluded else None
+            )
+        }
+
+    @classmethod
+    def _parametric_var_fallback(
+        cls,
+        signed_notional_by_symbol: Dict[str, float],
+        total_active_notional: float,
+        total_equity: float,
+        time_horizon_days: int
+    ) -> Dict[str, Any]:
+        """
+        VaR paramétrico (distribución normal) usado solo cuando no hay histórico local
+        suficiente para hacer Simulación Histórica. Usa volatilidad real por símbolo si
+        existe; si no, un valor estimado por defecto (ver DEFAULT_DAILY_VOLATILITIES).
+        Con 2+ símbolos, asume el escenario conservador de correlación perfecta (+1)
+        porque no hay datos para estimar la correlación real — esto se declara explícitamente
+        en el resultado en vez de presentarse como un cálculo preciso.
+        """
+        weighted_vol_sum = 0.0
+        estimated_symbols: List[str] = []
+        real_vol_symbols: List[str] = []
+
+        for sym, signed_notional in signed_notional_by_symbol.items():
+            notional = abs(signed_notional)
+            vol, is_estimated = cls._get_symbol_volatility(sym)
+            (estimated_symbols if is_estimated else real_vol_symbols).append(sym)
             weighted_vol_sum += notional * vol
 
-        if total_active_notional <= 0:
-            return {
-                "var_95_usd": 0.0,
-                "var_95_pct": 0.0,
-                "var_99_usd": 0.0,
-                "var_99_pct": 0.0,
-                "cvar_95_usd": 0.0,
-                "cvar_95_pct": 0.0,
-                "portfolio_daily_volatility_pct": 0.0,
-                "risk_category": "BAJO"
-            }
-
-        # Volatilidad diaria agregada de las posiciones abiertas
         daily_vol = weighted_vol_sum / total_active_notional
 
-        # Factores estadísticos estándar (distribución normal)
-        # Z(95%) = 1.6449, CVaR(95%) factor = 2.0627
-        # Z(99%) = 2.3263
+        # Factores estadísticos estándar (distribución normal): Z(95%)=1.6449, Z(99%)=2.3263, CVaR(95%)=2.0627
         sqrt_t = math.sqrt(time_horizon_days)
         var_95_usd = total_active_notional * daily_vol * 1.6449 * sqrt_t
         var_99_usd = total_active_notional * daily_vol * 2.3263 * sqrt_t
@@ -240,12 +393,17 @@ class PortfolioRiskAnalyzer:
         var_99_pct = (var_99_usd / total_equity) * 100.0
         cvar_95_pct = (cvar_95_usd / total_equity) * 100.0
 
-        if var_95_pct > 15.0:
-            risk_cat = "ALTO"
-        elif var_95_pct > 7.0:
-            risk_cat = "MODERADO"
+        warning = None
+        if len(signed_notional_by_symbol) > 1:
+            warning = (
+                "Sin histórico local suficiente para calcular la correlación real entre activos: "
+                "este VaR asume el escenario conservador de correlación perfecta (+1) entre todas las posiciones."
+            )
+
+        if estimated_symbols:
+            data_source = "mixed" if real_vol_symbols else "estimated_default"
         else:
-            risk_cat = "CONTROLADO"
+            data_source = "real_historical_volatility"
 
         return {
             "var_95_usd": var_95_usd,
@@ -255,7 +413,60 @@ class PortfolioRiskAnalyzer:
             "cvar_95_usd": cvar_95_usd,
             "cvar_95_pct": cvar_95_pct,
             "portfolio_daily_volatility_pct": daily_vol * 100.0,
-            "risk_category": risk_cat
+            "risk_category": cls._categorize_risk(var_95_pct),
+            "method": "parametric_perfect_correlation_assumption",
+            "data_source": data_source,
+            "symbols_using_estimated_volatility": estimated_symbols,
+            "symbols_using_real_volatility": real_vol_symbols,
+            "correlation_matrix": None,
+            "avg_pairwise_correlation": None,
+            "warning": warning
+        }
+
+    @classmethod
+    def _get_symbol_volatility(cls, symbol: str) -> Tuple[float, bool]:
+        """
+        Retorna (volatilidad_diaria, es_estimada). Calcula la volatilidad real (desviación
+        estándar de retornos logarítmicos diarios) si hay histórico local suficiente;
+        si no, cae al valor estimado por defecto de DEFAULT_DAILY_VOLATILITIES.
+        """
+        closes = _get_daily_close_series(symbol)
+        if closes is not None and len(closes) >= (MIN_HISTORY_POINTS + 1):
+            try:
+                import numpy as np
+                rets = (closes / closes.shift(1)).apply(lambda x: math.log(x) if x and x > 0 else None).dropna()
+                if len(rets) >= MIN_HISTORY_POINTS:
+                    return float(rets.std()), False
+            except Exception as e:
+                logger.debug("Error calculando volatilidad real de %s: %s", symbol, e)
+
+        base = symbol.replace("USDT", "").replace("BUSD", "").replace("USDC", "")
+        return DEFAULT_DAILY_VOLATILITIES.get(base, DEFAULT_DAILY_VOLATILITIES["DEFAULT"]), True
+
+    @classmethod
+    def _categorize_risk(cls, var_95_pct: float) -> str:
+        if var_95_pct > 15.0:
+            return "ALTO"
+        elif var_95_pct > 7.0:
+            return "MODERADO"
+        return "CONTROLADO"
+
+    @classmethod
+    def _empty_var_result(cls) -> Dict[str, Any]:
+        return {
+            "var_95_usd": 0.0,
+            "var_95_pct": 0.0,
+            "var_99_usd": 0.0,
+            "var_99_pct": 0.0,
+            "cvar_95_usd": 0.0,
+            "cvar_95_pct": 0.0,
+            "portfolio_daily_volatility_pct": 0.0,
+            "risk_category": "BAJO",
+            "method": None,
+            "data_source": None,
+            "correlation_matrix": None,
+            "avg_pairwise_correlation": None,
+            "warning": None
         }
 
     @classmethod
@@ -431,9 +642,16 @@ class PortfolioRiskAnalyzer:
                 recommendations.append("💵 Mantener al menos un 30% de margen libre no comprometido para absorber picos de volatilidad repentinos.")
             if var_95_pct > 10.0:
                 recommendations.append(f"🛡️ El VaR diario al 95% es de {var_95_pct:.1f}% (${var_metrics.get('var_95_usd', 0):,.2f} USD). Considerar reducir exposición si excede la tolerancia al riesgo.")
+
+            var_warning = var_metrics.get("warning")
+            if var_warning:
+                recommendations.append(f"ℹ️ {var_warning}")
+            elif var_metrics.get("method") == "historical_simulation" and var_metrics.get("avg_pairwise_correlation") is not None:
+                avg_corr = var_metrics["avg_pairwise_correlation"]
+                recommendations.append(f"📈 Correlación promedio real entre posiciones (últimos {var_metrics.get('history_days_used', 0)} días): {avg_corr:+.2f}.")
+
             if len(recommendations) < 3:
                 recommendations.append("✅ Los parámetros cuantitativos de la cartera se encuentran dentro de los rangos de riesgo establecidos.")
-                recommendations.append("📈 Monitorear la correlación entre pares si se agregan más posiciones simultáneas.")
 
         return {
             "health_score": round(score, 1),

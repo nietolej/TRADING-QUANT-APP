@@ -1,0 +1,10 @@
+{
+  "real_trading_enabled": false,
+  "guardrail_max_leverage_enabled": true,
+  "max_allowed_leverage": 5,
+  "guardrail_max_order_usd_enabled": true,
+  "max_order_notional_usd": 500.0,
+  "guardrail_circuit_breaker_enabled": true,
+  "daily_loss_circuit_breaker_pct": 3.0,
+  "last_updated": "2026-09-06T18:47:23.847333"
+}

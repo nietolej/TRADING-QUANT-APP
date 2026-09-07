@@ -79,6 +79,13 @@ def _build_range(min_val: float, max_val: float, step: float) -> List[float]:
     return values
 
 
+# Tope duro de combinaciones para un solo Grid Search. Cada combinación ejecuta un
+# backtest completo sobre el histórico real; sin este límite, una malla con varios
+# parámetros de rango amplio puede escalar a cientos de miles de combinaciones y
+# colgar el servidor (CPU/memoria) durante minutos u horas sin forma de saberlo antes.
+MAX_GRID_COMBINATIONS = 20_000
+
+
 def count_combinations(param_ranges: Dict[str, Any]) -> int:
     """Devuelve el número total de combinaciones sin ejecutar el grid."""
     total = 1
@@ -253,10 +260,22 @@ def run_grid_search(
     """
     Ejecuta Grid Search de forma segura y multihilo.
     Retorna una lista de resultados ordenados de mejor a peor según `optimize_metric`.
-    Soporta cancelación inmediata mediante `cancel_event`.
+
+    Soporta cancelación mediante `cancel_event`: al activarse, se cancelan todas las
+    combinaciones aún no iniciadas, pero las que ya están corriendo en el ThreadPoolExecutor
+    (hasta `max_workers` a la vez) terminan su backtest antes de detenerse por completo —
+    no es una interrupción instantánea de esos hilos en ejecución.
+
+    Lanza ValueError si el número de combinaciones excede MAX_GRID_COMBINATIONS, para
+    evitar colgar el servidor con una malla de parámetros demasiado extensa.
     """
     results: List[Dict[str, Any]] = []
     total = count_combinations(param_ranges)
+    if total > MAX_GRID_COMBINATIONS:
+        raise ValueError(
+            f"La combinatoria solicitada ({total:,} combinaciones) excede el máximo permitido "
+            f"({MAX_GRID_COMBINATIONS:,}). Reduce el rango o aumenta el paso de los parámetros."
+        )
     done = 0
 
     # Cargamos el config YAML una sola vez

@@ -1,15 +1,19 @@
 import os
 import asyncio
+import logging
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from nicegui import ui
 import plotly.graph_objects as go
+
+logger = logging.getLogger("BinanceAccountPage")
 
 from execution_engine.binance_client import (
     BinanceTestnetClient,
     get_binance_credentials,
     verify_binance_credentials,
 )
+from execution_engine.security_manager import SecurityManager, is_real_trading_enabled
 from analytics.portfolio_risk_analyzer import PortfolioRiskAnalyzer
 from web_gui.components.api_credentials_dialog import open_api_credentials_dialog
 
@@ -41,7 +45,9 @@ def _obfuscate_key(key: str) -> str:
 class BinanceAccountPage:
     def __init__(self):
         self.selected_network = "testnet"  # 'testnet' o 'mainnet'
+        self.selected_wallet = "futures"   # 'futures' o 'spot'
         self.account_data: Dict[str, Any] = {}
+        self.spot_data: Dict[str, Any] = {}
         self.risk_analysis: Dict[str, Any] = {}
         self.is_loading = False
 
@@ -49,20 +55,20 @@ class BinanceAccountPage:
         with ui.column().classes('w-full h-full p-2 md:p-4 gap-6 bg-[#0a0e17] text-white'):
 
             # ──────────────────────────────────────────────────────────────
-            # 1. Cabecera Principal y Selector de Red (Testnet vs Real)
+            # 1. Cabecera Principal y Selectores
             # ──────────────────────────────────────────────────────────────
             with ui.row().classes('w-full justify-between items-center pb-4 border-b border-gray-800 flex-wrap gap-4'):
                 with ui.column().classes('gap-1'):
                     with ui.row().classes('items-center gap-3'):
                         ui.icon('account_balance_wallet', size='32px', color='yellow-400')
                         ui.label('Cartera, Diagnóstico de Riesgo y Exchange Binance').classes('text-2xl md:text-3xl font-extrabold text-white tracking-tight font-heading')
-                    ui.label('Analizador de situación en tiempo real, interpretación cuantitativa, métricas de riesgo y separación de cuentas').classes('text-xs md:text-sm text-gray-400')
+                    ui.label('Analizador de situación en tiempo real, interpretación cuantitativa, métricas de riesgo y separación de carteras').classes('text-xs md:text-sm text-gray-400')
 
                 with ui.row().classes('gap-3 items-center flex-wrap'):
                     # Selector de Red Exclusivo (Testnet vs Mainnet)
                     with ui.row().classes('bg-gray-950 p-1 rounded-xl border border-gray-800 gap-1 shadow-inner'):
                         self.btn_testnet = ui.button(
-                            '🟡 Binance Futures Testnet (Demo)', 
+                            '🟡 Binance Testnet (Demo)', 
                             on_click=lambda: self._switch_network('testnet')
                         ).props('dense').classes('bg-yellow-500 text-black text-xs font-bold px-3 py-1.5 rounded-lg transition-all shadow')
                         
@@ -78,6 +84,14 @@ class BinanceAccountPage:
                         on_click=self._toggle_multi_assets_mode
                     ).props('dense outline').classes('text-xs text-yellow-300 border-yellow-500/40 rounded-xl px-3 py-1.5').tooltip('Permite usar tu saldo en BTC como garantía o colateral global para operar cualquier par en futuros')
 
+                    # Badge de Candado de Seguridad (Solo Lectura vs Trading Real)
+                    self.badge_security_lock = ui.badge(
+                        '🔒 MODO SOLO LECTURA (SEGURO)', 
+                        color='emerald-900'
+                    ).classes('text-emerald-300 border border-emerald-500/40 font-bold text-xs px-3 py-2 rounded-xl shadow cursor-pointer')
+                    self.badge_security_lock.tooltip('Haz clic para gestionar el candado de trading y los guardarraíles cuantitativos')
+                    self.badge_security_lock.on('click', lambda: open_api_credentials_dialog(on_saved_callback=self._on_security_updated))
+
                     # Botón de refresco manual
                     self.btn_refresh = ui.button(
                         'Actualizar', 
@@ -85,207 +99,332 @@ class BinanceAccountPage:
                         on_click=self._refresh_account_data_async
                     ).classes('bg-gray-800 hover:bg-gray-700 text-white font-bold text-xs px-3 py-2 rounded-xl shadow border border-gray-700')
 
-                    # Botón para Conectar / Configurar APIs
+                    # Botón para Conectar / Configurar APIs & Guardarraíles
                     ui.button(
-                        '🔑 Conectar APIs (Test & Real)', 
+                        '🔑 Conectar APIs & Seguridad', 
                         icon='vpn_key', 
-                        on_click=lambda: open_api_credentials_dialog(on_saved_callback=self._refresh_account_data_async)
+                        on_click=lambda: open_api_credentials_dialog(on_saved_callback=self._on_security_updated)
                     ).classes('bg-gradient-to-r from-amber-500 to-yellow-400 hover:from-amber-400 hover:to-yellow-300 text-black font-extrabold text-xs px-3 py-2 rounded-xl shadow-lg border border-amber-300/40 transition-all')
 
-            # ──────────────────────────────────────────────────────────────
-            # 2. KPIs de Alto Nivel de la Cartera y Exposición
-            # ──────────────────────────────────────────────────────────────
-            with ui.grid(columns=6).classes('w-full gap-3'):
-                # KPI 1: Patrimonio Total
-                with ui.card().classes('bg-gray-900 p-3 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
-                    ui.label('VALOR TOTAL CARTERA').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
-                    self.kpi_wallet_balance = ui.label('$0.00 USD').classes('text-xl font-black text-green-400 mt-1 font-mono')
-                    self.kpi_net_badge = ui.label('Entorno: Testnet').classes('text-[10px] text-gray-400 font-medium')
-
-                # KPI 2: Margen Disponible
-                with ui.card().classes('bg-gray-900 p-3 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
-                    ui.label('SALDO DISPONIBLE').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
-                    self.kpi_avail_margin = ui.label('0.00 USDT').classes('text-xl font-black text-yellow-400 mt-1 font-mono')
-                    self.kpi_margin_util = ui.label('Uso Margen: 0.0%').classes('text-[10px] text-gray-400')
-
-                # KPI 3: PnL No Realizado
-                with ui.card().classes('bg-gray-900 p-3 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
-                    ui.label('PNL NO REALIZADO').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
-                    self.kpi_unrealized_pnl = ui.label('+0.00 USDT').classes('text-xl font-black text-white mt-1 font-mono')
-                    self.kpi_margin_balance = ui.label('Margen Total: 0.00 USDT').classes('text-[10px] text-gray-400')
-
-                # KPI 4: Apalancamiento Efectivo
-                with ui.card().classes('bg-gray-900 p-3 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
-                    ui.label('APALANCAMIENTO').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
-                    self.kpi_effective_leverage = ui.label('0.00x').classes('text-xl font-black text-sky-400 mt-1 font-mono')
-                    self.kpi_notional_exposure = ui.label('Nocional: $0.00 USD').classes('text-[10px] text-gray-400')
-
-                # KPI 5: Distancia Mínima a Liquidación
-                with ui.card().classes('bg-gray-900 p-3 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
-                    ui.label('DISTANCIA A LIQUIDACIÓN').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
-                    self.kpi_liq_distance = ui.label('Seguro (100%)').classes('text-lg font-bold text-emerald-400 mt-1')
-                    self.kpi_highest_risk_sym = ui.label('Sin riesgo de liq.').classes('text-[10px] text-gray-400')
-
-                # KPI 6: Value at Risk (VaR 95% 1D)
-                with ui.card().classes('bg-gray-900 p-3 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
-                    ui.label('VALUE AT RISK (VaR 95%)').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
-                    self.kpi_var_95 = ui.label('$0.00 (0.0%)').classes('text-lg font-bold text-amber-400 mt-1 font-mono')
-                    self.kpi_api_status = ui.label('API: Conectada 🟢').classes('text-[10px] text-emerald-400 font-semibold')
+                    # Botón de Kill-Switch de Emergencia
+                    self.btn_kill_switch = ui.button(
+                        '🚨 Kill-Switch', 
+                        icon='power_settings_new', 
+                        on_click=self._confirm_emergency_kill_switch
+                    ).classes('bg-red-950/80 hover:bg-red-900 text-red-300 border border-red-700/60 font-black text-xs px-3 py-2 rounded-xl shadow transition-all').tooltip('Parada Inmediata: Bloquea trading real y cancela órdenes abiertas')
 
             # ──────────────────────────────────────────────────────────────
-            # 3. 🧠 INTERPRETACIÓN Y DIAGNÓSTICO CUANTITATIVO DE LA CARTERA
+            # 2. Selector de Cartera: FUTUROS (Donde Operan Bots) vs SPOT
             # ──────────────────────────────────────────────────────────────
-            with ui.card().classes('bg-gray-900/90 border border-yellow-500/40 p-5 rounded-2xl w-full shadow-xl'):
-                with ui.row().classes('w-full justify-between items-center mb-3 flex-wrap gap-2'):
-                    with ui.row().classes('items-center gap-2'):
-                        ui.icon('psychology', color='yellow-400', size='26px')
-                        ui.label('Diagnóstico e Interpretación Cuantitativa de la Cartera').classes('text-lg font-bold text-white font-heading')
-                    self.diag_health_badge = ui.badge('Analizando...', color='emerald-950').props('rounded').classes('text-emerald-300 font-bold text-xs px-3 py-1')
+            with ui.row().classes('w-full justify-between items-center bg-gray-900/90 p-3.5 rounded-2xl border border-gray-800 flex-wrap gap-4 shadow-lg'):
+                with ui.row().classes('items-center gap-3 flex-wrap'):
+                    ui.label('CARTERA SELECCIONADA:').classes('text-xs font-black text-gray-300 tracking-wider')
+                    with ui.row().classes('bg-gray-950 p-1.5 rounded-xl border border-gray-800 gap-1.5 shadow-inner'):
+                        self.btn_wallet_futures = ui.button(
+                            '⚡ Cartera Futuros (USDⓈ-M)',
+                            on_click=lambda: self._switch_wallet('futures')
+                        ).props('dense').classes('bg-yellow-500 text-black text-xs font-black px-4 py-2 rounded-lg transition-all shadow')
+                        
+                        self.btn_wallet_spot = ui.button(
+                            '🪙 Cartera Spot (Contado)',
+                            on_click=lambda: self._switch_wallet('spot')
+                        ).props('dense flat').classes('text-gray-400 hover:text-white text-xs font-semibold px-4 py-2 rounded-lg transition-all')
 
-                # Tarjetas de diagnóstico estructurado
-                with ui.grid(columns=4).classes('w-full gap-3 mb-4'):
-                    # 1. Postura de Mercado
-                    with ui.card().classes('bg-gray-950 p-3.5 rounded-xl border border-gray-800 flex flex-col justify-between'):
-                        with ui.row().classes('items-center gap-2 mb-1'):
-                            ui.icon('explore', color='blue-400', size='18px')
-                            ui.label('Postura de Mercado').classes('text-xs font-bold text-blue-400')
-                        self.diag_posture_label = ui.label('Calculando sesgo direccional...').classes('text-xs text-gray-300')
-
-                    # 2. Margen y Apalancamiento
-                    with ui.card().classes('bg-gray-950 p-3.5 rounded-xl border border-gray-800 flex flex-col justify-between'):
-                        with ui.row().classes('items-center gap-2 mb-1'):
-                            ui.icon('balance', color='yellow-400', size='18px')
-                            ui.label('Margen y Apalancamiento').classes('text-xs font-bold text-yellow-400')
-                        self.diag_margin_label = ui.label('Evaluando utilización de capital...').classes('text-xs text-gray-300')
-
-                    # 3. Seguridad de Liquidación
-                    with ui.card().classes('bg-gray-950 p-3.5 rounded-xl border border-gray-800 flex flex-col justify-between'):
-                        with ui.row().classes('items-center gap-2 mb-1'):
-                            ui.icon('shield', color='emerald-400', size='18px')
-                            ui.label('Buffer de Liquidación').classes('text-xs font-bold text-emerald-400')
-                        self.diag_liq_label = ui.label('Comprobando precios de liquidación...').classes('text-xs text-gray-300')
-
-                    # 4. Exposición VaR & Volatilidad
-                    with ui.card().classes('bg-gray-950 p-3.5 rounded-xl border border-gray-800 flex flex-col justify-between'):
-                        with ui.row().classes('items-center gap-2 mb-1'):
-                            ui.icon('trending_down', color='amber-400', size='18px')
-                            ui.label('Riesgo Estadístico (VaR)').classes('text-xs font-bold text-amber-400')
-                        self.diag_var_label = ui.label('Estimando pérdida máxima esperada...').classes('text-xs text-gray-300')
-
-                # Recomendaciones Accionables
-                with ui.column().classes('w-full bg-gray-950/80 p-3.5 rounded-xl border border-gray-800/80'):
-                    with ui.row().classes('items-center gap-2 mb-2'):
-                        ui.icon('checklist', color='green-400', size='18px')
-                        ui.label('Pautas y Recomendaciones de Gestión de Riesgo:').classes('text-xs font-bold text-green-400 uppercase tracking-wider')
-                    self.diag_recommendations_container = ui.column().classes('w-full gap-1.5 text-xs text-gray-300')
+                with ui.row().classes('items-center gap-2'):
+                    self.wallet_info_chip = ui.badge('🤖 ENTORNO DE OPERACIÓN DE LOS BOTS', color='yellow-500').classes('text-black font-extrabold text-xs px-3.5 py-1.5 rounded-lg shadow')
 
             # ──────────────────────────────────────────────────────────────
-            # 4. 📊 MATRIZ DE RIESGO CUANTITATIVO Y SIMULACIÓN DE ESTRÉS (PLOTLY)
+            # 3. CONTENEDOR DE CARTERA FUTUROS (USDⓈ-M)
             # ──────────────────────────────────────────────────────────────
-            with ui.row().classes('w-full gap-4 flex-wrap lg:flex-nowrap'):
-                # Gráfico 1: Simulación de Estrés de Mercado
-                with ui.card().classes('bg-gray-900 p-4 rounded-2xl border border-gray-800 flex-1 shadow-lg'):
-                    with ui.row().classes('w-full justify-between items-center mb-2'):
+            self.container_futures = ui.column().classes('w-full gap-6')
+            with self.container_futures:
+
+                # Banner Informativo de Futuros
+                with ui.card().classes('w-full bg-gradient-to-r from-yellow-950/30 to-gray-900/50 border border-yellow-500/40 p-3.5 rounded-xl flex flex-row items-center justify-between gap-3 shadow-inner'):
+                    with ui.row().classes('items-center gap-3'):
+                        ui.icon('smart_toy', color='yellow-400', size='24px')
+                        with ui.column().classes('gap-0.5'):
+                            ui.label('Cartera de Futuros USDⓈ-M (Entorno de Algoritmos Cuantitativos)').classes('text-xs font-extrabold text-yellow-300 uppercase tracking-wide')
+                            ui.label('Todos los bots de trading operan exclusivamente en esta cartera utilizando margen, apalancamiento y órdenes Stop/Take-Profit sobre contratos perpetuos.').classes('text-[11px] text-gray-300')
+                    self.kpi_net_badge = ui.badge('Entorno: Testnet', color='gray-800').classes('text-[10px] text-yellow-300 font-bold px-2 py-1 rounded')
+
+                # KPIs de Alto Nivel de Futuros
+                with ui.grid(columns=6).classes('w-full gap-3'):
+                    with ui.card().classes('bg-gray-900 p-3 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
+                        ui.label('VALOR TOTAL CARTERA').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
+                        self.kpi_wallet_balance = ui.label('$0.00 USD').classes('text-xl font-black text-green-400 mt-1 font-mono')
+                        self.kpi_futures_asset_count = ui.label('0 activos').classes('text-[10px] text-gray-400 font-medium')
+
+                    with ui.card().classes('bg-gray-900 p-3 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
+                        ui.label('MARGEN DISPONIBLE').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
+                        self.kpi_avail_margin = ui.label('0.00 USDT').classes('text-xl font-black text-yellow-400 mt-1 font-mono')
+                        self.kpi_margin_util = ui.label('Uso Margen: 0.0%').classes('text-[10px] text-gray-400')
+
+                    with ui.card().classes('bg-gray-900 p-3 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
+                        ui.label('PNL NO REALIZADO').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
+                        self.kpi_unrealized_pnl = ui.label('+0.00 USDT').classes('text-xl font-black text-white mt-1 font-mono')
+                        self.kpi_margin_balance = ui.label('Margen Total: 0.00 USDT').classes('text-[10px] text-gray-400')
+
+                    with ui.card().classes('bg-gray-900 p-3 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
+                        ui.label('APALANCAMIENTO').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
+                        self.kpi_effective_leverage = ui.label('0.00x').classes('text-xl font-black text-sky-400 mt-1 font-mono')
+                        self.kpi_notional_exposure = ui.label('Nocional: $0.00 USD').classes('text-[10px] text-gray-400')
+
+                    with ui.card().classes('bg-gray-900 p-3 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
+                        ui.label('DISTANCIA A LIQUIDACIÓN').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
+                        self.kpi_liq_distance = ui.label('Seguro (100%)').classes('text-lg font-bold text-emerald-400 mt-1')
+                        self.kpi_highest_risk_sym = ui.label('Sin riesgo de liq.').classes('text-[10px] text-gray-400')
+
+                    with ui.card().classes('bg-gray-900 p-3 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
+                        ui.label('VALUE AT RISK (VaR 95%)').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
+                        self.kpi_var_95 = ui.label('$0.00 (0.0%)').classes('text-lg font-bold text-amber-400 mt-1 font-mono')
+                        self.kpi_api_status = ui.label('API: Conectada 🟢').classes('text-[10px] text-emerald-400 font-semibold')
+
+                # Diagnóstico Cuantitativo de Cartera Futuros
+                with ui.card().classes('bg-gray-900/90 border border-yellow-500/40 p-5 rounded-2xl w-full shadow-xl'):
+                    with ui.row().classes('w-full justify-between items-center mb-3 flex-wrap gap-2'):
                         with ui.row().classes('items-center gap-2'):
-                            ui.icon('show_chart', color='amber-400', size='20px')
-                            ui.label('Simulador de Estrés de Mercado (Impacto en PnL & Equity)').classes('text-sm font-bold text-white')
-                        ui.label('Shocks de mercado (-20% a +20%)').classes('text-[11px] text-gray-400 italic')
-                    self.stress_chart = ui.plotly(self._build_empty_stress_chart()).classes('w-full h-64')
+                            ui.icon('psychology', color='yellow-400', size='26px')
+                            ui.label('Diagnóstico e Interpretación Cuantitativa de la Cartera').classes('text-lg font-bold text-white font-heading')
+                        self.diag_health_badge = ui.badge('Analizando...', color='emerald-950').props('rounded').classes('text-emerald-300 font-bold text-xs px-3 py-1')
 
-                # Gráfico 2: Distribución de Margen y Exposición (Donut)
-                with ui.card().classes('bg-gray-900 p-4 rounded-2xl border border-gray-800 w-full lg:w-96 shadow-lg'):
-                    with ui.row().classes('w-full justify-between items-center mb-2'):
+                    with ui.grid(columns=4).classes('w-full gap-3 mb-4'):
+                        with ui.card().classes('bg-gray-950 p-3.5 rounded-xl border border-gray-800 flex flex-col justify-between'):
+                            with ui.row().classes('items-center gap-2 mb-1'):
+                                ui.icon('explore', color='blue-400', size='18px')
+                                ui.label('Postura de Mercado').classes('text-xs font-bold text-blue-400')
+                            self.diag_posture_label = ui.label('Calculando sesgo direccional...').classes('text-xs text-gray-300')
+
+                        with ui.card().classes('bg-gray-950 p-3.5 rounded-xl border border-gray-800 flex flex-col justify-between'):
+                            with ui.row().classes('items-center gap-2 mb-1'):
+                                ui.icon('balance', color='yellow-400', size='18px')
+                                ui.label('Margen y Apalancamiento').classes('text-xs font-bold text-yellow-400')
+                            self.diag_margin_label = ui.label('Evaluando utilización de capital...').classes('text-xs text-gray-300')
+
+                        with ui.card().classes('bg-gray-950 p-3.5 rounded-xl border border-gray-800 flex flex-col justify-between'):
+                            with ui.row().classes('items-center gap-2 mb-1'):
+                                ui.icon('shield', color='emerald-400', size='18px')
+                                ui.label('Buffer de Liquidación').classes('text-xs font-bold text-emerald-400')
+                            self.diag_liq_label = ui.label('Comprobando precios de liquidación...').classes('text-xs text-gray-300')
+
+                        with ui.card().classes('bg-gray-950 p-3.5 rounded-xl border border-gray-800 flex flex-col justify-between'):
+                            with ui.row().classes('items-center gap-2 mb-1'):
+                                ui.icon('trending_down', color='amber-400', size='18px')
+                                ui.label('Riesgo Estadístico (VaR)').classes('text-xs font-bold text-amber-400')
+                            self.diag_var_label = ui.label('Estimando pérdida máxima esperada...').classes('text-xs text-gray-300')
+
+                    with ui.column().classes('w-full bg-gray-950/80 p-3.5 rounded-xl border border-gray-800/80'):
+                        with ui.row().classes('items-center gap-2 mb-2'):
+                            ui.icon('checklist', color='green-400', size='18px')
+                            ui.label('Pautas y Recomendaciones de Gestión de Riesgo:').classes('text-xs font-bold text-green-400 uppercase tracking-wider')
+                        self.diag_recommendations_container = ui.column().classes('w-full gap-1.5 text-xs text-gray-300')
+
+                # Matriz de Riesgo Cuantitativo y Gráficos Plotly
+                with ui.row().classes('w-full gap-4 flex-wrap lg:flex-nowrap'):
+                    with ui.card().classes('bg-gray-900 p-4 rounded-2xl border border-gray-800 flex-1 shadow-lg'):
+                        with ui.row().classes('w-full justify-between items-center mb-2'):
+                            with ui.row().classes('items-center gap-2'):
+                                ui.icon('show_chart', color='amber-400', size='20px')
+                                ui.label('Simulador de Estrés de Mercado (Impacto en PnL & Equity)').classes('text-sm font-bold text-white')
+                            ui.label('Shocks de mercado (-20% a +20%)').classes('text-[11px] text-gray-400 italic')
+                        self.stress_chart = ui.plotly(self._build_empty_stress_chart()).classes('w-full h-64')
+
+                    with ui.card().classes('bg-gray-900 p-4 rounded-2xl border border-gray-800 w-full lg:w-96 shadow-lg'):
+                        with ui.row().classes('w-full justify-between items-center mb-2'):
+                            with ui.row().classes('items-center gap-2'):
+                                ui.icon('pie_chart', color='blue-400', size='20px')
+                                ui.label('Composición y Exposición').classes('text-sm font-bold text-white')
+                        self.allocation_chart = ui.plotly(self._build_empty_alloc_chart()).classes('w-full h-64')
+
+                # Tabla de Saldos y Margen en Futuros
+                with ui.card().classes('bg-gray-900 p-5 rounded-2xl border border-gray-800 w-full shadow-xl'):
+                    with ui.row().classes('w-full justify-between items-center mb-3'):
                         with ui.row().classes('items-center gap-2'):
-                            ui.icon('pie_chart', color='blue-400', size='20px')
-                            ui.label('Composición y Exposición').classes('text-sm font-bold text-white')
-                    self.allocation_chart = ui.plotly(self._build_empty_alloc_chart()).classes('w-full h-64')
+                            ui.icon('savings', color='green-400', size='22px')
+                            ui.label('Activos con Saldo en Billetera de Futuros').classes('text-lg font-bold text-white font-heading')
+                        ui.label('Desglose de activos y conversión en USD en tiempo real').classes('text-xs text-gray-400 italic')
+
+                    self.assets_grid = ui.aggrid({
+                        'defaultColDef': {'flex': 1, 'sortable': True, 'resizable': True},
+                        'columnDefs': [
+                            {'headerName': 'Activo (Asset)',      'field': 'asset',             'maxWidth': 130, 'cellClass': 'font-bold text-yellow-400'},
+                            {'headerName': 'Balance Total',       'field': 'wallet_balance',    'maxWidth': 160, 'cellClass': 'font-mono text-green-400 font-bold'},
+                            {'headerName': 'Valor Estimado (USD)','field': 'usd_value_str',     'maxWidth': 170, 'cellClass': 'font-mono text-yellow-300 font-bold'},
+                            {'headerName': 'Disponible',          'field': 'available_balance', 'maxWidth': 150, 'cellClass': 'font-mono text-gray-200'},
+                            {'headerName': 'Margen de Posición',  'field': 'margin_balance',    'maxWidth': 150, 'cellClass': 'font-mono text-blue-300'},
+                            {'headerName': 'PnL No Realizado',    'field': 'unrealized_pnl',    'maxWidth': 150, 'cellClass': 'font-mono'},
+                        ],
+                        'rowData': [],
+                        'rowClassRules': {
+                            'text-green-400': 'parseFloat(data.unrealized_pnl) > 0',
+                            'text-red-400':   'parseFloat(data.unrealized_pnl) < 0',
+                        }
+                    }).classes('h-48 text-white')
+
+                # Posiciones Abiertas en Futuros
+                with ui.card().classes('bg-gray-900 p-5 rounded-2xl border border-gray-800 w-full shadow-xl'):
+                    with ui.row().classes('w-full justify-between items-center mb-3'):
+                        with ui.row().classes('items-center gap-2'):
+                            ui.icon('show_chart', color='blue-400', size='22px')
+                            ui.label('Posiciones Abiertas en Binance Futures').classes('text-lg font-bold text-white font-heading')
+                        ui.label('Posiciones activas con medición de distancia a liquidación en tiempo real').classes('text-xs text-gray-400 italic')
+
+                    self.positions_grid = ui.aggrid({
+                        'defaultColDef': {'flex': 1, 'sortable': True, 'resizable': True},
+                        'columnDefs': [
+                            {'headerName': 'Símbolo / Contrato', 'field': 'symbol_display',  'maxWidth': 160, 'cellClass': 'font-bold text-white'},
+                            {'headerName': 'Tamaño (Size)',      'field': 'size_display',    'maxWidth': 130, 'cellClass': 'font-mono text-yellow-300 font-bold'},
+                            {'headerName': 'Precio Entrada',     'field': 'entry_price',     'maxWidth': 130, 'cellClass': 'font-mono text-gray-200'},
+                            {'headerName': 'Break Even',         'field': 'break_even',      'maxWidth': 130, 'cellClass': 'font-mono text-gray-400'},
+                            {'headerName': 'Precio Marca',       'field': 'mark_price',      'maxWidth': 130, 'cellClass': 'font-mono text-sky-400'},
+                            {'headerName': 'Liq. Price',         'field': 'liq_price',       'maxWidth': 120, 'cellClass': 'font-mono text-red-400 font-semibold'},
+                            {'headerName': 'Distancia a Liq.',   'field': 'liq_distance_str','maxWidth': 140, 'cellClass': 'font-mono font-bold'},
+                            {'headerName': 'Margen',             'field': 'margin_display',  'maxWidth': 150, 'cellClass': 'font-mono text-blue-300'},
+                            {'headerName': 'PNL (ROI %)',        'field': 'pnl_display',     'maxWidth': 180, 'cellClass': 'font-mono font-bold'},
+                        ],
+                        'rowData': [],
+                        'rowClassRules': {
+                            'text-green-400 font-semibold': 'data.raw_pnl > 0',
+                            'text-red-400 font-semibold':   'data.raw_pnl < 0',
+                        }
+                    }).classes('h-44 text-white')
+
+                # Órdenes Abiertas en Futuros
+                with ui.card().classes('bg-gray-900 p-5 rounded-2xl border border-gray-800 w-full shadow-xl'):
+                    with ui.row().classes('w-full justify-between items-center mb-3 flex-wrap gap-2'):
+                        with ui.row().classes('items-center gap-2'):
+                            ui.icon('pending_actions', color='orange-400', size='22px')
+                            ui.label('Órdenes Abiertas en Binance Futures').classes('text-lg font-bold text-white font-heading')
+                        
+                        with ui.row().classes('gap-2'):
+                            ui.button('Cancelar Todas las Órdenes BTCUSDT', icon='delete_sweep', on_click=self._cancel_all_orders).props('dense outline color=red-400').classes('text-xs text-red-400 hover:bg-red-500/20')
+
+                    self.open_orders_grid = ui.aggrid({
+                        'defaultColDef': {'flex': 1, 'sortable': True, 'resizable': True},
+                        'columnDefs': [
+                            {'headerName': 'ID Orden',     'field': 'orderId',   'maxWidth': 160, 'cellClass': 'font-mono text-gray-300'},
+                            {'headerName': 'Símbolo',      'field': 'symbol',    'maxWidth': 130, 'cellClass': 'font-bold text-white'},
+                            {'headerName': 'Lado',         'field': 'side',      'maxWidth': 110},
+                            {'headerName': 'Tipo',         'field': 'type',      'maxWidth': 130},
+                            {'headerName': 'Cantidad',     'field': 'origQty',   'maxWidth': 130, 'cellClass': 'font-mono'},
+                            {'headerName': 'Precio',       'field': 'price',     'maxWidth': 130, 'cellClass': 'font-mono'},
+                            {'headerName': 'Stop Price',   'field': 'stopPrice', 'maxWidth': 130, 'cellClass': 'font-mono text-yellow-400'},
+                            {'headerName': 'Fecha/Hora',   'field': 'time_str',  'maxWidth': 140, 'cellClass': 'font-mono text-xs text-gray-400 text-center'},
+                        ],
+                        'rowData': []
+                    }).classes('h-40 text-white')
 
             # ──────────────────────────────────────────────────────────────
-            # 5. Tabla de Saldos y Activos en la Billetera
+            # 4. CONTENEDOR DE CARTERA SPOT (CONTADO / CUSTODIA)
             # ──────────────────────────────────────────────────────────────
-            with ui.card().classes('bg-gray-900 p-5 rounded-2xl border border-gray-800 w-full shadow-xl'):
-                with ui.row().classes('w-full justify-between items-center mb-3'):
-                    with ui.row().classes('items-center gap-2'):
-                        ui.icon('savings', color='green-400', size='22px')
-                        ui.label('Billetera y Activos con Saldo').classes('text-lg font-bold text-white font-heading')
-                    ui.label('Desglose de activos y conversión en USD en tiempo real').classes('text-xs text-gray-400 italic')
+            self.container_spot = ui.column().classes('w-full gap-6')
+            self.container_spot.set_visibility(False)  # Oculto por defecto hasta seleccionarlo
 
-                self.assets_grid = ui.aggrid({
-                    'defaultColDef': {'flex': 1, 'sortable': True, 'resizable': True},
-                    'columnDefs': [
-                        {'headerName': 'Activo (Asset)',      'field': 'asset',             'maxWidth': 130, 'cellClass': 'font-bold text-yellow-400'},
-                        {'headerName': 'Balance Total',       'field': 'wallet_balance',    'maxWidth': 160, 'cellClass': 'font-mono text-green-400 font-bold'},
-                        {'headerName': 'Valor Estimado (USD)','field': 'usd_value_str',     'maxWidth': 170, 'cellClass': 'font-mono text-yellow-300 font-bold'},
-                        {'headerName': 'Disponible',          'field': 'available_balance', 'maxWidth': 150, 'cellClass': 'font-mono text-gray-200'},
-                        {'headerName': 'Margen de Posición',  'field': 'margin_balance',    'maxWidth': 150, 'cellClass': 'font-mono text-blue-300'},
-                        {'headerName': 'PnL No Realizado',    'field': 'unrealized_pnl',    'maxWidth': 150, 'cellClass': 'font-mono'},
-                    ],
-                    'rowData': [],
-                    'rowClassRules': {
-                        'text-green-400': 'parseFloat(data.unrealized_pnl) > 0',
-                        'text-red-400':   'parseFloat(data.unrealized_pnl) < 0',
-                    }
-                }).classes('h-48 text-white')
+            with self.container_spot:
+
+                # Banner Informativo de Cartera Spot
+                with ui.card().classes('w-full bg-gradient-to-r from-blue-950/40 to-gray-900/50 border border-blue-500/40 p-4 rounded-xl flex flex-row items-center justify-between gap-3 shadow-inner'):
+                    with ui.row().classes('items-center gap-3'):
+                        ui.icon('wallet', color='blue-400', size='26px')
+                        with ui.column().classes('gap-0.5'):
+                            ui.label('Cartera Spot de Binance (Contado / Custodia / Hold)').classes('text-xs font-extrabold text-blue-300 uppercase tracking-wide')
+                            ui.label('Esta cartera refleja tus criptomonedas y saldo líquido disponible sin apalancamiento. Los bots cuantitativos NO operan en Spot.').classes('text-[11px] text-gray-300')
+                    self.kpi_spot_net_badge = ui.badge('Entorno: Testnet', color='gray-800').classes('text-[10px] text-blue-300 font-bold px-2 py-1 rounded')
+
+                # Alerta Destacada para Claves de Solo Futuros (Testnet vs Real)
+                self.spot_warning_card = ui.card().classes('w-full bg-amber-950/40 border border-amber-500/60 p-4 rounded-xl shadow-lg')
+                self.spot_warning_card.set_visibility(False)
+                with self.spot_warning_card:
+                    with ui.row().classes('items-start gap-3'):
+                        ui.icon('warning', color='amber-400', size='28px').classes('mt-0.5')
+                        with ui.column().classes('gap-1 flex-1'):
+                            ui.label('Nota sobre Permisos de la API en Cartera Spot').classes('text-sm font-bold text-amber-300')
+                            self.spot_warning_text = ui.label('Verificando acceso a Spot...').classes('text-xs text-gray-300 leading-relaxed')
+                            with ui.row().classes('items-center gap-2 mt-2'):
+                                ui.button(
+                                    'Configurar Claves con Permisos Spot', 
+                                    icon='vpn_key', 
+                                    on_click=lambda: open_api_credentials_dialog(on_saved_callback=self._refresh_account_data_async)
+                                ).props('dense outline color=amber-400').classes('text-xs text-amber-300 px-3 py-1 rounded-lg')
+
+                # KPIs de Cartera Spot
+                with ui.grid(columns=4).classes('w-full gap-4'):
+                    with ui.card().classes('bg-gray-900 p-4 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
+                        ui.label('VALOR TOTAL SPOT ESTIMADO').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
+                        self.kpi_spot_total_usd = ui.label('$0.00 USD').classes('text-2xl font-black text-green-400 mt-1 font-mono')
+                        ui.label('Suma de todos los activos a precio de mercado').classes('text-[10px] text-gray-400')
+
+                    with ui.card().classes('bg-gray-900 p-4 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
+                        ui.label('SALDO LIBRE EN USDT').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
+                        self.kpi_spot_free_usdt = ui.label('0.00 USDT').classes('text-2xl font-black text-yellow-400 mt-1 font-mono')
+                        self.kpi_spot_free_usd_sub = ui.label('Disponible para compras').classes('text-[10px] text-gray-400')
+
+                    with ui.card().classes('bg-gray-900 p-4 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
+                        ui.label('SALDO BLOQUEADO EN ÓRDENES').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
+                        self.kpi_spot_locked_usd = ui.label('$0.00 USD').classes('text-2xl font-black text-amber-400 mt-1 font-mono')
+                        ui.label('Comprometido en órdenes de límite').classes('text-[10px] text-gray-400')
+
+                    with ui.card().classes('bg-gray-900 p-4 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
+                        ui.label('CRIPTOACTIVOS CON BALANCE').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
+                        self.kpi_spot_assets_count = ui.label('0 activos').classes('text-2xl font-black text-sky-400 mt-1 font-mono')
+                        self.kpi_spot_orders_count = ui.label('0 órdenes abiertas').classes('text-[10px] text-gray-400')
+
+                # Gráfico Plotly Donut de Composición Spot + Tabla de Saldos Spot
+                with ui.row().classes('w-full gap-4 flex-wrap lg:flex-nowrap'):
+                    # Donut Chart Spot
+                    with ui.card().classes('bg-gray-900 p-4 rounded-2xl border border-gray-800 w-full lg:w-96 shadow-lg'):
+                        with ui.row().classes('w-full justify-between items-center mb-2'):
+                            with ui.row().classes('items-center gap-2'):
+                                ui.icon('pie_chart', color='blue-400', size='20px')
+                                ui.label('Distribución de Criptoactivos').classes('text-sm font-bold text-white')
+                        self.spot_pie_chart = ui.plotly(self._build_empty_spot_pie()).classes('w-full h-72')
+
+                    # Tabla de Saldos Spot
+                    with ui.card().classes('bg-gray-900 p-5 rounded-2xl border border-gray-800 flex-1 shadow-xl'):
+                        with ui.row().classes('w-full justify-between items-center mb-3'):
+                            with ui.row().classes('items-center gap-2'):
+                                ui.icon('currency_bitcoin', color='yellow-400', size='22px')
+                                ui.label('Activos en Cartera Spot (Free & Locked)').classes('text-lg font-bold text-white font-heading')
+                            ui.label('Balances directos con precio unitario y valoración en USD').classes('text-xs text-gray-400 italic')
+
+                        self.spot_assets_grid = ui.aggrid({
+                            'defaultColDef': {'flex': 1, 'sortable': True, 'resizable': True},
+                            'columnDefs': [
+                                {'headerName': 'Criptoactivo',        'field': 'asset',          'maxWidth': 130, 'cellClass': 'font-bold text-yellow-400'},
+                                {'headerName': 'Saldo Libre (Free)',  'field': 'free_str',       'maxWidth': 150, 'cellClass': 'font-mono text-green-400 font-semibold'},
+                                {'headerName': 'Bloqueado (Locked)',  'field': 'locked_str',     'maxWidth': 150, 'cellClass': 'font-mono text-gray-400'},
+                                {'headerName': 'Balance Total',       'field': 'total_str',      'maxWidth': 150, 'cellClass': 'font-mono text-white font-bold'},
+                                {'headerName': 'Precio Unit. (USD)',  'field': 'unit_price_str', 'maxWidth': 150, 'cellClass': 'font-mono text-sky-400'},
+                                {'headerName': 'Valor Estimado (USD)','field': 'usd_value_str',  'maxWidth': 170, 'cellClass': 'font-mono text-yellow-300 font-bold'},
+                            ],
+                            'rowData': []
+                        }).classes('h-72 text-white')
+
+                # Tabla de Órdenes Abiertas en Spot
+                with ui.card().classes('bg-gray-900 p-5 rounded-2xl border border-gray-800 w-full shadow-xl'):
+                    with ui.row().classes('w-full justify-between items-center mb-3 flex-wrap gap-2'):
+                        with ui.row().classes('items-center gap-2'):
+                            ui.icon('pending_actions', color='orange-400', size='22px')
+                            ui.label('Órdenes Abiertas en Binance Spot').classes('text-lg font-bold text-white font-heading')
+                        ui.label('Órdenes límite o condicionales pendientes de ejecución en Spot').classes('text-xs text-gray-400 italic')
+
+                    self.spot_orders_grid = ui.aggrid({
+                        'defaultColDef': {'flex': 1, 'sortable': True, 'resizable': True},
+                        'columnDefs': [
+                            {'headerName': 'ID Orden',     'field': 'orderId',   'maxWidth': 160, 'cellClass': 'font-mono text-gray-300'},
+                            {'headerName': 'Símbolo / Par', 'field': 'symbol',    'maxWidth': 140, 'cellClass': 'font-bold text-white'},
+                            {'headerName': 'Lado',         'field': 'side',      'maxWidth': 110},
+                            {'headerName': 'Tipo',         'field': 'type',      'maxWidth': 130},
+                            {'headerName': 'Cantidad',     'field': 'origQty',   'maxWidth': 140, 'cellClass': 'font-mono'},
+                            {'headerName': 'Precio',       'field': 'price',     'maxWidth': 140, 'cellClass': 'font-mono'},
+                            {'headerName': 'Stop Price',   'field': 'stopPrice', 'maxWidth': 130, 'cellClass': 'font-mono text-yellow-400'},
+                            {'headerName': 'Fecha/Hora',   'field': 'time_str',  'maxWidth': 140, 'cellClass': 'font-mono text-xs text-gray-400 text-center'},
+                        ],
+                        'rowData': []
+                    }).classes('h-40 text-white')
 
             # ──────────────────────────────────────────────────────────────
-            # 6. Posiciones Abiertas en Binance Futures
-            # ──────────────────────────────────────────────────────────────
-            with ui.card().classes('bg-gray-900 p-5 rounded-2xl border border-gray-800 w-full shadow-xl'):
-                with ui.row().classes('w-full justify-between items-center mb-3'):
-                    with ui.row().classes('items-center gap-2'):
-                        ui.icon('show_chart', color='blue-400', size='22px')
-                        ui.label('Posiciones Abiertas en Binance Futures').classes('text-lg font-bold text-white font-heading')
-                    ui.label('Posiciones activas con medición de distancia a liquidación en tiempo real').classes('text-xs text-gray-400 italic')
-
-                self.positions_grid = ui.aggrid({
-                    'defaultColDef': {'flex': 1, 'sortable': True, 'resizable': True},
-                    'columnDefs': [
-                        {'headerName': 'Símbolo / Contrato', 'field': 'symbol_display',  'maxWidth': 160, 'cellClass': 'font-bold text-white'},
-                        {'headerName': 'Tamaño (Size)',      'field': 'size_display',    'maxWidth': 130, 'cellClass': 'font-mono text-yellow-300 font-bold'},
-                        {'headerName': 'Precio Entrada',     'field': 'entry_price',     'maxWidth': 130, 'cellClass': 'font-mono text-gray-200'},
-                        {'headerName': 'Break Even',         'field': 'break_even',      'maxWidth': 130, 'cellClass': 'font-mono text-gray-400'},
-                        {'headerName': 'Precio Marca',       'field': 'mark_price',      'maxWidth': 130, 'cellClass': 'font-mono text-sky-400'},
-                        {'headerName': 'Liq. Price',         'field': 'liq_price',       'maxWidth': 120, 'cellClass': 'font-mono text-red-400 font-semibold'},
-                        {'headerName': 'Distancia a Liq.',   'field': 'liq_distance_str','maxWidth': 140, 'cellClass': 'font-mono font-bold'},
-                        {'headerName': 'Margen',             'field': 'margin_display',  'maxWidth': 150, 'cellClass': 'font-mono text-blue-300'},
-                        {'headerName': 'PNL (ROI %)',        'field': 'pnl_display',     'maxWidth': 180, 'cellClass': 'font-mono font-bold'},
-                    ],
-                    'rowData': [],
-                    'rowClassRules': {
-                        'text-green-400 font-semibold': 'data.raw_pnl > 0',
-                        'text-red-400 font-semibold':   'data.raw_pnl < 0',
-                    }
-                }).classes('h-44 text-white')
-
-            # ──────────────────────────────────────────────────────────────
-            # 7. Órdenes Abiertas (Open Orders) y Cancelación
-            # ──────────────────────────────────────────────────────────────
-            with ui.card().classes('bg-gray-900 p-5 rounded-2xl border border-gray-800 w-full shadow-xl'):
-                with ui.row().classes('w-full justify-between items-center mb-3 flex-wrap gap-2'):
-                    with ui.row().classes('items-center gap-2'):
-                        ui.icon('pending_actions', color='orange-400', size='22px')
-                        ui.label('Órdenes Abiertas en Binance').classes('text-lg font-bold text-white font-heading')
-                    
-                    with ui.row().classes('gap-2'):
-                        ui.button('Cancelar Todas las Órdenes BTCUSDT', icon='delete_sweep', on_click=self._cancel_all_orders).props('dense outline color=red-400').classes('text-xs text-red-400 hover:bg-red-500/20')
-
-                self.open_orders_grid = ui.aggrid({
-                    'defaultColDef': {'flex': 1, 'sortable': True, 'resizable': True},
-                    'columnDefs': [
-                        {'headerName': 'ID Orden',     'field': 'orderId',   'maxWidth': 160, 'cellClass': 'font-mono text-gray-300'},
-                        {'headerName': 'Símbolo',      'field': 'symbol',    'maxWidth': 130, 'cellClass': 'font-bold text-white'},
-                        {'headerName': 'Lado',         'field': 'side',      'maxWidth': 110},
-                        {'headerName': 'Tipo',         'field': 'type',      'maxWidth': 130},
-                        {'headerName': 'Cantidad',     'field': 'origQty',   'maxWidth': 130, 'cellClass': 'font-mono'},
-                        {'headerName': 'Precio',       'field': 'price',     'maxWidth': 130, 'cellClass': 'font-mono'},
-                        {'headerName': 'Stop Price',   'field': 'stopPrice', 'maxWidth': 130, 'cellClass': 'font-mono text-yellow-400'},
-                        {'headerName': 'Fecha/Hora',   'field': 'time_str',  'maxWidth': 140, 'cellClass': 'font-mono text-xs text-gray-400 text-center'},
-                    ],
-                    'rowData': []
-                }).classes('h-40 text-white')
-
-            # ──────────────────────────────────────────────────────────────
-            # 8. Centro de Conexión y Estado de APIs de Exchange (Testnet & Real)
+            # 5. Centro de Conexión y Estado de APIs de Exchange (Testnet & Real)
             # ──────────────────────────────────────────────────────────────
             with ui.card().classes('bg-gray-900/90 p-5 rounded-2xl border border-gray-800 w-full shadow-xl'):
                 with ui.row().classes('w-full justify-between items-center mb-4 flex-wrap gap-2'):
@@ -311,7 +450,7 @@ class BinanceAccountPage:
                         with ui.column().classes('gap-1 text-xs'):
                             self.label_testnet_key = ui.label('API Key: Cargando...').classes('font-mono text-gray-300')
                             self.label_testnet_secret = ui.label('Secret: Cargando...').classes('font-mono text-gray-400')
-                            ui.label('Endpoint: testnet.binancefuture.com').classes('text-[10px] text-gray-500 font-mono')
+                            ui.label('Endpoint: testnet.binancefuture.com (Futures)').classes('text-[10px] text-gray-500 font-mono')
                         
                         with ui.row().classes('w-full justify-between items-center pt-2 border-t border-gray-900'):
                             self.label_testnet_diag_res = ui.label('').classes('text-xs font-mono')
@@ -332,7 +471,7 @@ class BinanceAccountPage:
                         with ui.column().classes('gap-1 text-xs'):
                             self.label_real_key = ui.label('API Key: Cargando...').classes('font-mono text-gray-300')
                             self.label_real_secret = ui.label('Secret: Cargando...').classes('font-mono text-gray-400')
-                            ui.label('Endpoint: fapi.binance.com').classes('text-[10px] text-gray-500 font-mono')
+                            ui.label('Endpoints: fapi.binance.com (Futures) & api.binance.com (Spot)').classes('text-[10px] text-gray-500 font-mono')
                         
                         with ui.row().classes('w-full justify-between items-center pt-2 border-t border-gray-900'):
                             self.label_real_diag_res = ui.label('').classes('text-xs font-mono')
@@ -348,50 +487,92 @@ class BinanceAccountPage:
             ui.context.client.on_disconnect(lambda: self.live_timer.deactivate() if hasattr(self, 'live_timer') and self.live_timer else None)
 
     # ──────────────────────────────────────────────────────────────
-    # Métodos y Acciones
+    # Métodos y Acciones de Red y Cartera
     # ──────────────────────────────────────────────────────────────
+
+    def _switch_wallet(self, wallet: str):
+        """Alterna la vista entre Cartera de Futuros y Cartera Spot."""
+        self.selected_wallet = wallet
+        if wallet == "futures":
+            self.btn_wallet_futures.classes('bg-yellow-500 text-black font-black', remove='text-gray-400')
+            self.btn_wallet_spot.classes('text-gray-400 hover:text-white', remove='bg-blue-500 text-white font-black')
+            self.wallet_info_chip.set_text('🤖 ENTORNO DE OPERACIÓN DE LOS BOTS')
+            self.wallet_info_chip.props('color=yellow-500')
+            self.wallet_info_chip.classes('text-black', remove='text-white')
+            self.container_futures.set_visibility(True)
+            self.container_spot.set_visibility(False)
+            if hasattr(self, 'multi_assets_btn'):
+                self.multi_assets_btn.set_visibility(True)
+        else:
+            self.btn_wallet_spot.classes('bg-blue-500 text-white font-black', remove='text-gray-400')
+            self.btn_wallet_futures.classes('text-gray-400 hover:text-white', remove='bg-yellow-500 text-black font-black')
+            self.wallet_info_chip.set_text('🪙 CARTERA SPOT (HOLD / CUSTODIA)')
+            self.wallet_info_chip.props('color=blue-600')
+            self.wallet_info_chip.classes('text-white', remove='text-black')
+            self.container_futures.set_visibility(False)
+            self.container_spot.set_visibility(True)
+            if hasattr(self, 'multi_assets_btn'):
+                self.multi_assets_btn.set_visibility(False)
+
+        asyncio.create_task(self._refresh_account_data_async())
 
     def _switch_network(self, net: str):
         self.selected_network = net
         if net == "testnet":
             self.btn_testnet.classes('bg-yellow-500 text-black font-bold', remove='text-gray-400')
             self.btn_mainnet.classes('text-gray-400 hover:text-white', remove='bg-blue-600 text-white font-bold')
-            self.kpi_net_badge.set_text('Entorno: Binance Futures Testnet')
+            if hasattr(self, 'kpi_net_badge'):
+                self.kpi_net_badge.set_text('Entorno: Binance Futures Testnet')
+            if hasattr(self, 'kpi_spot_net_badge'):
+                self.kpi_spot_net_badge.set_text('Entorno: Binance Spot Testnet')
         else:
             self.btn_mainnet.classes('bg-blue-600 text-white font-bold', remove='text-gray-400')
             self.btn_testnet.classes('text-gray-400 hover:text-white', remove='bg-yellow-500 text-black font-bold')
-            self.kpi_net_badge.set_text('Entorno: Binance Real (Mainnet)')
+            if hasattr(self, 'kpi_net_badge'):
+                self.kpi_net_badge.set_text('Entorno: Binance Real (Mainnet)')
+            if hasattr(self, 'kpi_spot_net_badge'):
+                self.kpi_spot_net_badge.set_text('Entorno: Binance Real (Mainnet)')
         
         asyncio.create_task(self._refresh_account_data_async())
 
     async def _refresh_account_data_async(self):
-        """Descarga de forma asíncrona todos los datos de la cuenta y ejecuta el analizador de riesgo."""
+        """Descarga de forma asíncrona todos los datos de la cuenta según la cartera y red seleccionadas."""
         if self.is_loading:
             return
         self.is_loading = True
         self.btn_refresh.props('loading')
 
-        use_test = (self.selected_network == "testnet")
-        client = BinanceTestnetClient(use_testnet=use_test)
+        try:
+            use_test = (self.selected_network == "testnet")
+            client = BinanceTestnetClient(use_testnet=use_test)
+            loop = asyncio.get_event_loop()
 
-        loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, lambda: client.get_full_account_info(use_testnet=use_test))
+            # 1. Actualizar credenciales y estado del candado en pantalla
+            creds = get_binance_credentials()
+            self._update_credentials_ui(creds)
+            self._update_security_badge()
 
-        self.account_data = data
-        if data.get("success"):
-            # Ejecutar análisis cuantitativo de riesgo
-            self.risk_analysis = PortfolioRiskAnalyzer.analyze_portfolio(data)
-        else:
-            self.risk_analysis = {}
+            # 2. Según la cartera activa, consultar endpoint correspondiente
+            if self.selected_wallet == "futures":
+                data = await loop.run_in_executor(None, lambda: client.get_full_account_info(use_testnet=use_test))
+                self.account_data = data
+                if data.get("success"):
+                    self.risk_analysis = PortfolioRiskAnalyzer.analyze_portfolio(data)
+                else:
+                    self.risk_analysis = {}
+                self._update_futures_ui(data, self.risk_analysis)
+            else:
+                spot_data = await loop.run_in_executor(None, lambda: client.get_spot_account_info(use_testnet=use_test))
+                self.spot_data = spot_data
+                self._update_spot_ui(spot_data)
+        except Exception as e:
+            logger.error("Error refrescando datos de cuenta Binance: %s", e, exc_info=True)
+            ui.notify(f"Error actualizando datos de cuenta: {e}", type='negative')
+        finally:
+            self.btn_refresh.props(remove='loading')
+            self.is_loading = False
 
-        self._update_ui_with_account_data(data, self.risk_analysis)
-
-        self.btn_refresh.props(remove='loading')
-        self.is_loading = False
-
-    def _update_ui_with_account_data(self, data: Dict[str, Any], risk: Dict[str, Any]):
-        # Actualizar información de credenciales para ambas redes
-        creds = get_binance_credentials()
+    def _update_credentials_ui(self, creds: Dict[str, Any]):
         t_k = creds.get("testnet_api_key", "")
         t_s = creds.get("testnet_secret_key", "")
         r_k = creds.get("real_api_key", "")
@@ -417,6 +598,7 @@ class BinanceAccountPage:
                 self.badge_real_status.set_text('Sin configurar ⚠️')
                 self.badge_real_status.props('color=gray-800')
 
+    def _update_futures_ui(self, data: Dict[str, Any], risk: Dict[str, Any]):
         if not data.get("success"):
             err = data.get("error", "Error desconocido")
             self.kpi_api_status.set_text("API: Error 🔴")
@@ -436,7 +618,6 @@ class BinanceAccountPage:
                 self.multi_assets_btn.set_text("🔀 Multiactivos (BTC Colateral): INACTIVO ⚪")
                 self.multi_assets_btn.classes('bg-gray-900 text-gray-400 border-gray-700 font-normal', remove='bg-green-950 text-green-300 border-green-500/60')
 
-        # 1. KPIs Globales
         metrics = risk.get("metrics", {})
         var_metrics = risk.get("var_metrics", {})
         interpretation = risk.get("interpretation", {})
@@ -451,6 +632,7 @@ class BinanceAccountPage:
         highest_risk_sym = metrics.get("highest_risk_symbol")
 
         self.kpi_wallet_balance.set_text(f"${tot_usd:,.2f} USD")
+        self.kpi_futures_asset_count.set_text(f"{len(data.get('assets', []))} activos con saldo")
         self.kpi_avail_margin.set_text(f"{avail_bal:,.2f} USDT")
         self.kpi_margin_util.set_text(f"Uso Margen: {margin_util:.1f}%")
         
@@ -479,8 +661,21 @@ class BinanceAccountPage:
         var_95_usd = var_metrics.get("var_95_usd", 0.0)
         var_95_pct = var_metrics.get("var_95_pct", 0.0)
         self.kpi_var_95.set_text(f"${var_95_usd:,.2f} ({var_95_pct:.1f}%)")
+        var_method = var_metrics.get("method")
+        if var_method == "historical_simulation":
+            avg_corr = var_metrics.get("avg_pairwise_correlation")
+            corr_txt = f" | Correlación real prom.: {avg_corr:+.2f}" if avg_corr is not None else ""
+            self.kpi_var_95.tooltip(
+                f"Simulación Histórica sobre precios reales ({var_metrics.get('history_days_used', 0)} días){corr_txt}"
+            )
+        elif var_method == "parametric_perfect_correlation_assumption":
+            self.kpi_var_95.tooltip(
+                var_metrics.get("warning") or "VaR paramétrico: histórico local insuficiente, asume correlación perfecta entre activos."
+            )
+        else:
+            self.kpi_var_95.tooltip("")
 
-        # 2. Actualizar Diagnóstico e Interpretación Cuantitativa
+        # 2. Diagnóstico Cuantitativo
         if interpretation:
             score = interpretation.get("health_score", 100.0)
             badge_txt = interpretation.get("health_badge", "🟢 ÓPTIMO")
@@ -493,14 +688,13 @@ class BinanceAccountPage:
             cvar_pct = var_metrics.get("cvar_95_pct", 0.0)
             self.diag_var_label.set_text(f"VaR 95%: {var_95_pct:.1f}% | CVaR 95%: {cvar_pct:.1f}% | Riesgo {var_metrics.get('risk_category', 'BAJO')}")
 
-            # Recomendaciones
             self.diag_recommendations_container.clear()
             with self.diag_recommendations_container:
                 recs = interpretation.get("recommendations", [])
                 for r in recs:
                     ui.label(f"• {r}")
 
-        # 3. Actualizar Gráficos Plotly de Riesgo
+        # 3. Gráficos Plotly
         stress_res = risk.get("stress_test", [])
         if stress_res and hasattr(self, 'stress_chart'):
             self.stress_chart.update_figure(self._build_stress_chart_fig(stress_res, tot_usd))
@@ -508,7 +702,7 @@ class BinanceAccountPage:
         if hasattr(self, 'allocation_chart'):
             self.allocation_chart.update_figure(self._build_allocation_chart_fig(metrics))
 
-        # 4. Tabla de Activos
+        # 4. Tabla de Activos Futuros
         asset_rows = []
         for a in data.get("assets", []):
             usd_v = a.get("usd_value", a.get("wallet_balance", 0.0))
@@ -549,7 +743,7 @@ class BinanceAccountPage:
         self.positions_grid.options['rowData'] = pos_rows
         self.positions_grid.update()
 
-        # 6. Tabla de Órdenes Abiertas
+        # 6. Tabla de Órdenes Abiertas Futuros
         order_rows = []
         for o in data.get("open_orders", []):
             order_rows.append({
@@ -564,6 +758,90 @@ class BinanceAccountPage:
             })
         self.open_orders_grid.options['rowData'] = order_rows
         self.open_orders_grid.update()
+
+    def _update_spot_ui(self, spot_data: Dict[str, Any]):
+        """Actualiza la interfaz de la Cartera Spot."""
+        is_perm_err = spot_data.get("is_permission_error", False)
+        has_error = not spot_data.get("success", False)
+
+        if is_perm_err or has_error:
+            self.spot_warning_card.set_visibility(True)
+            err_msg = spot_data.get("error", "Error al consultar la cartera Spot.")
+            self.spot_warning_text.set_text(
+                f"{err_msg}\n\n"
+                "💡 Explicación: En Binance Testnet, las claves creadas en testnet.binancefuture.com son EXCLUSIVAS de Futuros. "
+                "Para operar o consultar Spot se utilizan las claves de Binance Real (o Spot Testnet). En Binance Real, asegúrate "
+                "de activar la opción 'Habilitar Lectura' (Enable Reading) y 'Spot & Margin Trading' en tu Administrador de API."
+            )
+            # Limpiar KPIs
+            self.kpi_spot_total_usd.set_text("$0.00 USD")
+            self.kpi_spot_free_usdt.set_text("0.00 USDT")
+            self.kpi_spot_locked_usd.set_text("$0.00 USD")
+            self.kpi_spot_assets_count.set_text("Acceso Restringido ⚠️")
+            self.kpi_spot_orders_count.set_text("0 órdenes")
+            self.spot_assets_grid.options['rowData'] = []
+            self.spot_assets_grid.update()
+            self.spot_orders_grid.options['rowData'] = []
+            self.spot_orders_grid.update()
+            self.spot_pie_chart.update_figure(self._build_empty_spot_pie())
+            return
+
+        self.spot_warning_card.set_visibility(False)
+
+        # 1. KPIs Spot
+        tot_usd = spot_data.get("total_usd_value", 0.0)
+        free_usd = spot_data.get("free_usd_value", 0.0)
+        locked_usd = spot_data.get("locked_usd_value", 0.0)
+        assets = spot_data.get("assets", [])
+        orders = spot_data.get("open_orders", [])
+
+        self.kpi_spot_total_usd.set_text(f"${tot_usd:,.2f} USD")
+        
+        # Buscar saldo USDT libre
+        usdt_free = 0.0
+        for a in assets:
+            if a.get("asset") == "USDT":
+                usdt_free = a.get("free", 0.0)
+                break
+        self.kpi_spot_free_usdt.set_text(f"{usdt_free:,.2f} USDT")
+        self.kpi_spot_locked_usd.set_text(f"${locked_usd:,.2f} USD")
+        self.kpi_spot_assets_count.set_text(f"{len(assets)} activos")
+        self.kpi_spot_orders_count.set_text(f"{len(orders)} órdenes abiertas")
+
+        # 2. Gráfico Plotly Donut Spot
+        self.spot_pie_chart.update_figure(self._build_spot_pie_fig(assets, tot_usd))
+
+        # 3. Tabla de Activos Spot
+        spot_rows = []
+        for a in assets:
+            u_p = a.get("unit_price_usd", 0.0)
+            u_p_str = f"${u_p:,.2f}" if u_p >= 1 else f"${u_p:.4f}"
+            spot_rows.append({
+                "asset": a["asset"],
+                "free_str": a.get("free_str", f"{a.get('free', 0):.4f}"),
+                "locked_str": a.get("locked_str", f"{a.get('locked', 0):.4f}"),
+                "total_str": a.get("total_str", f"{a.get('total', 0):.4f}"),
+                "unit_price_str": u_p_str,
+                "usd_value_str": a.get("usd_value_str", f"${a.get('usd_value', 0):,.2f}")
+            })
+        self.spot_assets_grid.options['rowData'] = spot_rows
+        self.spot_assets_grid.update()
+
+        # 4. Tabla de Órdenes Spot
+        spot_order_rows = []
+        for o in orders:
+            spot_order_rows.append({
+                "orderId": str(o.get("orderId")),
+                "symbol": o.get("symbol"),
+                "side": o.get("side"),
+                "type": o.get("type"),
+                "origQty": f"{o.get('origQty', 0):.4f}",
+                "price": f"{o.get('price', 0):,.2f}",
+                "stopPrice": f"{o.get('stopPrice', 0):,.2f}" if o.get('stopPrice') else "-",
+                "time_str": o.get("time_str", "-")
+            })
+        self.spot_orders_grid.options['rowData'] = spot_order_rows
+        self.spot_orders_grid.update()
 
     # ──────────────────────────────────────────────────────────────
     # Gráficos Plotly de Riesgo y Stress Testing
@@ -589,7 +867,54 @@ class BinanceAccountPage:
             paper_bgcolor='rgba(0,0,0,0)',
             plot_bgcolor='rgba(0,0,0,0)',
             margin=dict(l=20, r=20, t=20, b=20),
-            title=dict(text="Composición de Cartera", font=dict(color="#94a3b8", size=12))
+            title=dict(text="Composición de Cartera Futuros", font=dict(color="#94a3b8", size=12))
+        )
+        return fig
+
+    def _build_empty_spot_pie(self) -> go.Figure:
+        fig = go.Figure()
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            margin=dict(l=20, r=20, t=20, b=20),
+            title=dict(text="Composición de Activos Spot", font=dict(color="#94a3b8", size=12))
+        )
+        return fig
+
+    def _build_spot_pie_fig(self, assets: List[Dict[str, Any]], total_usd: float) -> go.Figure:
+        if not assets or total_usd <= 0:
+            return self._build_empty_spot_pie()
+
+        labels = [a["asset"] for a in assets[:6]]
+        values = [a["usd_value"] for a in assets[:6]]
+
+        # Si hay más de 6 activos, agrupar el resto en 'Otros'
+        if len(assets) > 6:
+            other_val = sum(a["usd_value"] for a in assets[6:])
+            if other_val > 0:
+                labels.append("Otros")
+                values.append(other_val)
+
+        fig = go.Figure(data=[go.Pie(
+            labels=labels,
+            values=values,
+            hole=.55,
+            marker=dict(colors=['#3b82f6', '#f59e0b', '#10b981', '#8b5cf6', '#ec4899', '#06b6d4', '#64748b']),
+            textinfo='label+percent',
+            insidetextorientation='radial',
+            hoverinfo='label+value+percent',
+            hovertemplate='%{label}: $%{value:,.2f} USD (%{percent})<extra></extra>'
+        )])
+
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            margin=dict(l=10, r=10, t=10, b=10),
+            font=dict(color='#cbd5e1', size=10),
+            showlegend=False,
+            annotations=[dict(text=f"Spot<br>${total_usd:,.0f}", x=0.5, y=0.5, font_size=12, showarrow=False, font_color='#ffffff')]
         )
         return fig
 
@@ -731,6 +1056,69 @@ class BinanceAccountPage:
             await self._refresh_account_data_async()
         else:
             ui.notify(f"⚠️ No se pudieron cancelar órdenes: {err}", type='warning')
+
+    def _update_security_badge(self):
+        """Actualiza la apariencia del badge según el estado del candado de Real Trading."""
+        if not hasattr(self, 'badge_security_lock') or not self.badge_security_lock:
+            return
+        is_real_enabled = is_real_trading_enabled()
+        if is_real_enabled:
+            self.badge_security_lock.set_text('⚠️ CANDADO ABIERTO: OPERATIVA REAL')
+            self.badge_security_lock.props('color=red-900')
+            self.badge_security_lock.classes('text-red-300 border border-red-500/60 animate-pulse font-extrabold', remove='text-emerald-300 border-emerald-500/40')
+        else:
+            self.badge_security_lock.set_text('🔒 MODO SOLO LECTURA (CANDADO ACTIVO)')
+            self.badge_security_lock.props('color=emerald-950')
+            self.badge_security_lock.classes('text-emerald-300 border border-emerald-500/40 font-bold', remove='text-red-300 border-red-500/60 animate-pulse font-extrabold')
+
+    async def _on_security_updated(self):
+        """Callback invocado al guardar credenciales o modificar guardarraíles."""
+        self._update_security_badge()
+        await self._refresh_account_data_async()
+
+    def _confirm_emergency_kill_switch(self):
+        """Muestra diálogo de confirmación para el Kill-Switch de Emergencia."""
+        with ui.dialog() as dlg, ui.card().classes('bg-gray-900 text-white p-6 border-2 border-red-600 rounded-2xl max-w-md w-full gap-4 shadow-2xl'):
+            with ui.row().classes('items-center gap-3'):
+                ui.icon('warning', size='32px', color='red-500')
+                ui.label('PARADA DE EMERGENCIA (KILL-SWITCH)').classes('text-lg font-black text-red-400 uppercase tracking-wide')
+            
+            ui.label(
+                '¿Confirmas la activación inmediata del Kill-Switch de Emergencia? Esta acción ejecutará de inmediato:'
+            ).classes('text-sm text-gray-300 leading-relaxed')
+
+            with ui.column().classes('gap-1.5 text-xs text-gray-300 bg-black/40 p-3 rounded-xl border border-gray-800'):
+                ui.label('1. 🔒 CERRAR el Candado de Trading Real bloqueando cualquier emisión de órdenes.').classes('text-emerald-400 font-bold')
+                ui.label('2. 🛑 CANCELAR todas las órdenes abiertas de Futuros en el exchange.').classes('text-amber-300 font-semibold')
+                ui.label('3. 🛡️ DETENER cualquier intento de ejecución algorítmica real.').classes('text-red-400 font-semibold')
+
+            with ui.row().classes('w-full justify-end gap-3 mt-4'):
+                ui.button('Cancelar', on_click=dlg.close).props('flat').classes('text-gray-400 hover:text-white font-bold text-xs')
+                ui.button(
+                    '🚨 SÍ, ACTIVAR KILL-SWITCH', 
+                    on_click=lambda: [dlg.close(), asyncio.create_task(self._execute_emergency_kill_switch())]
+                ).classes('bg-red-600 hover:bg-red-700 text-white font-black text-xs px-4 py-2 rounded-xl shadow-lg')
+        dlg.open()
+
+    async def _execute_emergency_kill_switch(self):
+        """Ejecuta el protocolo de parada de emergencia inmediata."""
+        ui.notify('🚨 Activando protocolo Kill-Switch de Emergencia...', type='warning', duration=5000)
+        sec = SecurityManager()
+        sec.set_real_trading_enabled(False)
+        self._update_security_badge()
+
+        loop = asyncio.get_event_loop()
+        use_test = (self.selected_network == "testnet")
+        client = BinanceTestnetClient(use_testnet=use_test)
+        ok, err = await loop.run_in_executor(None, lambda: client.cancel_all_futures_orders(symbol="BTCUSDT", use_testnet=use_test))
+        
+        ui.notify('🛡️ Candado de seguridad BLOQUEADO a MODO SOLO LECTURA.', type='positive', duration=8000)
+        if ok:
+            ui.notify('🛑 Órdenes abiertas de Futuros canceladas con éxito.', type='positive', duration=8000)
+        else:
+            ui.notify(f'ℹ️ Cancelación de órdenes: {err}', type='info', duration=6000)
+
+        await self._refresh_account_data_async()
 
 
 def render_binance_account_page():

@@ -10,22 +10,78 @@ logger = logging.getLogger("BinanceClient")
 
 import dotenv
 
+from execution_engine.security_manager import (
+    is_real_trading_enabled,
+    validate_order_guardrails,
+    load_security_config,
+    save_security_config,
+)
+
+
+def _sync_timestamp_offset(client: Client, use_futures: bool = True) -> None:
+    """
+    Corrige el desfase de reloj local frente al servidor de Binance (Error -1021).
+
+    Es muy común que el reloj del sistema (sobre todo en Windows) esté
+    desincronizado por unos pocos segundos respecto al NTP de Binance. Sin esta
+    corrección, TODAS las llamadas firmadas (cuenta, posiciones, precios,
+    órdenes) fallan con "Timestamp for this request was ahead/behind of the
+    server's time" y quedan silenciadas por los try/except del cliente,
+    dando la falsa impresión de que la app "no sincroniza" con Binance.
+    """
+    try:
+        server_time = (client.futures_time() if use_futures else client.get_server_time()).get("serverTime")
+        if server_time:
+            client.timestamp_offset = int(server_time) - int(time.time() * 1000)
+    except Exception as e:
+        logger.debug("No se pudo sincronizar el offset de tiempo con Binance: %s", e)
+
+
+def format_binance_error(e: Exception) -> str:
+    """
+    Traduce errores técnicos de la API de Binance (excepciones o texto crudo) a mensajes
+    claros y accionables para el usuario, cubriendo los casos que más confusión generan
+    (bloqueo geográfico, desfase de reloj, credenciales inválidas, timeouts de red).
+    """
+    status_code = getattr(e, "status_code", None)
+    raw = str(e)
+
+    if status_code == 451 or "restricted location" in raw or "b. Eligibility" in raw:
+        return (
+            "🌍 Binance bloqueó el acceso desde tu red (HTTP 451 - Ubicación restringida). "
+            "Es un bloqueo geográfico/regulatorio aplicado por Binance sobre tu IP actual, "
+            "no un error de la aplicación. Verifica si tu país/red tiene acceso a Binance "
+            "Futures/Testnet, o prueba desde otra conexión."
+        )
+    if "-2015" in raw:
+        return "🔑 Clave API inválida, restricción de IP o faltan permisos de Futuros (Error -2015)."
+    if "-1021" in raw:
+        return "⏱️ Desincronización de reloj del sistema con el servidor de Binance (Error -1021)."
+    if "-2014" in raw:
+        return "🔑 Formato de API-key inválido (Error -2014)."
+    if "Read timed out" in raw or "Connection" in raw:
+        return f"🔌 No se pudo conectar con Binance (timeout o red no disponible): {raw}"
+    return raw
+
+
 def get_binance_credentials() -> Dict[str, Any]:
-    """Obtiene las credenciales actuales cargadas en variables de entorno."""
+    """Obtiene las credenciales actuales cargadas en variables de entorno sin fallbacks cruzados inseguros."""
     is_testnet = os.getenv("BINANCE_TESTNET", "true").lower() == "true"
     
     testnet_k = os.getenv("BINANCE_TESTNET_API_KEY", "").strip()
     testnet_s = os.getenv("BINANCE_TESTNET_SECRET_KEY", "").strip()
-    if not testnet_k and is_testnet:
+    # Si no hay clave específica de testnet, verificar si BINANCE_API_KEY existe Y el entorno activo es testnet
+    if not testnet_k and is_testnet and not os.getenv("BINANCE_REAL_API_KEY"):
         testnet_k = os.getenv("BINANCE_API_KEY", "").strip()
-    if not testnet_s and is_testnet:
+    if not testnet_s and is_testnet and not os.getenv("BINANCE_REAL_SECRET_KEY"):
         testnet_s = os.getenv("BINANCE_SECRET_KEY", "").strip()
 
     real_k = os.getenv("BINANCE_REAL_API_KEY", "").strip()
     real_s = os.getenv("BINANCE_REAL_SECRET_KEY", "").strip()
-    if not real_k and not is_testnet:
+    # Para real, NUNCA usar BINANCE_API_KEY si BINANCE_TESTNET_API_KEY está configurada (evita mezclar credenciales)
+    if not real_k and not is_testnet and not os.getenv("BINANCE_TESTNET_API_KEY"):
         real_k = os.getenv("BINANCE_API_KEY", "").strip()
-    if not real_s and not is_testnet:
+    if not real_s and not is_testnet and not os.getenv("BINANCE_TESTNET_SECRET_KEY"):
         real_s = os.getenv("BINANCE_SECRET_KEY", "").strip()
 
     return {
@@ -35,7 +91,8 @@ def get_binance_credentials() -> Dict[str, Any]:
         "real_secret_key": real_s,
         "default_network": "testnet" if is_testnet else "mainnet",
         "has_testnet": bool(testnet_k and testnet_s),
-        "has_real": bool(real_k and real_s)
+        "has_real": bool(real_k and real_s),
+        "real_trading_enabled": is_real_trading_enabled()
     }
 
 def save_binance_credentials(
@@ -126,11 +183,12 @@ def verify_binance_credentials(
         }
 
     try:
-        client = Client(key, sec, testnet=use_testnet, requests_params={'timeout': 8})
+        client = Client(key, sec, testnet=use_testnet, ping=False, requests_params={'timeout': 8})
         if use_testnet:
             client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
         else:
             client.FUTURES_URL = 'https://fapi.binance.com/fapi/v1'
+        _sync_timestamp_offset(client, use_futures=True)
 
         # 1. Ping
         client.futures_ping()
@@ -153,18 +211,11 @@ def verify_binance_credentials(
         }
     except Exception as e:
         latency = int((time.time() - t0) * 1000)
-        err_msg = str(e)
-        if "-2015" in err_msg:
-            err_msg = "Clave API inválida, restricción de IP o faltan permisos de Futuros (Error -2015)."
-        elif "-1021" in err_msg:
-            err_msg = "Desincronización de reloj del sistema con el servidor de Binance (Error -1021)."
-        elif "-2014" in err_msg:
-            err_msg = "Formato de API-key inválido (Error -2014)."
         return {
             "success": False,
             "network": network_label,
             "latency_ms": latency,
-            "error": err_msg
+            "error": format_binance_error(e)
         }
 
 class BinanceTestnetClient:
@@ -176,26 +227,43 @@ class BinanceTestnetClient:
             self.api_key = api_key.strip()
             self.api_secret = api_secret.strip()
         elif use_testnet:
-            self.api_key = os.getenv("BINANCE_TESTNET_API_KEY", "").strip() or os.getenv("BINANCE_API_KEY", "").strip()
-            self.api_secret = os.getenv("BINANCE_TESTNET_SECRET_KEY", "").strip() or os.getenv("BINANCE_SECRET_KEY", "").strip()
+            self.api_key = os.getenv("BINANCE_TESTNET_API_KEY", "").strip()
+            self.api_secret = os.getenv("BINANCE_TESTNET_SECRET_KEY", "").strip()
+            if not self.api_key and not os.getenv("BINANCE_REAL_API_KEY"):
+                self.api_key = os.getenv("BINANCE_API_KEY", "").strip()
+            if not self.api_secret and not os.getenv("BINANCE_REAL_SECRET_KEY"):
+                self.api_secret = os.getenv("BINANCE_SECRET_KEY", "").strip()
         else:
-            self.api_key = os.getenv("BINANCE_REAL_API_KEY", "").strip() or os.getenv("BINANCE_API_KEY", "").strip()
-            self.api_secret = os.getenv("BINANCE_REAL_SECRET_KEY", "").strip() or os.getenv("BINANCE_SECRET_KEY", "").strip()
+            self.api_key = os.getenv("BINANCE_REAL_API_KEY", "").strip()
+            self.api_secret = os.getenv("BINANCE_REAL_SECRET_KEY", "").strip()
+            if not self.api_key and not os.getenv("BINANCE_TESTNET_API_KEY"):
+                self.api_key = os.getenv("BINANCE_API_KEY", "").strip()
+            if not self.api_secret and not os.getenv("BINANCE_TESTNET_SECRET_KEY"):
+                self.api_secret = os.getenv("BINANCE_SECRET_KEY", "").strip()
 
-        # Inicialización de cliente Binance con timeout
-        self.client = Client(
-            self.api_key,
-            self.api_secret,
-            testnet=use_testnet,
-            requests_params={'timeout': 10}
-        )
-        if use_testnet:
-            self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
-        else:
-            self.client.FUTURES_URL = 'https://fapi.binance.com/fapi/v1'
+        # Inicialización segura de cliente Binance sin ping síncrono bloqueante
+        self.client = None
+        try:
+            self.client = Client(
+                self.api_key,
+                self.api_secret,
+                testnet=use_testnet,
+                ping=False,
+                requests_params={'timeout': 10}
+            )
+            if use_testnet:
+                self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
+            else:
+                self.client.FUTURES_URL = 'https://fapi.binance.com/fapi/v1'
+            _sync_timestamp_offset(self.client, use_futures=True)
+        except Exception as e:
+            logger.warning("No se pudo inicializar Binance Client (restricción geográfica o red): %s", e)
+            self.client = None
 
     def get_historical_klines(self, symbol: str, interval: str, lookback_str: str):
         """Obtiene velas históricas para inicializar indicadores."""
+        if not self.client:
+            return []
         binance_symbol = symbol.replace("/", "").upper()
         return self.client.get_historical_klines(binance_symbol, interval, lookback_str)
 
@@ -216,6 +284,9 @@ class BinanceTestnetClient:
         """
         if expected_statuses is None:
             expected_statuses = ["FILLED"]
+
+        if not self.client:
+            return False, None, "Cliente de Binance no disponible (restricción geográfica o credenciales ausentes)"
 
         binance_symbol = symbol.replace("/", "").upper()
         last_order = None
@@ -252,6 +323,77 @@ class BinanceTestnetClient:
         logger.warning(err)
         return False, last_order, err
 
+    def get_symbol_precisions(self, symbol: str) -> Tuple[int, int, float]:
+        """
+        Obtiene la precisión de cantidad, precio y cantidad mínima para un par en Binance Futures.
+        Consulta futures_exchange_info() con caché en memoria o utiliza estándares del exchange.
+        """
+        binance_symbol = symbol.replace("/", "").upper()
+        if not hasattr(self, '_symbol_precision_cache'):
+            self._symbol_precision_cache = {}
+
+        if binance_symbol in self._symbol_precision_cache:
+            return self._symbol_precision_cache[binance_symbol]
+
+        # Intentar obtener de exchange_info de Binance
+        qty_prec = 3
+        price_prec = 2
+        min_qty = 0.001
+
+        if self.client:
+            try:
+                info = self.client.futures_exchange_info()
+                for s in info.get("symbols", []):
+                    sym_name = s.get("symbol")
+                    if sym_name:
+                        q_p = int(s.get("quantityPrecision", 3))
+                        p_p = int(s.get("pricePrecision", 2))
+                        m_q = 0.001
+                        for f in s.get("filters", []):
+                            if f.get("filterType") == "LOT_SIZE":
+                                step_size = f.get("stepSize", "0.001")
+                                if "." in step_size:
+                                    q_p = len(step_size.rstrip("0").split(".")[1])
+                                m_q = float(f.get("minQty", 0.001))
+                            elif f.get("filterType") == "PRICE_FILTER":
+                                tick_size = f.get("tickSize", "0.01")
+                                if "." in tick_size:
+                                    p_p = len(tick_size.rstrip("0").split(".")[1])
+                        self._symbol_precision_cache[sym_name] = (q_p, p_p, m_q)
+                if binance_symbol in self._symbol_precision_cache:
+                    return self._symbol_precision_cache[binance_symbol]
+            except Exception as ex:
+                logger.warning("No se pudo obtener exchange_info de Binance para precisión: %s", ex)
+
+        # Fallbacks seguros por par común
+        if "BTC" in binance_symbol:
+            qty_prec, price_prec, min_qty = 3, 2, 0.001
+        elif "ETH" in binance_symbol:
+            qty_prec, price_prec, min_qty = 3, 2, 0.001
+        elif any(k in binance_symbol for k in ["SOL", "BNB"]):
+            qty_prec, price_prec, min_qty = 2, 2, 0.01
+        elif any(k in binance_symbol for k in ["DOGE", "XRP", "ADA"]):
+            qty_prec, price_prec, min_qty = 0, 4, 1.0
+        else:
+            qty_prec, price_prec, min_qty = 3, 2, 0.001
+
+        self._symbol_precision_cache[binance_symbol] = (qty_prec, price_prec, min_qty)
+        return (qty_prec, price_prec, min_qty)
+
+    def format_quantity(self, symbol: str, quantity: float) -> float:
+        """Ajusta y redondea la cantidad a la precisión y stepSize exactos del exchange."""
+        qty_prec, _, min_qty = self.get_symbol_precisions(symbol)
+        if qty_prec == 0:
+            formatted = float(int(quantity))
+        else:
+            formatted = round(float(quantity), qty_prec)
+        return max(formatted, min_qty)
+
+    def format_price(self, symbol: str, price: float) -> float:
+        """Ajusta y redondea el precio a la precisión del exchange."""
+        _, price_prec, _ = self.get_symbol_precisions(symbol)
+        return round(float(price), price_prec)
+
     def place_futures_order(
         self,
         symbol: str,
@@ -262,22 +404,43 @@ class BinanceTestnetClient:
         verify_execution: bool = True
     ) -> Tuple[Optional[dict], Optional[str]]:
         """
-        Envía una orden (MARKET o LIMIT) a Binance Futures Testnet y verifica su ejecución en el exchange.
+        Envía una orden (MARKET o LIMIT) a Binance Futures y verifica su ejecución en el exchange.
+        Aplica obligatoriamente el Candado de Seguridad (Dual-Lock) y los Guardarraíles Cuantitativos.
         """
-        if not self.use_testnet:
-            return None, "Testnet desactivado en este bot"
-        if not self.api_key or not self.api_secret:
-            return None, "API Key o Secret no configuradas en .env"
-
         binance_symbol = symbol.replace("/", "").upper()
         binance_side = "BUY" if side.lower() == "long" else "SELL"
+
+        # ── CANDADO DE SEGURIDAD OPERATIVA (Primera línea de defensa) ──
+        if not self.use_testnet and not is_real_trading_enabled():
+            return None, (
+                "⛔ BLOQUEO DE SEGURIDAD OPERATIVA: La cuenta Real está en MODO SOLO LECTURA. "
+                "El candado de trading con dinero real está cerrado."
+            )
+
+        if not self.api_key or not self.api_secret:
+            return None, "API Key o Secret no configuradas en .env"
 
         if quantity <= 0:
             return None, "Cantidad inválida (debe ser mayor a 0)"
 
-        qty = round(quantity, 5)
-        if qty <= 0:
-            qty = quantity
+        # ── GUARDARRAÍLES CUANTITATIVOS ──
+        ref_price = price if (price and price > 0) else self.get_latest_price(binance_symbol)
+        allowed, guardrail_err = validate_order_guardrails(
+            symbol=binance_symbol,
+            quantity=quantity,
+            price=ref_price,
+            leverage=1,
+            use_testnet=self.use_testnet
+        )
+        if not allowed:
+            logger.warning("ORDEN INTERCEPTADA POR SEGURIDAD [%s]: %s", binance_symbol, guardrail_err)
+            return None, guardrail_err
+
+        # Ajuste de precisión dinámico según especificación del par en Binance
+        qty = self.format_quantity(binance_symbol, quantity)
+
+        if not self.client:
+            return None, "Cliente de Binance no disponible (restricción geográfica o red)"
 
         o_type = order_type.upper()
         try:
@@ -290,7 +453,7 @@ class BinanceTestnetClient:
             if o_type == "LIMIT":
                 if price is None or price <= 0:
                     return None, "Precio límite requerido para órdenes LIMIT"
-                params["price"] = round(price, 2)
+                params["price"] = self.format_price(binance_symbol, price)
                 params["timeInForce"] = "GTC"
 
             order = self.client.futures_create_order(**params)
@@ -299,12 +462,9 @@ class BinanceTestnetClient:
             logger.info("Orden %s (%s) creada en Binance Futures. ID: %s, Estado inicial: %s", o_type, binance_side, order_id, initial_status)
 
             if verify_execution and order_id:
-                # Para órdenes MARKET, esperamos 'FILLED' inmediatamente o en los siguientes milisegundos
-                # Para órdenes LIMIT, 'NEW' o 'PARTIALLY_FILLED' o 'FILLED' son válidos
                 expected = ["FILLED"] if o_type == "MARKET" else ["NEW", "PARTIALLY_FILLED", "FILLED"]
                 
                 if initial_status not in expected:
-                    # Consultar activamente para confirmar si cambió a FILLED
                     ok, verified_order, v_err = self.verify_order_status(
                         symbol=binance_symbol, order_id=order_id, expected_statuses=expected, max_attempts=4, delay_seconds=0.5
                     )
@@ -317,7 +477,7 @@ class BinanceTestnetClient:
             return order, None
         except Exception as e:
             logger.error("Error enviando orden %s a Binance Futures: %s", o_type, e)
-            return None, str(e)
+            return None, format_binance_error(e)
 
     def close_futures_position(
         self,
@@ -330,21 +490,20 @@ class BinanceTestnetClient:
     ) -> Tuple[Optional[dict], Optional[str]]:
         """
         Cierra una posición en Binance Futures con orden contraria y verifica su ejecución en el exchange.
+        Aplica el Candado de Seguridad de cuenta real.
         """
-        if not self.use_testnet:
-            return None, "Testnet desactivado en este bot"
+        binance_symbol = symbol.replace("/", "").upper()
+        # ── CANDADO DE SEGURIDAD OPERATIVA (Primera línea de defensa) ──
+        if not self.use_testnet and not is_real_trading_enabled():
+            return None, "⛔ BLOQUEO DE SEGURIDAD OPERATIVA: La cuenta Real está en MODO SOLO LECTURA."
+
         if not self.api_key or not self.api_secret:
             return None, "API Key o Secret no configuradas en .env"
-
-        binance_symbol = symbol.replace("/", "").upper()
-        close_side = "SELL" if side.lower() == "long" else "BUY"
 
         if quantity <= 0:
             return None, "Cantidad inválida (debe ser mayor a 0)"
 
-        qty = round(quantity, 5)
-        if qty <= 0:
-            qty = quantity
+        qty = self.format_quantity(binance_symbol, quantity)
 
         o_type = order_type.upper()
         try:
@@ -357,10 +516,13 @@ class BinanceTestnetClient:
             }
             if o_type == "LIMIT":
                 if price is not None and price > 0:
-                    params["price"] = round(price, 2)
+                    params["price"] = self.format_price(binance_symbol, price)
                     params["timeInForce"] = "GTC"
                 else:
                     params["type"] = "MARKET"
+
+            if not self.client:
+                return None, "Cliente de Binance no disponible"
 
             order = self.client.futures_create_order(**params)
             order_id = order.get("orderId")
@@ -382,7 +544,7 @@ class BinanceTestnetClient:
             return order, None
         except Exception as e:
             logger.error("Error cerrando posición en Binance Futures: %s", e)
-            return None, str(e)
+            return None, format_binance_error(e)
 
     def place_futures_sl_tp(
         self,
@@ -394,15 +556,16 @@ class BinanceTestnetClient:
         sl_order_type: str = "LIMIT",
         tp_order_type: str = "LIMIT"
     ) -> Dict[str, Any]:
-        """Coloca órdenes condicionales de Stop Loss y Take Profit (LIMIT o MARKET) en Binance Futures."""
-        if not self.use_testnet or not self.api_key or not self.api_secret:
-            return {"sl_order": None, "tp_order": None, "error": "Testnet no configurado"}
+        """Coloca órdenes condicionales de Stop Loss y Take Profit en Binance Futures protegidas por el Candado de Seguridad."""
+        if not self.api_key or not self.api_secret:
+            return {"sl_order": None, "tp_order": None, "error": "Credenciales no configuradas"}
+
+        if not self.use_testnet and not is_real_trading_enabled():
+            return {"sl_order": None, "tp_order": None, "error": "⛔ BLOQUEO: Cuenta Real en MODO SOLO LECTURA."}
 
         binance_symbol = symbol.replace("/", "").upper()
         close_side = "SELL" if side.lower() == "long" else "BUY"
-        qty = round(quantity, 3)
-        if qty < 0.001:
-            qty = 0.001
+        qty = self.format_quantity(binance_symbol, quantity)
 
         results = {"sl_order": None, "tp_order": None, "errors": []}
 
@@ -414,12 +577,12 @@ class BinanceTestnetClient:
                     "symbol": binance_symbol,
                     "side": close_side,
                     "type": tp_type,
-                    "stopPrice": round(tp_price, 2),
+                    "stopPrice": self.format_price(binance_symbol, tp_price),
                     "quantity": qty,
                     "reduceOnly": True
                 }
                 if tp_type == "TAKE_PROFIT":
-                    tp_params["price"] = round(tp_price, 2)
+                    tp_params["price"] = self.format_price(binance_symbol, tp_price)
                     tp_params["timeInForce"] = "GTC"
 
                 tp_res = self.client.futures_create_order(**tp_params)
@@ -437,13 +600,12 @@ class BinanceTestnetClient:
                     "symbol": binance_symbol,
                     "side": close_side,
                     "type": sl_type,
-                    "stopPrice": round(sl_price, 2),
+                    "stopPrice": self.format_price(binance_symbol, sl_price),
                     "quantity": qty,
                     "reduceOnly": True
                 }
                 if sl_type == "STOP":
-                    # Para STOP Limit, el precio de ejecución puede ser ligeramente más conservador o el mismo stopPrice
-                    sl_params["price"] = round(sl_price, 2)
+                    sl_params["price"] = self.format_price(binance_symbol, sl_price)
                     sl_params["timeInForce"] = "GTC"
 
                 sl_res = self.client.futures_create_order(**sl_params)
@@ -457,7 +619,7 @@ class BinanceTestnetClient:
 
     def get_open_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """Devuelve todas las posiciones actualmente abiertas con positionAmt != 0 en Binance Futures."""
-        if not self.api_key or not self.api_secret:
+        if not self.client or not self.api_key or not self.api_secret:
             return []
         try:
             params = {}
@@ -558,6 +720,8 @@ class BinanceTestnetClient:
     def get_symbol_price(self, symbol: str = "BTCUSDT") -> float:
         """Obtiene el último precio de mercado de un símbolo en Binance Futures."""
         try:
+            if not self.client:
+                return 0.0
             binance_symbol = symbol.replace("/", "").upper()
             ticker = self.client.futures_symbol_ticker(symbol=binance_symbol)
             return float(ticker.get('price', 0.0))
@@ -595,8 +759,9 @@ class BinanceTestnetClient:
 
         try:
             # 1. Testnet Futures Client
-            test_client = Client(self.api_key, self.api_secret, testnet=True, requests_params={'timeout': 10})
+            test_client = Client(self.api_key, self.api_secret, testnet=True, ping=False, requests_params={'timeout': 10})
             test_client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
+            _sync_timestamp_offset(test_client, use_futures=True)
 
             # 2. Ping & Account query
             acc = test_client.futures_account()
@@ -669,7 +834,7 @@ class BinanceTestnetClient:
 
         try:
             # Cliente público / privado para Mainnet
-            main_client = Client(self.api_key, self.api_secret, testnet=False, requests_params={'timeout': 8})
+            main_client = Client(self.api_key, self.api_secret, testnet=False, ping=False, requests_params={'timeout': 8})
 
             # 1. Ping
             main_client.ping()
@@ -684,6 +849,7 @@ class BinanceTestnetClient:
             server_time = main_client.get_server_time().get('serverTime', 0)
             local_time_ms = int(time.time() * 1000)
             results["server_time_offset_ms"] = server_time - local_time_ms
+            main_client.timestamp_offset = server_time - local_time_ms
 
             # 4. Probar acceso a cuenta si las claves están presentes
             if results["api_keys_configured"]:
@@ -747,11 +913,12 @@ class BinanceTestnetClient:
             return data
 
         try:
-            client = Client(api_k, api_s, testnet=use_testnet, requests_params={'timeout': 10})
+            client = Client(api_k, api_s, testnet=use_testnet, ping=False, requests_params={'timeout': 10})
             if use_testnet:
                 client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
             else:
                 client.FUTURES_URL = 'https://fapi.binance.com/fapi/v1'
+            _sync_timestamp_offset(client, use_futures=True)
 
             # 1. Información de la cuenta de Futuros
             acc = client.futures_account()
@@ -914,9 +1081,10 @@ class BinanceTestnetClient:
     def cancel_futures_order(self, symbol: str, order_id: int, use_testnet: bool = True) -> Tuple[bool, Optional[str]]:
         """Cancela una orden abierta en Binance Futures."""
         try:
-            client = Client(self.api_key, self.api_secret, testnet=use_testnet, requests_params={'timeout': 10})
+            client = Client(self.api_key, self.api_secret, testnet=use_testnet, ping=False, requests_params={'timeout': 10})
             if use_testnet:
                 client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
+            _sync_timestamp_offset(client, use_futures=True)
             binance_symbol = symbol.replace("/", "").upper()
             res = client.futures_cancel_order(symbol=binance_symbol, orderId=order_id)
             return True, None
@@ -926,14 +1094,180 @@ class BinanceTestnetClient:
     def cancel_all_futures_orders(self, symbol: str = "BTCUSDT", use_testnet: bool = True) -> Tuple[bool, Optional[str]]:
         """Cancela todas las órdenes abiertas en Binance Futures para un símbolo."""
         try:
-            client = Client(self.api_key, self.api_secret, testnet=use_testnet, requests_params={'timeout': 10})
+            client = Client(self.api_key, self.api_secret, testnet=use_testnet, ping=False, requests_params={'timeout': 10})
             if use_testnet:
                 client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
+            _sync_timestamp_offset(client, use_futures=True)
             binance_symbol = symbol.replace("/", "").upper()
             res = client.futures_cancel_all_open_orders(symbol=binance_symbol)
             return True, None
         except Exception as e:
             return False, str(e)
 
+    # ──────────────────────────────────────────────────────────────
+    # Consulta de Información de Cartera SPOT (Contado)
+    # ──────────────────────────────────────────────────────────────
+
+    def get_spot_account_info(self, use_testnet: bool = False) -> Dict[str, Any]:
+        """
+        Obtiene la información detallada de la cartera SPOT (Contado) de Binance:
+        - Balances de activos (free, locked, total)
+        - Precios en tiempo real y valoración estimada en USD
+        - Órdenes abiertas de Spot
+        """
+        if use_testnet:
+            api_k = os.getenv("BINANCE_TESTNET_API_KEY", "").strip() or os.getenv("BINANCE_API_KEY", "").strip()
+            api_s = os.getenv("BINANCE_TESTNET_SECRET_KEY", "").strip() or os.getenv("BINANCE_SECRET_KEY", "").strip()
+        else:
+            api_k = os.getenv("BINANCE_REAL_API_KEY", "").strip() or os.getenv("BINANCE_API_KEY", "").strip()
+            api_s = os.getenv("BINANCE_REAL_SECRET_KEY", "").strip() or os.getenv("BINANCE_SECRET_KEY", "").strip()
+
+        data: Dict[str, Any] = {
+            "network": "Binance Spot Testnet" if use_testnet else "Binance Spot Real (Mainnet)",
+            "use_testnet": use_testnet,
+            "wallet_type": "SPOT",
+            "api_keys_configured": bool(api_k and api_s),
+            "total_usd_value": 0.0,
+            "free_usd_value": 0.0,
+            "locked_usd_value": 0.0,
+            "assets": [],
+            "open_orders": [],
+            "success": False,
+            "is_permission_error": False,
+            "error": None
+        }
+
+        if not data["api_keys_configured"]:
+            env_name = "BINANCE_TESTNET_API_KEY" if use_testnet else "BINANCE_REAL_API_KEY"
+            data["error"] = f"No se han configurado {env_name} o BINANCE_API_KEY en el archivo .env"
+            return data
+
+        try:
+            client = Client(api_k, api_s, testnet=use_testnet, ping=False, requests_params={'timeout': 10})
+            _sync_timestamp_offset(client, use_futures=False)
+
+            # 1. Obtener datos de la cuenta Spot
+            account = client.get_account()
+
+            # 2. Obtener tickers de precios Spot para calcular valor USD
+            price_map: Dict[str, float] = {}
+            try:
+                tickers = client.get_all_tickers()
+                for t in tickers:
+                    sym = t.get('symbol', '')
+                    p = float(t.get('price', 0.0))
+                    if sym and p > 0:
+                        price_map[sym] = p
+            except Exception as pe:
+                logger.debug("No se pudieron cargar todos los tickers Spot: %s", pe)
+
+            # 3. Filtrar activos con saldo
+            total_usd = 0.0
+            free_usd = 0.0
+            locked_usd = 0.0
+            stables = {'USDT', 'USD', 'USDC', 'BUSD', 'FDUSD', 'DAI'}
+
+            for b in account.get('balances', []):
+                free_qty = float(b.get('free', 0.0))
+                locked_qty = float(b.get('locked', 0.0))
+                total_qty = free_qty + locked_qty
+
+                if total_qty > 1e-8:
+                    asset = b.get('asset', '')
+                    unit_price = 0.0
+
+                    if asset in stables:
+                        unit_price = 1.0
+                    elif f"{asset}USDT" in price_map:
+                        unit_price = price_map[f"{asset}USDT"]
+                    elif f"{asset}USDC" in price_map:
+                        unit_price = price_map[f"{asset}USDC"]
+                    elif f"{asset}BTC" in price_map and "BTCUSDT" in price_map:
+                        unit_price = price_map[f"{asset}BTC"] * price_map["BTCUSDT"]
+
+                    val_usd = total_qty * unit_price
+                    f_val = free_qty * unit_price
+                    l_val = locked_qty * unit_price
+
+                    total_usd += val_usd
+                    free_usd += f_val
+                    locked_usd += l_val
+
+                    data["assets"].append({
+                        "asset": asset,
+                        "free": free_qty,
+                        "locked": locked_qty,
+                        "total": total_qty,
+                        "unit_price_usd": unit_price,
+                        "usd_value": val_usd,
+                        "free_str": f"{free_qty:,.6f}".rstrip('0').rstrip('.') if free_qty < 1 else f"{free_qty:,.4f}",
+                        "locked_str": f"{locked_qty:,.6f}".rstrip('0').rstrip('.') if locked_qty < 1 else f"{locked_qty:,.4f}",
+                        "total_str": f"{total_qty:,.6f}".rstrip('0').rstrip('.') if total_qty < 1 else f"{total_qty:,.4f}",
+                        "usd_value_str": f"${val_usd:,.2f}"
+                    })
+
+            # Ordenar activos por valor USD descendente
+            data["assets"].sort(key=lambda x: x["usd_value"], reverse=True)
+            data["total_usd_value"] = total_usd
+            data["free_usd_value"] = free_usd
+            data["locked_usd_value"] = locked_usd
+
+            # 4. Órdenes abiertas en Spot
+            try:
+                open_orders = client.get_open_orders()
+                for o in open_orders:
+                    ts = o.get('time')
+                    ts_str = "-"
+                    if ts:
+                        try:
+                            from datetime import datetime
+                            ts_str = datetime.fromtimestamp(ts / 1000.0).strftime("%d/%m %H:%M:%S")
+                        except Exception:
+                            ts_str = str(ts)
+
+                    data["open_orders"].append({
+                        "orderId": str(o.get('orderId')),
+                        "symbol": o.get('symbol'),
+                        "side": o.get('side'),
+                        "type": o.get('type'),
+                        "origQty": float(o.get('origQty', 0.0)),
+                        "price": float(o.get('price', 0.0)),
+                        "stopPrice": float(o.get('stopPrice', 0.0)),
+                        "time": ts,
+                        "time_str": ts_str
+                    })
+            except Exception as oe:
+                logger.debug("Error al consultar órdenes abiertas Spot: %s", oe)
+
+            data["success"] = True
+            return data
+
+        except Exception as e:
+            err_msg = str(e)
+            logger.error("Error al obtener información de Spot en Binance: %s", err_msg)
+            if "-2015" in err_msg:
+                data["is_permission_error"] = True
+                if use_testnet:
+                    data["error"] = "Tus credenciales pertenecen a Binance Futures Testnet (fapi). Las claves de Futures Testnet no tienen acceso a Spot Testnet (testnet.binance.vision). Para ver Spot se requieren claves con permisos de Spot habilitados."
+                else:
+                    data["error"] = "La clave API de Binance Real no tiene habilitados permisos de lectura de Spot ('Enable Reading' / 'Spot & Margin Trading')."
+            elif "-1021" in err_msg:
+                data["error"] = "Desincronización de reloj del sistema con el servidor de Binance (Error -1021)."
+            else:
+                data["error"] = err_msg
+            return data
+
+    def cancel_spot_order(self, symbol: str, order_id: int, use_testnet: bool = False) -> Tuple[bool, Optional[str]]:
+        """Cancela una orden abierta en Binance Spot."""
+        try:
+            client = Client(self.api_key, self.api_secret, testnet=use_testnet, ping=False, requests_params={'timeout': 10})
+            _sync_timestamp_offset(client, use_futures=False)
+            binance_symbol = symbol.replace("/", "").upper()
+            client.cancel_order(symbol=binance_symbol, orderId=order_id)
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
     def stop(self):
         pass
+
