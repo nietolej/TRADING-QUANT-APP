@@ -151,23 +151,27 @@ def render_onchain_analyzer():
             
             # Consultar Datos On-Chain
             db = SessionLocal()
-            
-            mapped_metric = metric_suffix.lower()
-            if mapped_metric == 'total_supply' and symbol == 'BTC':
-                mapped_metric = 'btc_market_cap'
-                
-            query = db.query(OnChainMetric).filter(
-                OnChainMetric.metric_name.in_([metric_name, metric_suffix, mapped_metric]),
-                OnChainMetric.symbol == symbol,
-                OnChainMetric.timestamp >= start_date.replace(tzinfo=None)
-            ).order_by(OnChainMetric.timestamp.asc())
-            
-            df_onchain = pd.read_sql(query.statement, db.bind)
-            
+            try:
+                mapped_metric = metric_suffix.lower()
+                if mapped_metric == 'total_supply' and symbol == 'BTC':
+                    mapped_metric = 'btc_market_cap'
+
+                query = db.query(OnChainMetric).filter(
+                    OnChainMetric.metric_name.in_([metric_name, metric_suffix, mapped_metric]),
+                    OnChainMetric.symbol == symbol,
+                    OnChainMetric.timestamp >= start_date.replace(tzinfo=None)
+                ).order_by(OnChainMetric.timestamp.asc())
+
+                df_onchain = pd.read_sql(query.statement, db.bind)
+            finally:
+                # La conexion ya no se necesita mas alla de este punto (df_onchain ya esta
+                # materializado en memoria), se cierra aqui para no dejarla abierta si algo
+                # falla mas adelante en el renderizado del grafico/tabla.
+                db.close()
+
             if df_onchain.empty:
                 with chart_container:
                     ui.label('No hay datos on-chain para graficar. Ejecuta "Sincronizar APIs".').classes('text-red-400')
-                db.close()
                 return
                 
             df_onchain['timestamp'] = pd.to_datetime(df_onchain['timestamp']).dt.tz_localize('UTC')
@@ -310,8 +314,6 @@ def render_onchain_analyzer():
                     rows=df_table.to_dict('records'), 
                     row_key='id'
                 ).classes('w-full')
-                
-            db.close()
 
         fetch_btn.on_click(on_fetch_click)
         plot_btn.on_click(on_plot_click)

@@ -1,5 +1,6 @@
 import os
 import time
+import math
 import logging
 from typing import Dict, Any, Optional, List, Tuple
 from dotenv import load_dotenv
@@ -35,6 +36,17 @@ def _sync_timestamp_offset(client: Client, use_futures: bool = True) -> None:
             client.timestamp_offset = int(server_time) - int(time.time() * 1000)
     except Exception as e:
         logger.debug("No se pudo sincronizar el offset de tiempo con Binance: %s", e)
+
+
+def _fmt_ts(ms) -> str:
+    """Formatea un timestamp en milisegundos de Binance como DD/MM HH:mm:ss."""
+    if not ms:
+        return "-"
+    try:
+        from datetime import datetime
+        return datetime.fromtimestamp(int(ms) / 1000.0).strftime("%d/%m %H:%M:%S")
+    except Exception:
+        return str(ms)
 
 
 def format_binance_error(e: Exception) -> str:
@@ -323,9 +335,10 @@ class BinanceTestnetClient:
         logger.warning(err)
         return False, last_order, err
 
-    def get_symbol_precisions(self, symbol: str) -> Tuple[int, int, float]:
+    def get_symbol_precisions(self, symbol: str) -> Tuple[int, int, float, float]:
         """
-        Obtiene la precisión de cantidad, precio y cantidad mínima para un par en Binance Futures.
+        Obtiene la precisión de cantidad, precio, cantidad mínima y el STEP SIZE real (tamaño
+        del incremento válido, no solo la cantidad de decimales) para un par en Binance Futures.
         Consulta futures_exchange_info() con caché en memoria o utiliza estándares del exchange.
         """
         binance_symbol = symbol.replace("/", "").upper()
@@ -339,6 +352,7 @@ class BinanceTestnetClient:
         qty_prec = 3
         price_prec = 2
         min_qty = 0.001
+        step_size_val = 0.001
 
         if self.client:
             try:
@@ -349,17 +363,21 @@ class BinanceTestnetClient:
                         q_p = int(s.get("quantityPrecision", 3))
                         p_p = int(s.get("pricePrecision", 2))
                         m_q = 0.001
+                        s_size = 10 ** (-q_p)
                         for f in s.get("filters", []):
                             if f.get("filterType") == "LOT_SIZE":
                                 step_size = f.get("stepSize", "0.001")
+                                s_size = float(step_size)
                                 if "." in step_size:
                                     q_p = len(step_size.rstrip("0").split(".")[1])
+                                else:
+                                    q_p = 0
                                 m_q = float(f.get("minQty", 0.001))
                             elif f.get("filterType") == "PRICE_FILTER":
                                 tick_size = f.get("tickSize", "0.01")
                                 if "." in tick_size:
                                     p_p = len(tick_size.rstrip("0").split(".")[1])
-                        self._symbol_precision_cache[sym_name] = (q_p, p_p, m_q)
+                        self._symbol_precision_cache[sym_name] = (q_p, p_p, m_q, s_size)
                 if binance_symbol in self._symbol_precision_cache:
                     return self._symbol_precision_cache[binance_symbol]
             except Exception as ex:
@@ -376,22 +394,30 @@ class BinanceTestnetClient:
             qty_prec, price_prec, min_qty = 0, 4, 1.0
         else:
             qty_prec, price_prec, min_qty = 3, 2, 0.001
+        step_size_val = min_qty if min_qty > 0 else 10 ** (-qty_prec)
 
-        self._symbol_precision_cache[binance_symbol] = (qty_prec, price_prec, min_qty)
-        return (qty_prec, price_prec, min_qty)
+        self._symbol_precision_cache[binance_symbol] = (qty_prec, price_prec, min_qty, step_size_val)
+        return (qty_prec, price_prec, min_qty, step_size_val)
 
     def format_quantity(self, symbol: str, quantity: float) -> float:
-        """Ajusta y redondea la cantidad a la precisión y stepSize exactos del exchange."""
-        qty_prec, _, min_qty = self.get_symbol_precisions(symbol)
-        if qty_prec == 0:
+        """Ajusta la cantidad al STEP SIZE real del exchange (no solo redondea decimales):
+        Binance rechaza (error LOT_SIZE) cualquier cantidad que no sea un múltiplo exacto del
+        step size. Se redondea siempre HACIA ABAJO al múltiplo válido más cercano para no
+        exceder el balance/margen disponible."""
+        qty_prec, _, min_qty, step_size = self.get_symbol_precisions(symbol)
+        quantity = float(quantity)
+        if step_size and step_size > 0:
+            steps = math.floor((quantity + 1e-9) / step_size)
+            formatted = round(steps * step_size, max(qty_prec, 0))
+        elif qty_prec == 0:
             formatted = float(int(quantity))
         else:
-            formatted = round(float(quantity), qty_prec)
+            formatted = round(quantity, qty_prec)
         return max(formatted, min_qty)
 
     def format_price(self, symbol: str, price: float) -> float:
         """Ajusta y redondea el precio a la precisión del exchange."""
-        _, price_prec, _ = self.get_symbol_precisions(symbol)
+        _, price_prec, _, _ = self.get_symbol_precisions(symbol)
         return round(float(price), price_prec)
 
     def place_futures_order(
@@ -424,13 +450,19 @@ class BinanceTestnetClient:
             return None, "Cantidad inválida (debe ser mayor a 0)"
 
         # ── GUARDARRAÍLES CUANTITATIVOS ──
-        ref_price = price if (price and price > 0) else self.get_latest_price(binance_symbol)
+        # Se consulta el apalancamiento REAL configurado en Binance para este simbolo (no se
+        # asume 1x): un leverage=1 fijo hacia el guardarrail de "apalancamiento maximo" lo
+        # dejaba inerte para siempre, sin importar el limite que el usuario configurara.
+        ref_price = price if (price and price > 0) else self.get_symbol_price(binance_symbol)
+        real_leverage = self.get_symbol_leverage(binance_symbol)
+        avail_balance = self.get_available_balance("USDT")
         allowed, guardrail_err = validate_order_guardrails(
             symbol=binance_symbol,
             quantity=quantity,
             price=ref_price,
-            leverage=1,
-            use_testnet=self.use_testnet
+            leverage=real_leverage,
+            use_testnet=self.use_testnet,
+            available_balance_usd=avail_balance if avail_balance > 0 else None
         )
         if not allowed:
             logger.warning("ORDEN INTERCEPTADA POR SEGURIDAD [%s]: %s", binance_symbol, guardrail_err)
@@ -504,6 +536,7 @@ class BinanceTestnetClient:
             return None, "Cantidad inválida (debe ser mayor a 0)"
 
         qty = self.format_quantity(binance_symbol, quantity)
+        close_side = "SELL" if side.lower() == "long" else "BUY"
 
         o_type = order_type.upper()
         try:
@@ -617,6 +650,37 @@ class BinanceTestnetClient:
 
         return results
 
+    def get_available_balance(self, asset: str = "USDT") -> float:
+        """Consulta el margen disponible REAL de la cuenta de Futuros para un activo (endpoint
+        ligero, sin traer posiciones/ordenes). Usado por los guardarraíles para verificar que
+        una orden no exceda el capital realmente disponible en Binance."""
+        if not self.client or not self.api_key or not self.api_secret:
+            return 0.0
+        try:
+            balances = self.client.futures_account_balance()
+            for b in balances:
+                if b.get("asset", "").upper() == asset.upper():
+                    return float(b.get("availableBalance", 0.0))
+        except Exception as e:
+            logger.debug("Error consultando balance disponible de %s: %s", asset, e)
+        return 0.0
+
+    def get_symbol_leverage(self, symbol: str) -> int:
+        """Consulta el apalancamiento REAL configurado en Binance para un simbolo, sin importar
+        si hay o no posicion abierta (el leverage es una configuracion de cuenta por simbolo).
+        Usado por los guardarraíles de seguridad para no asumir 1x cuando la cuenta real puede
+        tener un apalancamiento mucho mayor configurado."""
+        if not self.client or not self.api_key or not self.api_secret:
+            return 1
+        try:
+            binance_symbol = symbol.replace("/", "").upper()
+            info = self.client.futures_position_information(symbol=binance_symbol)
+            if info:
+                return int(float(info[0].get("leverage", 1)))
+        except Exception as e:
+            logger.debug("Error consultando apalancamiento real de %s: %s", symbol, e)
+        return 1
+
     def get_open_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """Devuelve todas las posiciones actualmente abiertas con positionAmt != 0 en Binance Futures."""
         if not self.client or not self.api_key or not self.api_secret:
@@ -696,6 +760,55 @@ class BinanceTestnetClient:
             self.use_testnet = use_testnet
             self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1' if use_testnet else 'https://fapi.binance.com/fapi/v1'
         return self.cancel_all_open_orders(symbol)
+
+    def cancel_all_futures_orders_every_symbol(self, use_testnet: Optional[bool] = None) -> Tuple[bool, Optional[str]]:
+        """Cancela todas las órdenes abiertas (estándar y condicionales) en TODOS los símbolos con actividad
+        en Binance Futures. La API de Binance no ofrece cancelación masiva multi-símbolo en una sola llamada,
+        así que se detectan los símbolos con órdenes u posiciones abiertas y se cancela cada uno por separado."""
+        if use_testnet is not None:
+            self.use_testnet = use_testnet
+            self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1' if use_testnet else 'https://fapi.binance.com/fapi/v1'
+
+        if not self.client or not self.api_key or not self.api_secret:
+            return False, "API Key o Secret no configuradas en .env"
+
+        symbols = set()
+        try:
+            for o in (self.client.futures_get_open_orders() or []):
+                sym = o.get("symbol")
+                if sym:
+                    symbols.add(sym)
+        except Exception as e:
+            logger.warning("Error listando órdenes abiertas de todos los símbolos: %s", e)
+
+        try:
+            for a in (self.client.futures_get_open_algo_orders() or []):
+                sym = a.get("symbol")
+                if sym:
+                    symbols.add(sym)
+        except Exception as e:
+            logger.debug("Error listando órdenes algo abiertas de todos los símbolos: %s", e)
+
+        try:
+            for p in self.get_open_positions():
+                sym = p.get("symbol")
+                if sym:
+                    symbols.add(sym)
+        except Exception as e:
+            logger.debug("Error listando posiciones abiertas de todos los símbolos: %s", e)
+
+        if not symbols:
+            return True, None
+
+        errors = []
+        for sym in symbols:
+            ok, err = self.cancel_all_open_orders(sym)
+            if not ok:
+                errors.append(f"{sym}: {err}")
+
+        if errors:
+            return False, "; ".join(errors)
+        return True, None
 
     def get_multi_assets_margin(self) -> bool:
         """Consulta si el Modo Multiactivos (Multi-Assets Margin) está habilitado en Binance Futures."""
@@ -1091,19 +1204,6 @@ class BinanceTestnetClient:
         except Exception as e:
             return False, str(e)
 
-    def cancel_all_futures_orders(self, symbol: str = "BTCUSDT", use_testnet: bool = True) -> Tuple[bool, Optional[str]]:
-        """Cancela todas las órdenes abiertas en Binance Futures para un símbolo."""
-        try:
-            client = Client(self.api_key, self.api_secret, testnet=use_testnet, ping=False, requests_params={'timeout': 10})
-            if use_testnet:
-                client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
-            _sync_timestamp_offset(client, use_futures=True)
-            binance_symbol = symbol.replace("/", "").upper()
-            res = client.futures_cancel_all_open_orders(symbol=binance_symbol)
-            return True, None
-        except Exception as e:
-            return False, str(e)
-
     # ──────────────────────────────────────────────────────────────
     # Consulta de Información de Cartera SPOT (Contado)
     # ──────────────────────────────────────────────────────────────
@@ -1267,6 +1367,211 @@ class BinanceTestnetClient:
             return True, None
         except Exception as e:
             return False, str(e)
+
+    # ──────────────────────────────────────────────────────────────
+    # Historial completo de Operativa (Order/Trade/Transaction History)
+    # Replica las mismas pestañas que la interfaz real de Binance.
+    # ──────────────────────────────────────────────────────────────
+
+    def get_futures_order_history(self, symbol: str = "BTCUSDT", limit: int = 200) -> List[Dict[str, Any]]:
+        """Historial completo de órdenes (llenadas, canceladas, expiradas) de Futures para un símbolo.
+        La API de Binance Futures (GET /fapi/v1/allOrders) exige un símbolo, igual que en la propia
+        web de Binance cuando se filtra por par."""
+        if not self.client:
+            return []
+        binance_symbol = symbol.replace("/", "").upper()
+        try:
+            orders = self.client.futures_get_all_orders(symbol=binance_symbol, limit=limit)
+            result = []
+            for o in reversed(orders):
+                result.append({
+                    "time_str": _fmt_ts(o.get("time")),
+                    "time": o.get("time"),
+                    "symbol": o.get("symbol"),
+                    "type": o.get("type"),
+                    "side": o.get("side"),
+                    "price": float(o.get("price", 0.0)),
+                    "avgPrice": float(o.get("avgPrice", 0.0)),
+                    "origQty": float(o.get("origQty", 0.0)),
+                    "executedQty": float(o.get("executedQty", 0.0)),
+                    "status": o.get("status"),
+                    "reduceOnly": bool(o.get("reduceOnly", False)),
+                    "orderId": o.get("orderId"),
+                })
+            return result
+        except Exception as e:
+            logger.warning("Error obteniendo historial de órdenes Futures %s: %s", binance_symbol, e)
+            return []
+
+    def get_futures_trade_history(self, symbol: str = "BTCUSDT", limit: int = 500) -> List[Dict[str, Any]]:
+        """Historial de ejecuciones/fills (GET /fapi/v1/userTrades) de Futures para un símbolo."""
+        if not self.client:
+            return []
+        binance_symbol = symbol.replace("/", "").upper()
+        try:
+            trades = self.client.futures_account_trades(symbol=binance_symbol, limit=limit)
+            result = []
+            for t in reversed(trades):
+                result.append({
+                    "time_str": _fmt_ts(t.get("time")),
+                    "time": t.get("time"),
+                    "symbol": t.get("symbol"),
+                    "side": t.get("side"),
+                    "price": float(t.get("price", 0.0)),
+                    "qty": float(t.get("qty", 0.0)),
+                    "quoteQty": float(t.get("quoteQty", 0.0)),
+                    "commission": float(t.get("commission", 0.0)),
+                    "commissionAsset": t.get("commissionAsset"),
+                    "realizedPnl": float(t.get("realizedPnl", 0.0)),
+                    "orderId": t.get("orderId"),
+                })
+            return result
+        except Exception as e:
+            logger.warning("Error obteniendo historial de trades Futures %s: %s", binance_symbol, e)
+            return []
+
+    def get_futures_transaction_history(self, income_type: Optional[str] = None, limit: int = 500) -> List[Dict[str, Any]]:
+        """Historial de movimientos de la cuenta de Futures (funding, comisiones, PnL realizado,
+        transferencias) vía GET /fapi/v1/income. A diferencia de Order/Trade History, este endpoint
+        SÍ cubre todos los símbolos a la vez (no requiere filtrar por par)."""
+        if not self.client:
+            return []
+        try:
+            kwargs = {"limit": limit}
+            if income_type:
+                kwargs["incomeType"] = income_type
+            income = self.client.futures_income_history(**kwargs)
+            result = []
+            for i in reversed(income):
+                result.append({
+                    "time_str": _fmt_ts(i.get("time")),
+                    "time": i.get("time"),
+                    "symbol": i.get("symbol") or "-",
+                    "type": i.get("incomeType"),
+                    "income": float(i.get("income", 0.0)),
+                    "asset": i.get("asset"),
+                    "info": i.get("info", ""),
+                })
+            return result
+        except Exception as e:
+            logger.warning("Error obteniendo historial de transacciones Futures: %s", e)
+            return []
+
+    def get_spot_order_history(self, symbol: str = "BTCUSDT", limit: int = 200) -> List[Dict[str, Any]]:
+        """Historial completo de órdenes Spot (GET /api/v3/allOrders) para un símbolo."""
+        if not self.client:
+            return []
+        binance_symbol = symbol.replace("/", "").upper()
+        try:
+            orders = self.client.get_all_orders(symbol=binance_symbol, limit=limit)
+            result = []
+            for o in reversed(orders):
+                result.append({
+                    "time_str": _fmt_ts(o.get("time")),
+                    "time": o.get("time"),
+                    "symbol": o.get("symbol"),
+                    "type": o.get("type"),
+                    "side": o.get("side"),
+                    "price": float(o.get("price", 0.0)),
+                    "origQty": float(o.get("origQty", 0.0)),
+                    "executedQty": float(o.get("executedQty", 0.0)),
+                    "cummulativeQuoteQty": float(o.get("cummulativeQuoteQty", 0.0)),
+                    "status": o.get("status"),
+                    "orderId": o.get("orderId"),
+                })
+            return result
+        except Exception as e:
+            logger.warning("Error obteniendo historial de órdenes Spot %s: %s", binance_symbol, e)
+            return []
+
+    def get_spot_trade_history(self, symbol: str = "BTCUSDT", limit: int = 500) -> List[Dict[str, Any]]:
+        """Historial de ejecuciones/fills Spot (GET /api/v3/myTrades) para un símbolo."""
+        if not self.client:
+            return []
+        binance_symbol = symbol.replace("/", "").upper()
+        try:
+            trades = self.client.get_my_trades(symbol=binance_symbol, limit=limit)
+            result = []
+            for t in reversed(trades):
+                result.append({
+                    "time_str": _fmt_ts(t.get("time")),
+                    "time": t.get("time"),
+                    "symbol": t.get("symbol"),
+                    "side": "BUY" if t.get("isBuyer") else "SELL",
+                    "price": float(t.get("price", 0.0)),
+                    "qty": float(t.get("qty", 0.0)),
+                    "quoteQty": float(t.get("quoteQty", 0.0)),
+                    "commission": float(t.get("commission", 0.0)),
+                    "commissionAsset": t.get("commissionAsset"),
+                    "orderId": t.get("orderId"),
+                })
+            return result
+        except Exception as e:
+            logger.warning("Error obteniendo historial de trades Spot %s: %s", binance_symbol, e)
+            return []
+
+    def get_spot_transaction_history(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Historial combinado de depósitos y retiros de la cuenta (GET /sapi/v1/capital/deposit/hisrec
+        y /sapi/v1/capital/withdraw/history)."""
+        if not self.client:
+            return []
+        result = []
+        try:
+            for d in self.client.get_deposit_history():
+                result.append({
+                    "time_str": _fmt_ts(d.get("insertTime")),
+                    "time": d.get("insertTime"),
+                    "type": "DEPOSIT",
+                    "asset": d.get("coin"),
+                    "amount": float(d.get("amount", 0.0)),
+                    "status": d.get("status"),
+                    "txId": d.get("txId", ""),
+                })
+        except Exception as e:
+            logger.debug("Error obteniendo historial de depósitos: %s", e)
+        try:
+            for w in self.client.get_withdraw_history():
+                result.append({
+                    "time_str": _fmt_ts(w.get("applyTime")),
+                    "time": w.get("applyTime"),
+                    "type": "WITHDRAW",
+                    "asset": w.get("coin"),
+                    "amount": float(w.get("amount", 0.0)),
+                    "status": w.get("status"),
+                    "txId": w.get("txId", ""),
+                })
+        except Exception as e:
+            logger.debug("Error obteniendo historial de retiros: %s", e)
+        result.sort(key=lambda r: r.get("time") or 0, reverse=True)
+        return result[:limit]
+
+    def get_p2p_trade_history(self, trade_type: str = "BUY", rows: int = 100) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Historial de operaciones P2P/C2C (GET /sapi/v1/c2c/orderMatch/listUserOrderHistory).
+        EXCLUSIVO de cuentas Reales: Binance Testnet no ofrece mercado P2P en absoluto."""
+        if self.use_testnet:
+            return [], "P2P no está disponible en Binance Testnet, solo en cuentas Reales."
+        if not self.client:
+            return [], "Cliente de Binance no disponible"
+        try:
+            res = self.client.get_c2c_trade_history(tradeType=trade_type, rows=rows)
+            data = res.get("data", []) if isinstance(res, dict) else []
+            result = []
+            for o in data:
+                result.append({
+                    "orderNumber": o.get("orderNumber"),
+                    "type": o.get("orderStatus"),
+                    "trade_type": o.get("tradeType"),
+                    "asset": o.get("asset"),
+                    "amount": float(o.get("amount", 0.0)),
+                    "totalPrice": float(o.get("totalPrice", 0.0)),
+                    "unitPrice": float(o.get("unitPrice", 0.0)),
+                    "fiat": o.get("fiat"),
+                    "counterPartNickName": o.get("counterPartNickName", "-"),
+                    "createTime": _fmt_ts(o.get("createTime")),
+                })
+            return result, None
+        except Exception as e:
+            return [], format_binance_error(e)
 
     def stop(self):
         pass

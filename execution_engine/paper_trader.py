@@ -150,7 +150,11 @@ class PaperTrader:
         self._notify("⏳ Descargando histórico para calentar indicadores...")
         try:
             binance_symbol = self.symbol.replace("/", "").upper()
-            raw_klines = self._client.client.get_klines(
+            # futures_klines (no get_klines, que es Spot): si el historico de calentamiento viene
+            # de Spot y el polling en vivo (mas abajo) ya usa Futures, se produce una discontinuidad
+            # de precio entre el historico y las velas en vivo dentro del mismo klines_df, pudiendo
+            # generar cruces de indicadores (EMA, etc.) falsos justo al arrancar el bot.
+            raw_klines = self._client.client.futures_klines(
                 symbol=binance_symbol, interval=self.timeframe, limit=300
             )
         except Exception as e:
@@ -207,16 +211,20 @@ class PaperTrader:
         while self.is_running:
             loop_counter += 1
             try:
-                # 1. Obtener bid/ask actual (Orderbook ticker)
-                ticker = self._client.client.get_orderbook_ticker(symbol=binance_symbol)
+                # 1. Obtener bid/ask actual (Orderbook ticker) — DEBE ser el endpoint de FUTURES
+                # (get_orderbook_ticker es Spot; usarlo aqui devolvia el precio de Spot, no el de
+                # Futures donde realmente opera el bot, desincronizando el ticker mostrado en vivo
+                # y el precio de senal usado para evaluar entry/exit conditions).
+                ticker = self._client.client.futures_orderbook_ticker(symbol=binance_symbol)
                 with self._lock:
                     self.current_bid = float(ticker['bidPrice'])
                     self.current_ask = float(ticker['askPrice'])
                     self.current_bid_qty = float(ticker['bidQty'])
                     self.current_ask_qty = float(ticker['askQty'])
-                
-                # 2. Limit=2 para obtener la vela actual (en curso)
-                raw_klines = self._client.client.get_klines(
+
+                # 2. Limit=2 para obtener la vela actual (en curso) — igualmente debe ser Futures,
+                # no Spot (get_klines), para que coincida con el mercado donde se ejecutan las ordenes.
+                raw_klines = self._client.client.futures_klines(
                     symbol=binance_symbol, interval=self.timeframe, limit=2
                 )
                 if raw_klines:
@@ -261,10 +269,49 @@ class PaperTrader:
                                         "margin_type": p_info.get('marginType', 'cross'),
                                     }
                                     self._had_open_binance_pos = True
+
                                     if self.position:
-                                        if entry_p > 0:
-                                            self.position.entry_price = entry_p
-                                        self.position.quantity = abs(pos_amt)
+                                        # Sanity check: la cantidad/precio de una posicion ya abierta no deberia
+                                        # saltar de forma abrupta salvo por un fill parcial adicional legitimo.
+                                        # Sin este chequeo, un glitch puntual de Testnet en CUALQUIER poll (no solo
+                                        # al abrir) corrompe silenciosamente la posicion durante el resto del trade
+                                        # (mismo patron del bug ya corregido en _open_position con executedQty).
+                                        qty_ratio = abs(pos_amt) / self.position.quantity if self.position.quantity > 0 else 1.0
+                                        price_ratio = (entry_p / self.position.entry_price) if (entry_p > 0 and self.position.entry_price > 0) else 1.0
+                                        if 0.5 <= qty_ratio <= 2.0 and 0.5 <= price_ratio <= 2.0:
+                                            if entry_p > 0:
+                                                self.position.entry_price = entry_p
+                                            self.position.quantity = abs(pos_amt)
+                                        else:
+                                            self._trigger_critical_order_alert(
+                                                "Discrepancia de posición ignorada al sincronizar con Binance (posible glitch del exchange)",
+                                                {
+                                                    "Cantidad interna": f"{self.position.quantity:.6f}",
+                                                    "Cantidad reportada por Binance": f"{abs(pos_amt):.6f}",
+                                                    "Precio entrada interno": f"{self.position.entry_price:.4f}",
+                                                    "Precio entrada reportado": f"{entry_p:.4f}",
+                                                }
+                                            )
+                                    else:
+                                        # Binance tiene una posición abierta que el bot no conoce (crash tras
+                                        # ejecutar la orden y antes de guardar estado, orden manual en Binance,
+                                        # etc.). Sin adoptarla, el bot seguiria evaluando entry_conditions y
+                                        # podria abrir una SEGUNDA posición mientras ya hay una expuesta y sin
+                                        # que el SL/TP interno la vigile.
+                                        adopted_side = "long" if pos_amt > 0 else "short"
+                                        self.position = Position(adopted_side, entry_p if entry_p > 0 else mark_p, abs(pos_amt), datetime.now())
+                                        try:
+                                            idx = len(self.klines_df) - 1
+                                            sl_p, tp_p = self.strategy.risk_manager.compute_sl_tp(self.klines_df, idx, adopted_side)
+                                            self.position.sl_price = sl_p
+                                            self.position.tp_price = tp_p
+                                        except Exception:
+                                            pass
+                                        self._notify(
+                                            f"⚠️ Posición huérfana detectada en Binance ({adopted_side.upper()} "
+                                            f"{abs(pos_amt):.6f} @ {entry_p:.4f}) y adoptada por el bot para evitar duplicar exposición."
+                                        )
+                                        self._save_state()
 
                                 # Si se cerró en Binance (ej. TP/SL, liquidación o cierre manual en la web de Binance)
                                 elif pos_amt == 0:
@@ -370,6 +417,39 @@ class PaperTrader:
         self._notify(
             f"🛑 Bot '{self.name}' detenido. Balance final: {self.current_balance:,.2f} {self.currency}"
         )
+
+    def reset(self, new_initial_balance: Optional[float] = None):
+        """Reinicia el bot a un estado limpio: detiene ejecución, borra historial de trades,
+        estadísticas y posición, y restaura el balance. Usado por el endpoint /reset del
+        daemon (bot_daemon.py) — antes no existía este método y esa llamada lanzaba
+        AttributeError sin controlar, dejando el bot sin resetear."""
+        if self.is_running:
+            self.stop()
+
+        if new_initial_balance is not None:
+            self.initial_balance = new_initial_balance
+        self.current_balance = self.initial_balance
+
+        self.position = None
+        self.binance_position_info = None
+        self._had_open_binance_pos = False
+        self.trade_history = []
+        self.unexecuted_orders = []
+        self.log_lines = []
+        self.stats = {
+            "win_rate": 0.0,
+            "total_pnl": 0.0,
+            "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+        }
+        self.session_id = datetime.now().strftime("%Y%m%d%H%M%S")
+        self.started_at = None
+        self.status = "STOPPED"
+        self.status_message = "Detenido (reseteado)"
+
+        self._save_state()
+        self._notify(f"🔄 Bot '{self.name}' reseteado. Balance: {self.current_balance:,.2f} {self.currency}")
 
     def _save_state(self):
         """Notifica al gestor para persistir el estado del bot en disco."""
@@ -717,6 +797,8 @@ class PaperTrader:
         else:
             quantity = risk_mgr.compute_position_size(self.current_balance, price)
 
+        entry_type = self.order_types.get("entry", "MARKET").upper()
+
         if quantity <= 0:
             err_msg = f"Saldo insuficiente ({self.current_balance:.4f} {self.currency}) para abrir posición"
             self.record_unexecuted_order(
@@ -739,7 +821,6 @@ class PaperTrader:
             sl_price = price * (0.98 if side == "long" else 1.02)
             tp_price = price * (1.04 if side == "long" else 0.96)
 
-        entry_type = self.order_types.get("entry", "MARKET").upper()
         sl_type = self.order_types.get("stop_loss", "LIMIT").upper()
         tp_type = self.order_types.get("take_profit", "LIMIT").upper()
 
@@ -826,14 +907,42 @@ class PaperTrader:
                 )
                 return
 
-            # Sincronizar precio real de ejecución (avgPrice) si Binance lo reporta
+            # Sincronizar precio real de ejecución (avgPrice) si Binance lo reporta, validando
+            # que sea razonable respecto al precio de la señal (protege contra un avgPrice
+            # corrupto/glitch que inflaria o desinflaria el PNL de toda la operación).
             real_fill_price = float(ext_order.get('avgPrice', 0.0) or 0.0)
             if real_fill_price > 0:
-                price = real_fill_price
+                price_deviation = abs(real_fill_price - price) / price if price > 0 else 0.0
+                if price_deviation <= 0.15:
+                    price = real_fill_price
+                else:
+                    self._trigger_critical_order_alert(
+                        "Discrepancia de precio de ejecución ignorada (posible glitch del exchange)",
+                        {
+                            "Precio de señal": f"{price:.4f}",
+                            "avgPrice reportado por Binance": f"{real_fill_price:.4f}",
+                            "Accion": "Se mantiene el precio de señal para no corromper el PNL calculado"
+                        }
+                    )
 
+            # Sincronizar cantidad ejecutada real, pero SOLO si es coherente con lo solicitado.
+            # Un MARKET order nunca puede ejecutar mas cantidad de la pedida: una respuesta con
+            # executedQty muy superior (glitch de Testnet, orden residual, o bug de precision)
+            # NO debe sobrescribir la cantidad interna, o el PNL/balance quedan corrompidos con
+            # una posicion cientos de veces mas grande de la que realmente se pretendia abrir.
             real_qty = float(ext_order.get('executedQty', 0.0) or 0.0)
             if real_qty > 0:
-                quantity = real_qty
+                if real_qty <= quantity * 1.02:
+                    quantity = real_qty
+                else:
+                    self._trigger_critical_order_alert(
+                        "Discrepancia de cantidad ejecutada ignorada (posible glitch del exchange)",
+                        {
+                            "Cantidad solicitada": f"{quantity:.6f}",
+                            "executedQty reportado por Binance": f"{real_qty:.6f}",
+                            "Accion": "Se mantiene la cantidad solicitada para no corromper el balance interno"
+                        }
+                    )
 
             self._notify(
                 f"⚡ ORDEN ENTRADA ({entry_type}) EJECUTADA en Binance | "
@@ -879,24 +988,56 @@ class PaperTrader:
         # Cierre en Binance Futures si está configurado
         if self.use_testnet:
             if self._client:
-                # 1. CANCELAR TODAS LAS ÓRDENES CONDICIONALES PENDIENTES PRIMERO (SL / TP)
-                self._client.cancel_all_open_orders(self.symbol)
-
-                # 2. Si el cierre no se originó directamente en el exchange, enviar orden de salida a Binance
+                # Si el cierre no se originó directamente en el exchange, enviar orden de salida a Binance.
+                # IMPORTANTE: ya NO se cancelan las órdenes SL/TP condicionales ANTES de intentar el
+                # cierre (como se hacía antes): si el intento de cierre fallaba por una razón genuina
+                # (red, rate limit, etc.) la posición quedaba desprotegida en el exchange sin que el
+                # bot lo supiera. Ahora solo se cancelan una vez confirmado que la posición ya no existe.
                 if reason != "BINANCE_EXCHANGE_CLOSED":
                     close_order, err = self._client.close_futures_position(
                         self.symbol, pos.side, pos.quantity, order_type=exit_type, price=price, verify_execution=True
                     )
+
+                    # Un rechazo "ReduceOnly Order is rejected" (-2022) significa que Binance ya NO
+                    # tiene posición que reducir: casi siempre porque el SL/TP ya la cerró en el
+                    # exchange momentos antes de que este intento de EXIT_SIGNAL llegara (carrera
+                    # entre la sincronización de posición del polling loop y la evaluación de la
+                    # estrategia). En ese caso Binance esta diciendo la verdad: no hay nada que cerrar,
+                    # así que es correcto proceder a cerrar internamente (con el mejor precio
+                    # disponible) para no dejar al bot "creyendo" para siempre que tiene una posición
+                    # que ya no existe. Cualquier OTRO error (red, margen, etc.) SI debe abortar sin
+                    # tocar el estado interno, porque no hay confirmación de que la posición se cerró.
+                    reduce_only_rejected = bool(err) and ("-2022" in str(err) or "ReduceOnly" in str(err))
+
                     if close_order and not err:
-                        # Sincronizar precio real de salida (avgPrice) si Binance lo reporta
+                        # Sincronizar precio real de salida (avgPrice) si Binance lo reporta,
+                        # validando que sea razonable respecto al precio de la señal de salida
+                        # (mismo sanity check que en la apertura, protege el PNL final del trade).
                         real_fill_price = float(close_order.get('avgPrice', 0.0) or 0.0)
                         if real_fill_price > 0:
-                            price = real_fill_price
-
+                            price_deviation = abs(real_fill_price - price) / price if price > 0 else 0.0
+                            if price_deviation <= 0.15:
+                                price = real_fill_price
+                            else:
+                                self._trigger_critical_order_alert(
+                                    "Discrepancia de precio de cierre ignorada (posible glitch del exchange)",
+                                    {
+                                        "Precio de señal de salida": f"{price:.4f}",
+                                        "avgPrice reportado por Binance": f"{real_fill_price:.4f}",
+                                        "Accion": "Se mantiene el precio de señal para no corromper el PNL final del trade"
+                                    }
+                                )
                         self._notify(
                             f"⚡ CIERRE ({exit_type}) EJECUTADO en Binance | "
                             f"Precio Fill: {price:.2f} | ID: {close_order.get('orderId')} | Status: {close_order.get('status')}"
                         )
+                        self._client.cancel_all_open_orders(self.symbol)
+                    elif reduce_only_rejected:
+                        self._notify(
+                            "ℹ️ Binance reporta que la posición ya no existe (ReduceOnly rechazado). "
+                            "Sincronizando estado interno como cerrada."
+                        )
+                        self._client.cancel_all_open_orders(self.symbol)
                     else:
                         err_msg = str(err or "Orden de cierre rechazada o no confirmada por Binance")
                         self.record_unexecuted_order(
@@ -922,9 +1063,15 @@ class PaperTrader:
                                 "error": err_msg
                             }
                         )
-
-                # 3. Cancelación de seguridad posterior para asegurar 0 órdenes residuales
-                self._client.cancel_all_open_orders(self.symbol)
+                        # Aborta SIN tocar self.position/balance/trade_history: la posicion sigue
+                        # protegida por su SL/TP (nunca se cancelaron), y se reintentara en el
+                        # siguiente ciclo de evaluacion de la estrategia.
+                        return
+                else:
+                    # BINANCE_EXCHANGE_CLOSED: el propio polling loop ya detecto que la posicion
+                    # se cerro en el exchange (SL/TP, liquidacion, cierre manual); solo queda
+                    # limpiar cualquier orden condicional residual.
+                    self._client.cancel_all_open_orders(self.symbol)
             else:
                 err_msg = "Modo Binance activo pero sin cliente conectado al cerrar"
                 self.record_unexecuted_order(
@@ -940,6 +1087,8 @@ class PaperTrader:
                     err_msg,
                     {"error": "Cliente Binance no inicializado", "symbol": self.symbol}
                 )
+                # Sin cliente no hay forma de confirmar el cierre real: abortar sin fabricar el trade.
+                return
 
         # PNL en cotizada (ej. USDT)
         if pos.side == "long":
@@ -949,8 +1098,13 @@ class PaperTrader:
             raw_pnl_quote = (pos.entry_price - price) * pos.quantity
             pnl_pct = ((pos.entry_price - price) / pos.entry_price) * 100.0
 
-        # Comisión estimada (0.1% entrada + 0.1% salida)
-        fee_quote = pos.quantity * price * 0.002
+        # Comisión estimada. Binance Futures USDⓈ-M (VIP 0, incluida Testnet) cobra 0.05% taker /
+        # 0.02% maker por lado. El valor anterior (0.1% + 0.1% = 0.2% round-trip) DUPLICABA la
+        # comisión real de un round-trip taker-taker (0.05%+0.05%=0.1%), sesgando sistemáticamente
+        # el PNL mostrado a peor de lo que realmente seria en la cuenta. Se usa 0.05% por lado
+        # (worst-case taker, ya que entry/exit por defecto son MARKET) como estimación conservadora
+        # pero realista.
+        fee_quote = pos.quantity * price * 0.001
         net_pnl_quote = raw_pnl_quote - fee_quote
 
         # Si la cuenta está en divisa base (ej. BTC) o la cuenta general es en BTC
@@ -1058,7 +1212,15 @@ class PaperTrader:
         total_pnl_pct = (total_pnl / self.initial_balance * 100.0) if self.initial_balance > 0 else 0.0
         gross_profit = sum(wins)
         gross_loss = abs(sum(losses))
-        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
+        # Profit factor = ganancia bruta / perdida bruta. Sin perdidas, el ratio es matematicamente
+        # infinito (no el monto de ganancia bruta, que tiene otras unidades - USDT, no un ratio -
+        # y antes se mostraba tal cual en la UI como si fuera el profit factor, confundiendo al usuario).
+        if gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        elif gross_profit > 0:
+            profit_factor = float('inf')
+        else:
+            profit_factor = 0.0
 
         return {
             "total_trades": total_trades,

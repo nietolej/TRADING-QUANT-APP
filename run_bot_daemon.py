@@ -96,6 +96,19 @@ def main():
         "--log-level", "info"
     ]
 
+    # Auto-reload solo en modo desarrollo (DEV_MODE=1). Al reiniciar, BotManager
+    # relee bots_state.json y reanuda automaticamente los bots que estaban activos.
+    dev_mode = os.environ.get("DEV_MODE", "0") == "1"
+    if dev_mode:
+        reload_dirs = ["execution_engine", "strategy_engine", "data_layer", "analytics"]
+        cmd.append("--reload")
+        cmd += ["--reload-exclude", "*.pyc", "--reload-exclude", "*.nbi", "--reload-exclude", "*__pycache__*"]
+        for rd in reload_dirs:
+            rd_path = os.path.join(project_dir, rd)
+            if os.path.isdir(rd_path):
+                cmd.extend(["--reload-dir", rd_path])
+        print(f"{YELLOW}  [DEV_MODE] Hot-reload activado. Los bots activos se reanudaran automaticamente tras cada recarga.{RESET}\n")
+
     print(f"{GREEN}Iniciando Trading Daemon en http://{HOST}:{PORT}{RESET}")
     print(f"{CYAN}Presiona Ctrl+C para detener el daemon.\n{RESET}")
 

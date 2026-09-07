@@ -901,7 +901,8 @@ def render_portfolio_page():
             p_client = ui.context.client
             total_w = sum(float(item['weight_pct']) for item in portfolio_state['items'])
             if abs(total_w - 100.0) > 1.0:
-                ui.notify(f"La suma de los pesos del portafolio debe ser 100% (actualmente es {total_w:.1f}%)", type="warning")
+                ui.notify(f"La suma de los pesos del portafolio debe ser 100% (actualmente es {total_w:.1f}%). Ajusta los pesos antes de simular.", type="negative")
+                return
 
             btn_run_portfolio.disable()
             btn_run_portfolio.set_text("⏳ Calculando simulación de portafolio y comparativa HOLD...")
@@ -1390,8 +1391,11 @@ def render_portfolio_page():
                             port_eq_arr = np.array(res['portfolio_equity'], dtype=float) / p_arr
                             hold_eq_arr = np.array(res['hold_equity'], dtype=float) / p_arr
 
-                            s_port = pd.Series(port_eq_arr, index=pd.to_datetime(res['dates']))
-                            s_hold = pd.Series(hold_eq_arr, index=pd.to_datetime(res['dates']))
+                            # Mismo formato explicito DD/MM/YY que compute_currency_metrics(), para que
+                            # el CAGR/drawdown no cambien al togglear de moneda por una inferencia de
+                            # fecha ambigua distinta entre ambos calculos.
+                            s_port = pd.Series(port_eq_arr, index=pd.to_datetime(res['dates'], format='%d/%m/%y', errors='coerce'))
+                            s_hold = pd.Series(hold_eq_arr, index=pd.to_datetime(res['dates'], format='%d/%m/%y', errors='coerce'))
 
                             # Recalcular métricas cuantitativas en la moneda elegida
                             m_port = calculate_equity_curve_metrics(s_port)

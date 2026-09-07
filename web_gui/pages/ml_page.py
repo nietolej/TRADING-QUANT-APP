@@ -1,4 +1,4 @@
-from nicegui import ui
+from nicegui import ui, run
 import pandas as pd
 from data_layer.storage import SessionLocal, OHLCV
 from ml_engine.model_trainer import MLModelTrainer
@@ -40,24 +40,26 @@ def render_ml_page():
                     try:
                         # 1. Load Data
                         db = SessionLocal()
-                        query = db.query(OHLCV).filter(
-                            OHLCV.symbol == state['symbol'],
-                            OHLCV.timeframe == state['timeframe']
-                        ).order_by(OHLCV.timestamp.asc())
-                        
-                        df = pd.read_sql(query.statement, db.bind)
-                        db.close()
-                        
+                        try:
+                            query = db.query(OHLCV).filter(
+                                OHLCV.symbol == state['symbol'],
+                                OHLCV.timeframe == state['timeframe']
+                            ).order_by(OHLCV.timestamp.asc())
+                            df = pd.read_sql(query.statement, db.bind)
+                        finally:
+                            db.close()
+
+
                         if len(df) < 100:
                             ui.notify('Not enough data. Download more OHLCV first.', type='warning')
                             status_label.text = 'Error'
                             return
                             
                         status_label.text = 'Training Model...'
-                        
-                        # 2. Train Model (Should be run in executor for heavy tasks, but keeping it simple)
+
+                        # 2. Train Model en un hilo aparte para no bloquear el event loop de NiceGUI
                         trainer = MLModelTrainer(model_type=state['model_type'].lower().replace(" ", "_"))
-                        metrics = trainer.train(df)
+                        metrics = await run.io_bound(trainer.train, df)
                         
                         state['metrics'] = metrics
                         status_label.text = 'Training Complete!'

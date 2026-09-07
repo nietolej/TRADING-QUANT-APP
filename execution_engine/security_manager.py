@@ -136,7 +136,8 @@ def validate_order_guardrails(
     quantity: float,
     price: float,
     leverage: int = 1,
-    use_testnet: bool = True
+    use_testnet: bool = True,
+    available_balance_usd: Optional[float] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     Valida una orden contra los guardarraíles cuantitativos antes de permitir su envío.
@@ -170,6 +171,21 @@ def validate_order_guardrails(
             msg = (
                 f"⛔ GUARDARRAÍL DE RIESGO: Valor nocional de la orden (${notional_usd:,.2f} USD) "
                 f"supera el límite de protección configurado (${max_usd:,.2f} USD)."
+            )
+            logger.warning(msg)
+            return False, msg
+
+    # Guardarraíl 3: Margen Requerido vs Margen Disponible Real en Binance
+    # (una orden puede pasar el limite nocional fijo del Guardarraíl 2 y aun asi ser mayor
+    # al capital realmente disponible en la cuenta, resultando en rechazo o sobreapalancamiento
+    # en el exchange).
+    if available_balance_usd is not None and leverage > 0:
+        notional_usd = quantity * price
+        required_margin_usd = notional_usd / leverage
+        if required_margin_usd > available_balance_usd:
+            msg = (
+                f"⛔ GUARDARRAÍL DE RIESGO: Margen requerido (${required_margin_usd:,.2f} USD a {leverage}x) "
+                f"supera el margen disponible real en Binance (${available_balance_usd:,.2f} USD)."
             )
             logger.warning(msg)
             return False, msg

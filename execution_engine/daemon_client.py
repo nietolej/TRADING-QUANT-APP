@@ -142,6 +142,11 @@ class DaemonClient:
         self._last_online_check = 0.0
         self._is_online_cache = False
         self._cache_ttl = 1.0  # Cachear estado 1 segundo para evitar saturar sockets locales
+        self._consecutive_failures = 0
+        # Requerir varios fallos consecutivos antes de considerar el daemon offline y caer al
+        # modo embebido, para no "perder de vista" bots por un hipo de red momentaneo de una
+        # sola peticion (el daemon vuelve a marcarse online de inmediato en cuanto responde).
+        self._failures_before_offline = 3
 
     def is_daemon_online(self, force_refresh: bool = False) -> bool:
         """Verifica si el Trading Daemon responde en el puerto local."""
@@ -152,9 +157,18 @@ class DaemonClient:
 
         try:
             res = requests.get(f"{self.base_url}/health", timeout=self.timeout)
-            self._is_online_cache = (res.status_code == 200 and res.json().get("status") == "online")
+            reachable = (res.status_code == 200 and res.json().get("status") == "online")
         except Exception:
-            self._is_online_cache = False
+            reachable = False
+
+        if reachable:
+            self._consecutive_failures = 0
+            self._is_online_cache = True
+        else:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._failures_before_offline:
+                self._is_online_cache = False
+            # si no, se mantiene el ultimo estado conocido (probable hipo transitorio)
 
         self._last_online_check = now
         return self._is_online_cache
@@ -216,12 +230,14 @@ class DaemonClient:
         currency: str = "BTC",
         custom_parameters: Optional[dict] = None,
         use_testnet: bool = False,
-        custom_timeframe: Optional[str] = None,
-        custom_symbol: Optional[str] = None,
+        timeframe: Optional[str] = None,
+        symbol: Optional[str] = None,
         name: Optional[str] = None,
         auto_start: bool = False
     ) -> Any:
-        """Crea un bot en el daemon o en modo local."""
+        """Crea un bot en el daemon o en modo local.
+        Nombres de parametro (symbol/timeframe) alineados con BotManager.create_bot local,
+        que es como lo llaman todos los call sites reales (live_monitor_page.py, etc.)."""
         if self.is_daemon_online():
             payload = {
                 "strategy_yaml_path": strategy_yaml_path,
@@ -229,8 +245,8 @@ class DaemonClient:
                 "currency": currency,
                 "custom_parameters": custom_parameters or {},
                 "use_testnet": use_testnet,
-                "custom_timeframe": custom_timeframe,
-                "custom_symbol": custom_symbol,
+                "custom_timeframe": timeframe,
+                "custom_symbol": symbol,
                 "name": name,
                 "auto_start": auto_start
             }
@@ -242,17 +258,20 @@ class DaemonClient:
                 logger.error("Error creando bot en daemon: %s", e)
 
         from execution_engine.bot_manager import bot_manager
-        return bot_manager.create_bot(
+        new_bot = bot_manager.create_bot(
             strategy_yaml_path=strategy_yaml_path,
             initial_balance=initial_balance,
             currency=currency,
             custom_parameters=custom_parameters,
             use_testnet=use_testnet,
-            custom_timeframe=custom_timeframe,
-            custom_symbol=custom_symbol,
+            timeframe=timeframe,
+            symbol=symbol,
             name=name,
-            auto_start=auto_start
         )
+        if auto_start and new_bot and not new_bot.is_running:
+            new_bot.start()
+            bot_manager.save_state_to_disk()
+        return new_bot
 
     def delete_bot(self, bot_id: str) -> bool:
         """Elimina un bot."""

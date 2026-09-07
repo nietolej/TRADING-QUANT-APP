@@ -3,8 +3,10 @@ import os
 import json
 import uuid
 import asyncio
+import logging
 from datetime import datetime, timezone
 from nicegui import ui, run
+from sqlalchemy import func
 import pandas as pd
 import numpy as np
 
@@ -19,6 +21,8 @@ from backtest_engine.metrics import calculate_metrics, calculate_equity_curve_me
 import yaml
 from web_gui.components.tradingview_chart import build_tradingview_plotly_figure
 from data_layer.export_utils import export_df_to_ninjatrader8, format_dt_display, format_date_display, parse_flexible_date
+
+logger = logging.getLogger(__name__)
 
 
 def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_dt, comm_pct, slip_pct):
@@ -385,13 +389,13 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                         sym_combo.value = row['symbol']
                     if row.get('timeframe'):
                         state['timeframe'] = row['timeframe']
-                        tf_combo.value = row['timeframe']
+                        time_combo.value = row['timeframe']
                     if row.get('start_date'):
                         state['start_date'] = row['start_date']
-                        start_date_input.value = row['start_date']
+                        start_date.value = row['start_date']
                     if row.get('end_date'):
                         state['end_date'] = row['end_date']
-                        end_date_input.value = row['end_date']
+                        end_date.value = row['end_date']
 
                     if row.get('config_snapshot'):
                         try:
@@ -1343,6 +1347,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                     end_date.value = state['end_date']
             except Exception as ex:
                 logger.warning(f"Error auto-detectando rango: {ex}")
+                ui.notify(f"Error detectando rango en BD: {ex}", type="negative")
             finally:
                 db.close()
 
@@ -2870,55 +2875,61 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
         btn_portfolio.on_click(on_go_to_portfolio if on_go_to_portfolio else open_portfolio_modal)
 
     def select_strategy(filename, symbol=None, timeframe=None, custom_params=None):
-        if filename in strategies:
-            state['strategy_name'] = filename
-            strat_combo.value = filename
-            if symbol:
-                state['symbol'] = symbol
-                sym_combo.value = symbol
-            if timeframe:
-                state['timeframe'] = timeframe
-                tf_combo.value = timeframe
-            if custom_params:
-                state['custom_parameters'] = dict(custom_params)
-            update_parameters_ui()
+        try:
+            if filename in strategies:
+                state['strategy_name'] = filename
+                strat_combo.value = filename
+                if symbol:
+                    state['symbol'] = symbol
+                    sym_combo.value = symbol
+                if timeframe:
+                    state['timeframe'] = timeframe
+                    time_combo.value = timeframe
+                if custom_params:
+                    state['custom_parameters'] = dict(custom_params)
+                update_parameters_ui()
+        except Exception as ex:
+            ui.notify(f"Error al seleccionar estrategia: {ex}", type="negative")
 
     def load_from_history(row):
-        if row.get('strategy_name') and row['strategy_name'] in strategies:
-            state['strategy_name'] = row['strategy_name']
-            strat_combo.value = row['strategy_name']
-        if row.get('symbol'):
-            state['symbol'] = row['symbol']
-            sym_combo.value = row['symbol']
-        if row.get('timeframe'):
-            state['timeframe'] = row['timeframe']
-            tf_combo.value = row['timeframe']
-        if row.get('start_date'):
-            state['start_date'] = row['start_date']
-            start_date_input.value = row['start_date']
-        if row.get('end_date'):
-            state['end_date'] = row['end_date']
-            end_date_input.value = row['end_date']
+        try:
+            if row.get('strategy_name') and row['strategy_name'] in strategies:
+                state['strategy_name'] = row['strategy_name']
+                strat_combo.value = row['strategy_name']
+            if row.get('symbol'):
+                state['symbol'] = row['symbol']
+                sym_combo.value = row['symbol']
+            if row.get('timeframe'):
+                state['timeframe'] = row['timeframe']
+                time_combo.value = row['timeframe']
+            if row.get('start_date'):
+                state['start_date'] = row['start_date']
+                start_date.value = row['start_date']
+            if row.get('end_date'):
+                state['end_date'] = row['end_date']
+                end_date.value = row['end_date']
 
-        if row.get('config_snapshot'):
-            try:
-                cfg = json.loads(row['config_snapshot'])
-                if 'custom_parameters' in cfg:
-                    state['custom_parameters'] = cfg['custom_parameters']
-                if 'sizing_mode' in cfg and cfg['sizing_mode']:
-                    state['sizing_mode'] = cfg['sizing_mode']
-                    sizing_combo.value = cfg['sizing_mode']
-                if 'commission_pct' in cfg and cfg['commission_pct'] is not None:
-                    state['commission_pct'] = float(cfg['commission_pct'])
-                    comm_input.value = float(cfg['commission_pct'])
-                if 'slippage_pct' in cfg and cfg['slippage_pct'] is not None:
-                    state['slippage_pct'] = float(cfg['slippage_pct'])
-                    slip_input.value = float(cfg['slippage_pct'])
-            except Exception as parse_ex:
-                print(f"Error parsing config snapshot: {parse_ex}")
+            if row.get('config_snapshot'):
+                try:
+                    cfg = json.loads(row['config_snapshot'])
+                    if 'custom_parameters' in cfg:
+                        state['custom_parameters'] = cfg['custom_parameters']
+                    if 'sizing_mode' in cfg and cfg['sizing_mode']:
+                        state['sizing_mode'] = cfg['sizing_mode']
+                        sizing_combo.value = cfg['sizing_mode']
+                    if 'commission_pct' in cfg and cfg['commission_pct'] is not None:
+                        state['commission_pct'] = float(cfg['commission_pct'])
+                        comm_input.value = float(cfg['commission_pct'])
+                    if 'slippage_pct' in cfg and cfg['slippage_pct'] is not None:
+                        state['slippage_pct'] = float(cfg['slippage_pct'])
+                        slip_input.value = float(cfg['slippage_pct'])
+                except Exception as parse_ex:
+                    print(f"Error parsing config snapshot: {parse_ex}")
 
-        update_parameters_ui()
-        ui.notify(f"✅ Parámetros cargados desde el historial para '{row.get('strategy_name')}'", type="positive")
+            update_parameters_ui()
+            ui.notify(f"✅ Parámetros cargados desde el historial para '{row.get('strategy_name')}'", type="positive")
+        except Exception as ex:
+            ui.notify(f"Error al cargar desde historial: {ex}", type="negative")
 
     return {
         'select_strategy': select_strategy,

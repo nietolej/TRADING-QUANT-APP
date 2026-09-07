@@ -402,7 +402,10 @@ class BinanceDerivativesProvider:
             try:
                 df_local = pd.read_parquet(parquet_path)
                 logger.info("Cargados datos de derivados desde disco local: %s", parquet_path)
-                return self._build_dashboard_from_dataframe(df_local, clean_sym, clean_period, from_cache=True, local_path=parquet_path)
+                return self._build_dashboard_from_dataframe(
+                    df_local, clean_sym, clean_period, from_cache=True, local_path=parquet_path,
+                    start_time_ms=start_ms, end_time_ms=end_ms
+                )
             except Exception as e:
                 logger.warning("No se pudo leer parquet local %s: %s. Descargando de red...", parquet_path, e)
 
@@ -473,15 +476,18 @@ class BinanceDerivativesProvider:
             df_k.to_parquet(filepath, index=False)
             logger.info("Datos guardados exitosamente en Parquet: %s (%d registros)", filepath, len(df_k))
 
-    def _build_dashboard_from_dataframe(self, df_k, symbol, period, from_cache=True, local_path=""):
-        """Reconstruye el dashboard desde un DataFrame local de Parquet."""
+    def _build_dashboard_from_dataframe(self, df_k, symbol, period, from_cache=True, local_path="", start_time_ms=None, end_time_ms=None):
+        """Reconstruye el dashboard desde un DataFrame local de Parquet.
+        Recibe el mismo rango de fechas (start_time_ms/end_time_ms) que la ruta de descarga en
+        vivo, para que Open Interest / ratios Long-Short / Taker correspondan al mismo rango
+        que las velas OHLCV cacheadas, en vez de "los ultimos N puntos por defecto"."""
         klines = df_k.to_dict(orient="records") if not df_k.empty else []
         premium = self.get_premium_index_and_basis(symbol)
-        funding = self.get_funding_rate_history(symbol, limit=1000)
-        oi = self.get_open_interest_history(symbol, period=period, limit=500)
-        top_ls = self.get_top_long_short_account_ratio(symbol, period=period, limit=500)
-        glob_ls = self.get_global_long_short_account_ratio(symbol, period=period, limit=500)
-        taker_ls = self.get_taker_long_short_ratio(symbol, period=period, limit=500)
+        funding = self.get_funding_rate_history(symbol, start_time_ms=start_time_ms, end_time_ms=end_time_ms, limit=1000)
+        oi = self.get_open_interest_history(symbol, period=period, start_time_ms=start_time_ms, end_time_ms=end_time_ms, limit=500)
+        top_ls = self.get_top_long_short_account_ratio(symbol, period=period, start_time_ms=start_time_ms, end_time_ms=end_time_ms, limit=500)
+        glob_ls = self.get_global_long_short_account_ratio(symbol, period=period, start_time_ms=start_time_ms, end_time_ms=end_time_ms, limit=500)
+        taker_ls = self.get_taker_long_short_ratio(symbol, period=period, start_time_ms=start_time_ms, end_time_ms=end_time_ms, limit=500)
 
         latest_oi_usd = oi[-1]["sum_open_interest_usd"] if oi else 0.0
         prev_oi_usd = oi[-2]["sum_open_interest_usd"] if len(oi) > 1 else latest_oi_usd

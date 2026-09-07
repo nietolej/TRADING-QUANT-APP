@@ -70,6 +70,10 @@ class LiveMonitorPage:
         self.edit_bot_dialog = None
         self.new_bot_inputs = {}
 
+        # Bots con un arranque en curso (guard sincrono contra doble-clic /
+        # doble ejecucion mientras run.io_bound(bot.start) todavia no marca is_running=True)
+        self._starting_bot_ids: set = set()
+
         # Ensure at least 1 default bot exists if none exist
         self._ensure_default_bot()
 
@@ -138,22 +142,28 @@ class LiveMonitorPage:
         bot = bot_manager.get_bot(bot_id)
         if not bot:
             return
-        if bot.is_running:
+        if bot.is_running or bot_id in self._starting_bot_ids:
             ui.notify(f"El bot '{bot.name}' ya está en ejecución.", type='warning')
             return
 
-        bot.status = "STARTING"
-        bot.status_message = "Iniciando..."
-        ui.notify(f"Iniciando bot '{bot.name}'...", type='info')
-        self._update_cards_data_in_place()
+        # Guard sincrono: se marca ANTES del primer 'await' para que un segundo
+        # clic disparado antes de que bot.start() ponga is_running=True no pase el chequeo.
+        self._starting_bot_ids.add(bot_id)
+        try:
+            bot.status = "STARTING"
+            bot.status_message = "Iniciando..."
+            ui.notify(f"Iniciando bot '{bot.name}'...", type='info')
+            self._update_cards_data_in_place()
 
-        await run.io_bound(bot.start)
+            await run.io_bound(bot.start)
 
-        if bot.is_running:
-            ui.notify(f"✅ Bot '{bot.name}' iniciado correctamente.", type='positive')
-        else:
-            ui.notify(f"❌ Error al iniciar '{bot.name}': {bot.status_message}", type='negative')
-            
+            if bot.is_running:
+                ui.notify(f"✅ Bot '{bot.name}' iniciado correctamente.", type='positive')
+            else:
+                ui.notify(f"❌ Error al iniciar '{bot.name}': {bot.status_message}", type='negative')
+        finally:
+            self._starting_bot_ids.discard(bot_id)
+
         # Forzar actualización del inspector
         self._rendered_inspector_status = None
         self._last_chart_kline_len = -1
@@ -324,7 +334,7 @@ class LiveMonitorPage:
                 if float(p.get('positionAmt', 0.0)) != 0
             }
 
-            bots = bot_manager.get_all_bots()
+            bots = await loop.run_in_executor(None, bot_manager.get_all_bots)
             changes_detected = False
 
             for b in bots:
@@ -580,33 +590,40 @@ class LiveMonitorPage:
                 curr = currency_select.value
                 use_testnet = (network_select.value == 'Binance Testnet')
 
-                new_bot = bot_manager.create_bot(
-                    strategy_yaml_path=strat_path,
-                    name=bot_name,
-                    symbol=sym,
-                    timeframe=tf,
-                    initial_balance=bal,
-                    currency=curr,
-                    use_testnet=use_testnet,
-                    custom_parameters=collected_params,
-                )
+                try:
+                    new_bot = bot_manager.create_bot(
+                        strategy_yaml_path=strat_path,
+                        name=bot_name,
+                        symbol=sym,
+                        timeframe=tf,
+                        initial_balance=bal,
+                        currency=curr,
+                        use_testnet=use_testnet,
+                        custom_parameters=collected_params,
+                    )
 
-                new_bot.order_types = {
-                    'entry': new_entry_type.value,
-                    'exit': new_exit_type.value,
-                    'stop_loss': new_sl_type.value,
-                    'take_profit': new_tp_type.value
-                }
-                new_bot._save_state()
+                    # update_configuration() existe tanto en PaperTrader (modo embebido) como en
+                    # BotProxy (modo daemon) y persiste el cambio en cada caso; asignar
+                    # new_bot.order_types + _save_state() directamente rompia en modo daemon
+                    # porque BotProxy no tiene _save_state(), abortando con AttributeError
+                    # ANTES de llegar a iniciar el bot cuando "Crear e Iniciar" estaba marcado.
+                    new_bot.update_configuration(order_types={
+                        'entry': new_entry_type.value,
+                        'exit': new_exit_type.value,
+                        'stop_loss': new_sl_type.value,
+                        'take_profit': new_tp_type.value
+                    })
 
-                self.selected_bot_id = new_bot.bot_id
-                self._update_bot_select_options()
-                self._refresh_ui_elements(force_dom_rebuild=True)
-                self.new_bot_dialog.close()
-                ui.notify(f"✅ Bot '{bot_name}' creado con éxito.", type='positive')
+                    self.selected_bot_id = new_bot.bot_id
+                    self._update_bot_select_options()
+                    self._refresh_ui_elements(force_dom_rebuild=True)
+                    self.new_bot_dialog.close()
+                    ui.notify(f"✅ Bot '{bot_name}' creado con éxito.", type='positive')
 
-                if start_immediately:
-                    await self._start_bot_async(new_bot.bot_id)
+                    if start_immediately:
+                        await self._start_bot_async(new_bot.bot_id)
+                except Exception as ex:
+                    ui.notify(f"❌ Error creando el bot: {ex}", type='negative')
 
             with ui.row().classes('w-full justify-end gap-3'):
                 ui.button('Cancelar', on_click=self.new_bot_dialog.close).props('flat text-color=gray-400')
@@ -775,9 +792,31 @@ class LiveMonitorPage:
                 self._refresh_ui_elements(force_dom_rebuild=True)
                 ui.notify(f"✅ Configuración del bot '{bot.name}' actualizada.", type='positive')
 
-            with ui.row().classes('w-full justify-end gap-3'):
-                ui.button('Cancelar', on_click=self.edit_bot_dialog.close).props('flat text-color=gray-400')
-                ui.button('💾 Guardar Cambios', on_click=save_changes).classes('bg-yellow-500 hover:bg-yellow-600 text-black font-bold')
+            # Confirmacion de "armar y confirmar" en el MISMO boton, en vez de abrir un segundo
+            # ui.dialog() anidado: abrir un dialog nuevo dentro de otro ya abierto (o justo tras
+            # cerrarlo en el mismo tick) rompe el render en NiceGUI/Quasar para este dialogo en
+            # particular (MutationObserver sobre un nodo que no llega a montarse), dejando la
+            # confirmacion invisible aunque exista en el DOM.
+            reset_armed = {'value': False}
+
+            def confirm_reset():
+                if not reset_armed['value']:
+                    reset_armed['value'] = True
+                    reset_btn.set_text('⚠️ ¿Seguro? Click de nuevo para borrar todo')
+                    reset_btn.classes(add='bg-red-600 text-white', remove='text-red-400 hover:bg-red-500/10')
+                    return
+
+                bot.reset()
+                self.edit_bot_dialog.close()
+                self._update_bot_select_options()
+                self._refresh_ui_elements(force_dom_rebuild=True)
+                ui.notify(f"🔄 Bot '{bot.name}' reseteado correctamente.", type='positive')
+
+            with ui.row().classes('w-full justify-between gap-3'):
+                reset_btn = ui.button('🔄 Resetear Bot', on_click=confirm_reset).props('flat').classes('text-red-400 hover:bg-red-500/10 font-semibold')
+                with ui.row().classes('gap-3'):
+                    ui.button('Cancelar', on_click=self.edit_bot_dialog.close).props('flat text-color=gray-400')
+                    ui.button('💾 Guardar Cambios', on_click=save_changes).classes('bg-yellow-500 hover:bg-yellow-600 text-black font-bold')
 
         self.edit_bot_dialog.open()
 
@@ -1161,7 +1200,11 @@ class LiveMonitorPage:
     # Bucle de Actualización UI Optimizado (Zero Thrashing)
     # ──────────────────────────────────────────────────────────────
 
-    def _ui_update_loop(self):
+    async def _ui_update_loop(self):
+        """Callback del ui.timer (cada 1.5s). Es async para poder sacar del hilo del
+        event loop (via run.io_bound) las llamadas HTTP al daemon (bot_manager/daemon_client),
+        que de lo contrario bloquean TODO el servidor (todos los clientes conectados) mientras
+        esperan respuesta, especialmente si el daemon esta lento o saturado."""
         if not getattr(self, 'is_active_page', False):
             return
         try:
@@ -1170,16 +1213,35 @@ class LiveMonitorPage:
             if self._sync_counter % 2 == 0:
                 asyncio.create_task(self._sync_exchange_positions(show_notify=False))
 
-            self._refresh_ui_elements(force_dom_rebuild=False)
+            # Prefetch de red fuera del event loop principal
+            bots, summary, all_unexec, daemon_status = await run.io_bound(self._fetch_live_monitor_data)
+
+            self._refresh_ui_elements(
+                force_dom_rebuild=False,
+                prefetched_bots=bots,
+                prefetched_summary=summary,
+                prefetched_unexec=all_unexec,
+                prefetched_daemon_status=daemon_status
+            )
         except Exception:
             pass
 
-    def _refresh_ui_elements(self, force_dom_rebuild: bool = False):
-        self._update_daemon_status_pill()
+    def _fetch_live_monitor_data(self):
+        """Ejecuta en un hilo aparte (run.io_bound) todas las llamadas de red bloqueantes
+        que antes se hacian directamente en el hilo del event loop de NiceGUI."""
         bots = bot_manager.get_all_bots()
+        summary = bot_manager.get_portfolio_summary()
+        all_unexec = bot_manager.get_unexecuted_orders("all")
+        is_online = daemon_client.is_daemon_online()
+        st = daemon_client.get_system_status() if is_online else None
+        return bots, summary, all_unexec, (is_online, st)
+
+    def _refresh_ui_elements(self, force_dom_rebuild: bool = False, prefetched_bots=None, prefetched_summary=None, prefetched_unexec=None, prefetched_daemon_status=None):
+        self._update_daemon_status_pill(prefetched_status=prefetched_daemon_status)
+        bots = prefetched_bots if prefetched_bots is not None else bot_manager.get_all_bots()
 
         # 1. Actualizar KPIs globales en sitio
-        summary = bot_manager.get_portfolio_summary()
+        summary = prefetched_summary if prefetched_summary is not None else bot_manager.get_portfolio_summary()
         if hasattr(self, 'kpi_bots_label'):
             self.kpi_bots_label.set_text(f"{summary['running_bots']} / {summary['total_bots']}")
         if hasattr(self, 'kpi_balance_label'):
@@ -1192,7 +1254,7 @@ class LiveMonitorPage:
             self.kpi_positions_label.set_text(f"{summary['active_positions']} activas | WR: {summary['win_rate']:.1f}%")
 
         # Notificación emergente flotante en tiempo real si surge una nueva orden rechazada
-        all_unexec = bot_manager.get_unexecuted_orders("all")
+        all_unexec = prefetched_unexec if prefetched_unexec is not None else bot_manager.get_unexecuted_orders("all")
         curr_unexec_len = len(all_unexec)
         if getattr(self, '_seen_unexec_count', None) is None:
             self._seen_unexec_count = curr_unexec_len
@@ -1603,7 +1665,8 @@ class LiveMonitorPage:
         if hasattr(self, 'inspector_pf_label'):
             pf = stats.get('profit_factor', 0.0)
             avg_t = stats.get('avg_trade_pnl', 0.0)
-            self.inspector_pf_label.set_text(f"Profit Factor: {pf:.2f} | Prom: {avg_t:+.{dec}f}")
+            pf_display = "∞ (sin pérdidas)" if pf == float('inf') else f"{pf:.2f}"
+            self.inspector_pf_label.set_text(f"Profit Factor: {pf_display} | Prom: {avg_t:+.{dec}f}")
 
         if hasattr(self, 'inspector_pos_label'):
             if bot.position:
@@ -1795,7 +1858,7 @@ class LiveMonitorPage:
             if hasattr(self, 'tab_unexec_btn'):
                 cnt = len(unexec_rows)
                 tab_txt = f"🚨 Órdenes No Ejecutadas ({cnt})" if cnt > 0 else "🚨 Órdenes No Ejecutadas"
-                self.tab_unexec_btn.set_text(tab_txt)
+                self.tab_unexec_btn.set_label(tab_txt)
 
         # 8. Consola de logs
         if hasattr(self, 'log_label'):
@@ -1874,14 +1937,18 @@ class LiveMonitorPage:
                 btn_txt = '⚡ Aplicar Parámetros en Caliente' if bot.is_running else '💾 Guardar Parámetros'
                 ui.button(btn_txt, icon='bolt' if bot.is_running else 'save', on_click=save_inspector_params).classes('bg-yellow-500 hover:bg-yellow-600 text-black font-bold text-xs py-1 px-3 rounded shadow')
 
-    def _update_daemon_status_pill(self):
+    def _update_daemon_status_pill(self, prefetched_status=None):
         if not hasattr(self, 'daemon_status_pill') or self.daemon_status_pill is None:
             return
-        is_online = daemon_client.is_daemon_online()
+        if prefetched_status is not None:
+            is_online, cached_st = prefetched_status
+        else:
+            is_online = daemon_client.is_daemon_online()
+            cached_st = None
         self.daemon_status_pill.clear()
         with self.daemon_status_pill:
             if is_online:
-                st = daemon_client.get_system_status()
+                st = cached_st if cached_st is not None else daemon_client.get_system_status()
                 pid = st.get('pid', '-')
                 mem = st.get('memory_mb', 0)
                 self.daemon_status_pill.classes(remove='bg-amber-950/80 text-amber-300 border-amber-600', add='bg-emerald-950/80 text-emerald-300 border border-emerald-500')
@@ -1938,12 +2005,18 @@ class LiveMonitorPage:
             
             # KPI 2: Balance Total
             with ui.card().classes('bg-gray-800 p-4 rounded-xl border border-gray-700 shadow-md flex flex-col justify-between'):
-                ui.label('BALANCE TOTAL CARTERA').classes('text-xs font-semibold text-gray-400 uppercase tracking-wider')
+                with ui.row().classes('items-center gap-1'):
+                    ui.label('CAPITAL VIRTUAL (PAPER)').classes('text-xs font-semibold text-gray-400 uppercase tracking-wider')
+                    ui.icon('info', size='14px').classes('text-gray-500').tooltip(
+                        'Contabilidad interna simulada por bot, NO es el balance real de tu cuenta '
+                        'de Binance. Las órdenes se ejecutan de verdad en Testnet, pero cada bot lleva '
+                        'su propio capital virtual aislado. Ver el balance REAL en "Cuenta Binance".'
+                    )
                 self.kpi_balance_label = ui.label(init_summary.get('balance_display', '0.00 USDT')).classes('text-2xl font-bold text-green-400 mt-1')
 
             # KPI 3: PNL Total
             with ui.card().classes('bg-gray-800 p-4 rounded-xl border border-gray-700 shadow-md flex flex-col justify-between'):
-                ui.label('PNL TOTAL ACUMULADO').classes('text-xs font-semibold text-gray-400 uppercase tracking-wider')
+                ui.label('PNL VIRTUAL ACUMULADO').classes('text-xs font-semibold text-gray-400 uppercase tracking-wider')
                 self.kpi_pnl_label = ui.label(init_summary.get('pnl_display', '+0.00 USDT (+0.00%)')).classes('text-2xl font-bold text-yellow-400 mt-1')
 
             # KPI 4: Posiciones

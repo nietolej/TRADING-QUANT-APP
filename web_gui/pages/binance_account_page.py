@@ -50,6 +50,9 @@ class BinanceAccountPage:
         self.spot_data: Dict[str, Any] = {}
         self.risk_analysis: Dict[str, Any] = {}
         self.is_loading = False
+        # Guard contra doble-clic en acciones sensibles (cancelar ordenes, kill-switch,
+        # cambio de modo multiactivos) mientras la peticion anterior sigue en curso.
+        self._action_in_progress = False
 
     def render(self):
         with ui.column().classes('w-full h-full p-2 md:p-4 gap-6 bg-[#0a0e17] text-white'):
@@ -151,7 +154,13 @@ class BinanceAccountPage:
                 # KPIs de Alto Nivel de Futuros
                 with ui.grid(columns=6).classes('w-full gap-3'):
                     with ui.card().classes('bg-gray-900 p-3 rounded-xl border border-gray-800 shadow-md flex flex-col justify-between'):
-                        ui.label('VALOR TOTAL CARTERA').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
+                        with ui.row().classes('items-center gap-1'):
+                            ui.label('VALOR TOTAL CARTERA (REAL)').classes('text-[10px] font-bold text-gray-400 uppercase tracking-wider')
+                            ui.icon('info', size='12px').classes('text-gray-500').tooltip(
+                                'Este es el balance REAL de tu cuenta de Binance (compartido por todos los bots). '
+                                'El "Capital Virtual" que ves en Monitor en Vivo es contabilidad interna simulada '
+                                'por bot y no tiene por qué coincidir con este valor.'
+                            )
                         self.kpi_wallet_balance = ui.label('$0.00 USD').classes('text-xl font-black text-green-400 mt-1 font-mono')
                         self.kpi_futures_asset_count = ui.label('0 activos').classes('text-[10px] text-gray-400 font-medium')
 
@@ -603,6 +612,19 @@ class BinanceAccountPage:
             err = data.get("error", "Error desconocido")
             self.kpi_api_status.set_text("API: Error 🔴")
             self.kpi_api_status.classes('text-red-400', remove='text-emerald-400')
+            # Limpiar datos obsoletos para no mostrar posiciones/ordenes de una consulta anterior
+            # como si reflejaran el estado actual de la cuenta.
+            self.kpi_wallet_balance.set_text("-- USD")
+            self.kpi_avail_margin.set_text("-- USDT")
+            self.kpi_unrealized_pnl.set_text("-- USDT")
+            self.kpi_margin_util.set_text("Uso Margen: --")
+            self.assets_grid.options['rowData'] = []
+            self.assets_grid.update()
+            self.positions_grid.options['rowData'] = []
+            self.positions_grid.update()
+            self.open_orders_grid.options['rowData'] = []
+            self.open_orders_grid.update()
+            ui.notify(f"⚠️ Error consultando cuenta de Futuros: {err}", type='negative')
             return
 
         self.kpi_api_status.set_text("API: Conectada 🟢")
@@ -705,15 +727,16 @@ class BinanceAccountPage:
         # 4. Tabla de Activos Futuros
         asset_rows = []
         for a in data.get("assets", []):
-            usd_v = a.get("usd_value", a.get("wallet_balance", 0.0))
+            wallet_bal = a.get("wallet_balance", 0.0)
+            usd_v = a.get("usd_value", wallet_bal)
             asset_rows.append({
-                "asset": a["asset"],
-                "wallet_balance": f"{a['wallet_balance']:,.4f}",
+                "asset": a.get("asset", "-"),
+                "wallet_balance": f"{wallet_bal:,.4f}",
                 "usd_value_str": f"${usd_v:,.2f}",
-                "available_balance": f"{a['available_balance']:,.4f}",
-                "margin_balance": f"{a['margin_balance']:,.4f}",
-                "unrealized_pnl": f"{a['unrealized_pnl']:+,.4f}",
-                "max_withdraw": f"{a['max_withdraw']:,.4f}"
+                "available_balance": f"{a.get('available_balance', 0.0):,.4f}",
+                "margin_balance": f"{a.get('margin_balance', 0.0):,.4f}",
+                "unrealized_pnl": f"{a.get('unrealized_pnl', 0.0):+,.4f}",
+                "max_withdraw": f"{a.get('max_withdraw', 0.0):,.4f}"
             })
         self.assets_grid.options['rowData'] = asset_rows
         self.assets_grid.update()
@@ -721,20 +744,23 @@ class BinanceAccountPage:
         # 5. Tabla de Posiciones
         pos_rows = []
         for p in metrics.get("position_details", []):
-            side_icon = "📈 " if p['side'] == "LONG" else "📉 "
+            symbol = p.get('symbol', '-')
+            entry_price = p.get('entry_price', 0.0)
+            side_icon = "📈 " if p.get('side') == "LONG" else "📉 "
             raw_pnl = float(p.get('unrealized_pnl', 0.0))
             im = float(p.get('margin', 0.0))
             roi_pct = (raw_pnl / im * 100.0) if im > 0 else 0.0
             liq_dist_pct = p.get('liq_distance_pct')
             liq_dist_str = f"{liq_dist_pct:.1f}%" if liq_dist_pct is not None else "--"
-            
+            liq_price = p.get('liq_price')
+
             pos_rows.append({
-                "symbol_display": f"{p['symbol']} Perp {p.get('leverage', 1)}x",
-                "size_display": f"{side_icon} {abs(p.get('amount', 0)):.4f} {p['symbol'].replace('USDT', '').replace('USDC', '')}",
-                "entry_price": f"{p['entry_price']:,.2f}",
-                "break_even": f"{p.get('break_even_price', p['entry_price']):,.2f}",
+                "symbol_display": f"{symbol} Perp {p.get('leverage', 1)}x",
+                "size_display": f"{side_icon} {abs(p.get('amount', 0)):.4f} {symbol.replace('USDT', '').replace('USDC', '')}",
+                "entry_price": f"{entry_price:,.2f}",
+                "break_even": f"{p.get('break_even_price', entry_price):,.2f}",
                 "mark_price": f"{p.get('mark_price', 0):,.2f}" if p.get('mark_price') else "-",
-                "liq_price": f"{p['liq_price']:,.2f}" if p.get('liq_price') else "--",
+                "liq_price": f"{liq_price:,.2f}" if liq_price else "--",
                 "liq_distance_str": liq_dist_str,
                 "margin_display": f"{im:.2f} USDT",
                 "pnl_display": f"{raw_pnl:+,.2f} USDT ({roi_pct:+.2f}%)",
@@ -1031,31 +1057,45 @@ class BinanceAccountPage:
             ui.notify(f"🚨 Error en diagnóstico de Binance: {err}", type='negative', duration=8000)
 
     async def _toggle_multi_assets_mode(self):
-        use_test = (self.selected_network == "testnet")
-        client = BinanceTestnetClient(use_testnet=use_test)
-        current_state = bool(self.account_data.get("multi_assets_margin", False)) if self.account_data else False
-        new_target = not current_state
-        
-        ui.notify(f"Configurando Modo Multiactivos en Binance a {'ACTIVO' if new_target else 'INACTIVO'}...", type='info')
-        loop = asyncio.get_event_loop()
-        ok, err = await loop.run_in_executor(None, lambda: client.set_multi_assets_margin(new_target))
-        
-        if ok:
-            ui.notify(f"✅ Modo Multiactivos {'ACTIVADO' if new_target else 'DESACTIVADO'} en Binance.", type='positive')
-            await self._refresh_account_data_async()
-        else:
-            ui.notify(f"⚠️ No se pudo cambiar el modo multiactivos: {err}", type='warning')
+        if self._action_in_progress:
+            ui.notify("Ya hay una acción en curso, espera a que termine.", type='warning')
+            return
+        self._action_in_progress = True
+        try:
+            use_test = (self.selected_network == "testnet")
+            client = BinanceTestnetClient(use_testnet=use_test)
+            current_state = bool(self.account_data.get("multi_assets_margin", False)) if self.account_data else False
+            new_target = not current_state
+
+            ui.notify(f"Configurando Modo Multiactivos en Binance a {'ACTIVO' if new_target else 'INACTIVO'}...", type='info')
+            loop = asyncio.get_event_loop()
+            ok, err = await loop.run_in_executor(None, lambda: client.set_multi_assets_margin(new_target))
+
+            if ok:
+                ui.notify(f"✅ Modo Multiactivos {'ACTIVADO' if new_target else 'DESACTIVADO'} en Binance.", type='positive')
+                await self._refresh_account_data_async()
+            else:
+                ui.notify(f"⚠️ No se pudo cambiar el modo multiactivos: {err}", type='warning')
+        finally:
+            self._action_in_progress = False
 
     async def _cancel_all_orders(self):
-        use_test = (self.selected_network == "testnet")
-        client = BinanceTestnetClient(use_testnet=use_test)
-        loop = asyncio.get_event_loop()
-        ok, err = await loop.run_in_executor(None, lambda: client.cancel_all_futures_orders(symbol="BTCUSDT", use_testnet=use_test))
-        if ok:
-            ui.notify("🗑 Todas las órdenes abiertas de BTCUSDT han sido canceladas.", type='positive')
-            await self._refresh_account_data_async()
-        else:
-            ui.notify(f"⚠️ No se pudieron cancelar órdenes: {err}", type='warning')
+        if self._action_in_progress:
+            ui.notify("Ya hay una acción en curso, espera a que termine.", type='warning')
+            return
+        self._action_in_progress = True
+        try:
+            use_test = (self.selected_network == "testnet")
+            client = BinanceTestnetClient(use_testnet=use_test)
+            loop = asyncio.get_event_loop()
+            ok, err = await loop.run_in_executor(None, lambda: client.cancel_all_futures_orders(symbol="BTCUSDT", use_testnet=use_test))
+            if ok:
+                ui.notify("🗑 Todas las órdenes abiertas de BTCUSDT han sido canceladas.", type='positive')
+                await self._refresh_account_data_async()
+            else:
+                ui.notify(f"⚠️ No se pudieron cancelar órdenes: {err}", type='warning')
+        finally:
+            self._action_in_progress = False
 
     def _update_security_badge(self):
         """Actualiza la apariencia del badge según el estado del candado de Real Trading."""
@@ -1110,8 +1150,8 @@ class BinanceAccountPage:
         loop = asyncio.get_event_loop()
         use_test = (self.selected_network == "testnet")
         client = BinanceTestnetClient(use_testnet=use_test)
-        ok, err = await loop.run_in_executor(None, lambda: client.cancel_all_futures_orders(symbol="BTCUSDT", use_testnet=use_test))
-        
+        ok, err = await loop.run_in_executor(None, lambda: client.cancel_all_futures_orders_every_symbol(use_testnet=use_test))
+
         ui.notify('🛡️ Candado de seguridad BLOQUEADO a MODO SOLO LECTURA.', type='positive', duration=8000)
         if ok:
             ui.notify('🛑 Órdenes abiertas de Futuros canceladas con éxito.', type='positive', duration=8000)

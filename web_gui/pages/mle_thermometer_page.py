@@ -26,9 +26,9 @@ class MLEThermometerPage:
             # Ejecutamos el cálculo sincrónico en un hilo separado para no bloquear
             data = await run.io_bound(self.thermometer.get_thermometer_value)
             self.last_full_data = data
-            
+            theta = data.get('theta', 50.0)
+
             if hasattr(self, 'mle_gauge'):
-                theta = data.get('theta', 50.0)
                 self.mle_gauge.set_value(theta / 100.0)  # progress usa 0.0 a 1.0
                 
                 # Cambiar color según umbrales activos
@@ -44,12 +44,21 @@ class MLEThermometerPage:
                     color = 'yellow'
                     status = 'Zona Neutral / Rango'
                     status_class = 'text-amber-400'
-                    
+
+                # Si el cálculo falló (APIs caídas) el valor puede ser un neutral (50) de
+                # relleno o un dato obsoleto — no debe presentarse como una lectura real del mercado.
+                if data.get('is_valid') is False:
+                    color = 'grey'
+                    status = '⚠️ SIN DATOS ACTUALIZADOS (fallo de API)'
+                    status_class = 'text-gray-400'
+
                 self.mle_gauge.props(f'color="{color}"')
                 self.mle_value_label.set_text(f"{theta:.1f}%")
                 self.mle_status_badge.set_text(status)
                 self.mle_status_badge.classes(replace=f'text-xs font-bold px-3 py-1 rounded-full border border-slate-700 {status_class} bg-slate-900/80')
                 self.mle_details.set_text(f"Poder Adq: {data.get('n_ssr', 0):.1f} | Velocidad: {data.get('n_inf', 0):.1f} | Apalanc: {data.get('n_lev', 0):.1f}")
+                if data.get('is_valid') is False:
+                    ui.notify(f"⚠️ Termómetro MLE: {data.get('error', 'no se pudo actualizar con datos frescos')}", type='warning')
                 
             btc_hist = data.get('history_btc', pd.Series())
             theta_hist = data.get('history_theta', pd.Series())

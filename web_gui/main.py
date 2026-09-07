@@ -23,6 +23,8 @@ from .pages.mle_thermometer_page import render_mle_thermometer_page
 from .pages.onchain_analyzer_page import render_onchain_analyzer
 from .pages.halving_analyzer_page import render_halving_analyzer
 from .pages.binance_account_page import render_binance_account_page
+from .pages.binance_operations_page import render_binance_operations_page
+from .pages.binance_p2p_page import render_binance_p2p_page
 from .pages.derivatives_analyzer_page import render_derivatives_analyzer_page
 from .pages.options_algo_page import render_options_algo_page
 from .components.api_credentials_dialog import open_api_credentials_dialog
@@ -284,6 +286,8 @@ def create_gui(app):
                 menu_item('Análisis On-Chain', 'currency_exchange', 'onchain')
                 menu_item('Live Monitor', 'play_circle', 'live')
                 menu_item('Cartera & Riesgo Binance', 'account_balance_wallet', 'binance_account')
+                menu_item('Operativa Binance (Spot/Fut)', 'receipt_long', 'binance_operations')
+                menu_item('P2P Binance (Real)', 'handshake', 'binance_p2p')
                 menu_item('Derivados & Futuros', 'query_stats', 'derivatives')
                 menu_item('Opciones & TWAP/POV', 'hub', 'options_algo')
                 
@@ -415,6 +419,12 @@ def create_gui(app):
 
             with ui.column().classes('w-full h-full') as pages['binance_account']:
                 render_binance_account_page()
+
+            with ui.column().classes('w-full h-full') as pages['binance_operations']:
+                render_binance_operations_page()
+
+            with ui.column().classes('w-full h-full') as pages['binance_p2p']:
+                render_binance_p2p_page()
 
             with ui.column().classes('w-full h-full') as pages['derivatives']:
                 render_derivatives_analyzer_page()

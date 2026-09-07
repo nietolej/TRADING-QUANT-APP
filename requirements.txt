@@ -18,3 +18,4 @@ vectorbt
 nicegui
 scikit-learn
 joblib
+mcp

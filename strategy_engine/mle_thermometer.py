@@ -83,6 +83,7 @@ class MLEThermometer:
 
             self.last_theta = theta
             self.last_metrics = {
+                'is_valid': True,
                 'theta': round(theta, 2),
                 'n_ssr': round(n_ssr, 2),
                 'n_inf': round(n_inf, 2),
@@ -106,16 +107,28 @@ class MLEThermometer:
             import traceback
             traceback.print_exc()
             print(f"Error calculando Termómetro MLE: {e}")
-            # Si hay error en la red o APIs, devolver el último conocido o neutral (50)
+            # Si hay error en la red o APIs, devolver el último conocido (marcado como posiblemente
+            # obsoleto) o un neutral (50) EXPLICITAMENTE marcado como invalido, para que la UI no lo
+            # muestre como una lectura real del mercado.
             if not self.last_metrics:
-                return {'theta': 50.0, 'n_ssr': 50.0, 'n_inf': 50.0, 'n_lev': 50.0, 
+                return {'is_valid': False, 'error': str(e), 'theta': 50.0, 'n_ssr': 50.0, 'n_inf': 50.0, 'n_lev': 50.0,
                         'raw_ssr': 0, 'raw_inf': 0, 'raw_lev': 0,
                         'history_theta': pd.Series(), 'history_ssr': pd.Series(), 'history_inf': pd.Series(), 'history_lev': pd.Series(), 'history_btc': pd.Series(),
                         'history_raw_ssr': pd.Series(), 'history_raw_inf': pd.Series(), 'history_raw_lev': pd.Series()}
-            return self.last_metrics
+            stale_metrics = dict(self.last_metrics)
+            stale_metrics['is_valid'] = False
+            stale_metrics['error'] = f"Datos no actualizados (último cálculo exitoso). Error actual: {e}"
+            return stale_metrics
 
     def _fetch_defillama_stablecoins(self):
-        """Descarga el histórico de Market Cap de Stablecoins desde DefiLlama (Gratis)"""
+        """Descarga el histórico de Market Cap de Stablecoins desde DefiLlama (Gratis).
+        Cacheado brevemente porque _calculate_n_ssr/_n_inf/_n_lev lo llaman por separado
+        en cada refresco del termómetro, triplicando innecesariamente la misma petición."""
+        cached = getattr(self, '_defillama_cache', None)
+        cached_at = getattr(self, '_defillama_cache_at', None)
+        if cached is not None and cached_at and (datetime.now() - cached_at).total_seconds() < 300:
+            return cached
+
         url = "https://stablecoins.llama.fi/stablecoincharts/all"
         resp = requests.get(url)
         if resp.status_code == 200:
@@ -124,6 +137,8 @@ class MLEThermometer:
             df['date'] = pd.to_datetime(df['date'].astype(int), unit='s')
             df.set_index('date', inplace=True)
             mc = df['totalCirculatingUSD'].apply(lambda x: x.get('peggedUSD', 0) if isinstance(x, dict) else 0)
+            self._defillama_cache = mc
+            self._defillama_cache_at = datetime.now()
             return mc
         return pd.Series()
 

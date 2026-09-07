@@ -147,11 +147,12 @@ def create_bot(req: CreateBotRequest):
             currency=req.currency,
             custom_parameters=req.custom_parameters,
             use_testnet=req.use_testnet,
-            custom_timeframe=req.custom_timeframe,
-            custom_symbol=req.custom_symbol,
+            timeframe=req.custom_timeframe,
+            symbol=req.custom_symbol,
             name=req.name,
-            auto_start=req.auto_start
         )
+        if req.auto_start and not new_bot.is_running:
+            new_bot.start()
         logger.info("Bot creado exitosamente en daemon: %s (ID: %s)", new_bot.name, new_bot.bot_id)
         return new_bot.to_dict()
     except Exception as e:

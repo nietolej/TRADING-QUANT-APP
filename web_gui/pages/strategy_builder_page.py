@@ -163,17 +163,31 @@ def render_strategy_builder():
             strategy_names.append(state['strategy_name'])
 
         def save_strategy():
-            def _cast_param(v, t):
+            validation_error = _validate_strategy_config(state)
+            if validation_error:
+                ui.notify(f"⚠️ {validation_error}", type='warning', icon='warning')
+                return
+
+            invalid_params = []
+
+            def _cast_param(name, v, t):
                 try:
                     if t == 'Entero': return int(float(v))
                     if t == 'Decimal' or t == '%': return float(v)
                     if t == 'Lógico': return str(v).lower() in ['true', '1', 'yes', 't', 'verdadero', 'v']
-                except:
-                    pass
+                except (TypeError, ValueError):
+                    invalid_params.append(f"{name} ({t}): valor '{v}' no es válido")
                 return v
 
-            params_dict = {p['name']: _cast_param(p['value'], p.get('type', 'Decimal')) for p in state['parameters'] if p['name']}
-            
+            params_dict = {p['name']: _cast_param(p['name'], p['value'], p.get('type', 'Decimal')) for p in state['parameters'] if p['name']}
+
+            if invalid_params:
+                ui.notify(
+                    "⚠️ Parámetro(s) con valor inválido para su tipo: " + "; ".join(invalid_params) + ". Corrígelos antes de guardar.",
+                    type='warning', icon='warning', timeout=8000
+                )
+                return
+
             def _parse_val_local(v):
                 if not v: return 0
                 try:
@@ -265,11 +279,6 @@ def render_strategy_builder():
                 }
             }
             
-            validation_error = _validate_strategy_config(state)
-            if validation_error:
-                ui.notify(f"⚠️ {validation_error}", type='warning', icon='warning')
-                return
-
             filename = _strategy_filepath(state['strategy_name'])
             os.makedirs(os.path.dirname(filename), exist_ok=True)
             try:
@@ -940,6 +949,15 @@ def render_strategy_builder():
                     def delete_strategy(e):
                         row = e.args
                         strategy_name = row['name']
+                        with ui.dialog() as confirm_dlg, ui.card().classes('p-6 rounded-2xl gap-3'):
+                            ui.label(f"¿Eliminar la estrategia '{strategy_name}'?").classes('text-base font-bold')
+                            ui.label('Esta acción borra el archivo YAML de forma permanente y no se puede deshacer.').classes('text-sm text-slate-500')
+                            with ui.row().classes('w-full justify-end gap-2 mt-2'):
+                                ui.button('Cancelar', on_click=confirm_dlg.close).props('flat')
+                                ui.button('Eliminar', on_click=lambda: (confirm_dlg.close(), _do_delete_strategy(strategy_name))).classes('bg-red-600 hover:bg-red-500 text-white font-bold')
+                        confirm_dlg.open()
+
+                    def _do_delete_strategy(strategy_name):
                         matched_file = None
                         for f_path in glob.glob(os.path.join(STRATEGIES_DIR, '*.yaml')):
                             try:

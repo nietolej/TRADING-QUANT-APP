@@ -10,6 +10,7 @@ import logging
 import asyncio
 import random
 import time
+import requests
 from typing import Dict, Any, List, Optional, Callable
 from datetime import datetime
 
@@ -100,15 +101,33 @@ class AlgoExecutionEngine:
         return self._testnet_client
 
     def get_current_price(self, symbol: str) -> float:
-        """Obtiene precio actual de mercado."""
+        """Obtiene precio actual de mercado real para el simbolo dado. Si no hay credenciales
+        configuradas (modo Simulacion sin cliente autenticado), usa el endpoint publico de
+        Binance Futures (sin autenticacion) para el simbolo pedido, en vez de un precio de
+        BTC hardcodeado que produciria VWAP/slippage irreales para otros pares (ETH, SOL, etc.)."""
+        binance_symbol = symbol.replace("/", "").upper()
         try:
             if self.testnet_client:
-                price = self.testnet_client.get_symbol_price(symbol)
+                price = self.testnet_client.get_symbol_price(binance_symbol)
                 if price and price > 0:
                     return price
-            return 80000.0
         except Exception:
-            return 80000.0
+            pass
+
+        try:
+            resp = requests.get(
+                "https://fapi.binance.com/fapi/v1/ticker/price",
+                params={"symbol": binance_symbol},
+                timeout=5
+            )
+            if resp.status_code == 200:
+                price = float(resp.json().get("price", 0.0))
+                if price > 0:
+                    return price
+        except Exception as e:
+            logger.warning("No se pudo obtener precio publico de %s: %s", binance_symbol, e)
+
+        return 0.0
 
     async def execute_twap_async(
         self,
@@ -140,6 +159,13 @@ class AlgoExecutionEngine:
     async def _run_twap_loop(self, task: AlgoExecutionTask):
         """Bucle de ejecución no bloqueante de TWAP."""
         task.arrival_price = self.get_current_price(task.symbol)
+        if task.arrival_price <= 0:
+            task.status = "ERROR"
+            task.error_message = f"No se pudo obtener el precio de mercado de {task.symbol}. Ejecución TWAP abortada."
+            logger.error(task.error_message)
+            if task.status_callback:
+                task.status_callback(task)
+            return
         total_sec = task.duration_minutes * 60.0
         interval_sec = max(2.0, total_sec / task.num_slices)
         base_slice_qty = task.total_quantity / task.num_slices

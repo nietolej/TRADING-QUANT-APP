@@ -11,7 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timezone
-from nicegui import ui, background_tasks
+from nicegui import ui, run, background_tasks
 from data_layer.halving_analyzer import BTCHalvingAnalyzer, HALVING_EVENTS
 from data_layer.stablecoin_backtester import StablecoinBacktester
 
@@ -1172,12 +1172,20 @@ def render_halving_analyzer():
 
         def render_growth_tab():
             growth_container.clear()
-            growth_data = analyzer.calculate_periodic_growth_analysis(
-                timeframe=growth_state["timeframe"],
-                step_size=growth_state["step_size"],
-                max_days=growth_state["max_days"],
-                asset_type=growth_state.get("asset_type", "btc")
-            )
+            try:
+                growth_data = analyzer.calculate_periodic_growth_analysis(
+                    timeframe=growth_state["timeframe"],
+                    step_size=growth_state["step_size"],
+                    max_days=growth_state["max_days"],
+                    asset_type=growth_state.get("asset_type", "btc")
+                )
+            except Exception as ex:
+                with growth_container:
+                    with ui.card().classes('w-full bg-[#111827] border border-amber-500/30 p-6 rounded-xl text-center mt-3'):
+                        ui.icon('warning', size='2rem', color='amber')
+                        ui.label('No se pudo calcular el análisis de crecimiento periódico').classes('text-sm font-bold text-white mt-2')
+                        ui.label(f'{ex}').classes('text-xs text-slate-400 mt-1 font-mono')
+                return
 
             periods = growth_data.get("periods", [])
             summary = growth_data.get("summary", {})
@@ -1369,19 +1377,27 @@ def render_halving_analyzer():
 
         def render_stables_tab():
             stables_container.clear()
-            stables_kpis = analyzer.calculate_stablecoin_summary_kpis()
-            stables_data = analyzer.calculate_periodic_growth_analysis(
-                timeframe=stables_state["timeframe"],
-                step_size=stables_state["step_size"],
-                max_days=stables_state["max_days"],
-                asset_type="stablecoins"
-            )
-            btc_data = analyzer.calculate_periodic_growth_analysis(
-                timeframe=stables_state["timeframe"],
-                step_size=stables_state["step_size"],
-                max_days=stables_state["max_days"],
-                asset_type="btc"
-            )
+            try:
+                stables_kpis = analyzer.calculate_stablecoin_summary_kpis()
+                stables_data = analyzer.calculate_periodic_growth_analysis(
+                    timeframe=stables_state["timeframe"],
+                    step_size=stables_state["step_size"],
+                    max_days=stables_state["max_days"],
+                    asset_type="stablecoins"
+                )
+                btc_data = analyzer.calculate_periodic_growth_analysis(
+                    timeframe=stables_state["timeframe"],
+                    step_size=stables_state["step_size"],
+                    max_days=stables_state["max_days"],
+                    asset_type="btc"
+                )
+            except Exception as ex:
+                with stables_container:
+                    with ui.card().classes('w-full bg-[#111827] border border-amber-500/30 p-6 rounded-xl text-center mt-3'):
+                        ui.icon('warning', size='2rem', color='amber')
+                        ui.label('No se pudo calcular el análisis de Stablecoins').classes('text-sm font-bold text-white mt-2')
+                        ui.label(f'{ex}').classes('text-xs text-slate-400 mt-1 font-mono')
+                return
 
             periods = stables_data.get("periods", [])
             summary = stables_data.get("summary", {})
@@ -1895,7 +1911,15 @@ def render_halving_analyzer():
 
         def render_horizons_tab():
             horizons_container.clear()
-            metrics = analyzer.calculate_cycle_metrics()
+            try:
+                metrics = analyzer.calculate_cycle_metrics()
+            except Exception as ex:
+                with horizons_container:
+                    with ui.card().classes('w-full bg-[#111827] border border-amber-500/30 p-6 rounded-xl text-center mt-3'):
+                        ui.icon('warning', size='2rem', color='amber')
+                        ui.label('No se pudieron calcular las métricas por horizonte').classes('text-sm font-bold text-white mt-2')
+                        ui.label(f'{ex}').classes('text-xs text-slate-400 mt-1 font-mono')
+                return
 
             with horizons_container:
                 with ui.card().classes('w-full bg-[#111827] border border-[#1e293b] p-5 rounded-xl mt-3'):
@@ -1963,7 +1987,15 @@ def render_halving_analyzer():
 
         def render_correlation_tab():
             corr_container.clear()
-            corrs = analyzer.calculate_correlation_matrix()
+            try:
+                corrs = analyzer.calculate_correlation_matrix()
+            except Exception as ex:
+                with corr_container:
+                    with ui.card().classes('w-full bg-[#111827] border border-amber-500/30 p-6 rounded-xl text-center mt-3'):
+                        ui.icon('warning', size='2rem', color='amber')
+                        ui.label('No se pudo calcular la matriz de correlación').classes('text-sm font-bold text-white mt-2')
+                        ui.label(f'{ex}').classes('text-xs text-slate-400 mt-1 font-mono')
+                return
 
             with corr_container:
                 with ui.row().classes('w-full grid grid-cols-1 lg:grid-cols-2 gap-4 mt-3'):
@@ -2022,8 +2054,16 @@ def render_halving_analyzer():
 
         def render_decay_tab():
             decay_container.clear()
-            decay_data = analyzer.calculate_diminishing_returns_model()
-            metrics = analyzer.calculate_cycle_metrics()
+            try:
+                decay_data = analyzer.calculate_diminishing_returns_model()
+                metrics = analyzer.calculate_cycle_metrics()
+            except Exception as ex:
+                with decay_container:
+                    with ui.card().classes('w-full bg-[#111827] border border-amber-500/30 p-6 rounded-xl text-center mt-3'):
+                        ui.icon('warning', size='2rem', color='amber')
+                        ui.label('No se pudo calcular el modelo de rendimientos decrecientes').classes('text-sm font-bold text-white mt-2')
+                        ui.label(f'{ex}').classes('text-xs text-slate-400 mt-1 font-mono')
+                return
 
             with decay_container:
                 with ui.row().classes('w-full grid grid-cols-1 lg:grid-cols-2 gap-4 mt-3'):
@@ -2034,7 +2074,7 @@ def render_halving_analyzer():
                         ui.label('Múltiplo máximo alcanzado en cada ciclo de Halving vs modelo exponencial de maduración de mercado.').classes('text-xs text-slate-400 mb-3')
 
                         completed_m = [m for m in metrics if m["is_completed"]]
-                        cycles = [1, 2, 3]
+                        cycles = list(range(1, len(completed_m) + 1))
                         mults = [m["peak_multiplier"] for m in completed_m]
 
                         fig_decay = go.Figure()
@@ -2048,7 +2088,7 @@ def render_halving_analyzer():
                             text=[f"<b>{m:.1f}x</b>" for m in mults],
                             textposition='top right',
                             textfont=dict(family='JetBrains Mono', color='#ffffff', size=12),
-                            marker=dict(size=12, color=['#38bdf8', '#a855f7', '#10b981'], symbol='circle')
+                            marker=dict(size=12, color=(['#38bdf8', '#a855f7', '#10b981', '#ec4899', '#f59e0b'] * 2)[:len(cycles)], symbol='circle')
                         ))
 
                         # Curva ajustada y proyección a Ciclo 4
@@ -2119,7 +2159,15 @@ def render_halving_analyzer():
 
         def render_table_tab():
             table_container.clear()
-            metrics = analyzer.calculate_cycle_metrics()
+            try:
+                metrics = analyzer.calculate_cycle_metrics()
+            except Exception as ex:
+                with table_container:
+                    with ui.card().classes('w-full bg-[#111827] border border-amber-500/30 p-6 rounded-xl text-center mt-3'):
+                        ui.icon('warning', size='2rem', color='amber')
+                        ui.label('No se pudo calcular la tabla comparativa de Halvings').classes('text-sm font-bold text-white mt-2')
+                        ui.label(f'{ex}').classes('text-xs text-slate-400 mt-1 font-mono')
+                return
 
             with table_container:
                 with ui.card().classes('w-full bg-[#111827] border border-[#1e293b] p-5 rounded-xl mt-3 overflow-x-auto'):
@@ -2214,6 +2262,36 @@ def render_halving_analyzer():
                     )
                 )
                 
+                # Invalidar el cache del backtest para que se recalcule con los datos recien
+                # sincronizados, en vez de reusar 'last_results' calculado antes del refresh.
+                # Se recalcula aqui mismo via run.io_bound (en un hilo aparte) para no bloquear
+                # el event loop de NiceGUI; render_backtest_tab() vera 'last_results' ya listo.
+                try:
+                    bt_state["last_results"] = await run.io_bound(
+                        lambda: bt_engine.run_backtest(
+                            initial_capital=bt_state["initial_capital"],
+                            commission_pct=bt_state["commission_pct"],
+                            slippage_pct=bt_state["slippage_pct"],
+                            ema_fast=bt_state["ema_fast"],
+                            ema_slow=bt_state["ema_slow"],
+                            ema_trend=bt_state["ema_trend"],
+                            trend_mode=bt_state["trend_mode"],
+                            flow_window=bt_state["flow_window"],
+                            z_window=bt_state["z_window"],
+                            z_entry_threshold=bt_state["z_entry_threshold"],
+                            z_exit_threshold=bt_state["z_exit_threshold"],
+                            halving_filter_enabled=bt_state["halving_filter_enabled"],
+                            min_post_halving_days=bt_state["min_post_halving_days"],
+                            max_post_halving_days=bt_state["max_post_halving_days"],
+                            stop_loss_pct=bt_state["stop_loss_pct"],
+                            take_profit_pct=bt_state["take_profit_pct"],
+                            trailing_stop=bt_state["trailing_stop"]
+                        )
+                    )
+                except Exception as bt_err:
+                    print(f"Error recalculando backtest de Halving tras refresh: {bt_err}")
+                    bt_state["last_results"] = None
+
                 # Re-renderizar todos los componentes
                 render_kpi_cards()
                 render_main_chart()

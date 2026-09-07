@@ -1599,6 +1599,10 @@ def render_optimizer_page(on_go_to_analyzer=None):
             ''')
 
         async def _run_walk_forward_ui():
+            if state.get('is_running'):
+                ui.notify('Ya hay una optimización en curso (Grid Search o Walk-Forward). Espera a que termine.', type='warning')
+                return
+
             file_path = strategies.get(state['strategy_name'])
             if not file_path or not opt_ranges:
                 ui.notify('Primero configure la estrategia y rangos de parámetros.', type='warning')
@@ -1607,8 +1611,11 @@ def render_optimizer_page(on_go_to_analyzer=None):
             n_splits_val = int(wf_n_splits.value or 5)
             is_pct_val = float((wf_is_pct.value or 70)) / 100.0
 
+            cancel_token['event'] = threading.Event()
+            state['is_running'] = True
             btn_wf.set_text('⏳ Ejecutando Walk-Forward...')
             btn_wf.props('disabled')
+            btn_cancel_opt.set_visibility(True)
 
             try:
                 start_dt = parse_flexible_date(state.get('start_date', '01/01/20'), default=datetime(2020, 1, 1, tzinfo=timezone.utc))
@@ -1640,8 +1647,13 @@ def render_optimizer_page(on_go_to_analyzer=None):
                         optimize_metric=metric_key,
                         commission_pct=comm_pct,
                         slippage_pct=slip_pct,
+                        cancel_event=cancel_token['event'],
                     )
                 )
+
+                if cancel_token['event'] and cancel_token['event'].is_set():
+                    ui.notify('🛑 Walk-Forward cancelado por el usuario.', type='warning')
+                    return
 
                 if wf_result.get('error'):
                     ui.notify(f"Walk-Forward error: {wf_result['error']}", type='negative')
@@ -1690,8 +1702,10 @@ def render_optimizer_page(on_go_to_analyzer=None):
             except Exception as wf_ex:
                 ui.notify(f"Error en Walk-Forward: {wf_ex}", type='negative')
             finally:
+                state['is_running'] = False
                 btn_wf.set_text('🔄 WALK-FORWARD')
                 btn_wf.props(remove='disabled')
+                btn_cancel_opt.set_visibility(False)
 
     return {
         'state': state,

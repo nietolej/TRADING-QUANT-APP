@@ -5,6 +5,7 @@ Diseño Bloomberg Obsidian Edition con panel flotante colapsable.
 """
 
 import json
+import re
 import asyncio
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -20,6 +21,14 @@ from api.mcp.binance_mcp_server import (
     binance_cancel_all_orders,
     binance_get_daily_trades,
 )
+
+
+def _has_word(text: str, words: List[str]) -> bool:
+    """Coincidencia que exige un limite de palabra al INICIO de cada termino (evita falsos
+    positivos como "descuentas" activando la palabra clave "cuenta" a mitad de palabra),
+    pero deja el final abierto para seguir cubriendo raices/conjugaciones intencionales
+    como "ejecutad" -> "ejecutada"/"ejecutado"/"ejecutados"."""
+    return any(re.search(r'\b' + re.escape(w), text) for w in words)
 
 
 class QuantCopilotChat:
@@ -194,7 +203,7 @@ class QuantCopilotChat:
 
         try:
             # 1. Saldo y Balances
-            if any(w in q_lower for w in ["saldo", "balance", "margen", "fondos", "cuenta", "ceunta", "capital", "dinero", "tengo", "plata"]):
+            if _has_word(q_lower, ["saldo", "balance", "margen", "fondos", "cuenta", "ceunta", "capital", "dinero", "tengo", "plata"]):
                 raw = await loop.run_in_executor(None, lambda: binance_get_account_balance(use_testnet=True))
                 data = json.loads(raw)
                 if data.get("success"):
@@ -224,7 +233,7 @@ class QuantCopilotChat:
                 ]
 
             # 2. Operaciones y Trades Ejecutados (Hoy o Recientes)
-            elif any(w in q_lower for w in ["operacion", "operaciones", "trades", "hice", "hecho", "cuantas", "historial", "ejecutad"]):
+            elif _has_word(q_lower, ["operacion", "operaciones", "trades", "hice", "hecho", "cuantas", "historial", "ejecutad"]):
                 raw = await loop.run_in_executor(None, lambda: binance_get_daily_trades(symbol="BTCUSDT", use_testnet=True))
                 data = json.loads(raw)
                 if data.get("success"):
@@ -255,7 +264,7 @@ class QuantCopilotChat:
                 ]
 
             # 3. Posiciones Abiertas
-            elif any(w in q_lower for w in ["posicion", "posiciones", "abiertas", "contratos"]):
+            elif _has_word(q_lower, ["posicion", "posiciones", "abiertas", "contratos"]):
                 raw = await loop.run_in_executor(None, lambda: binance_get_positions(use_testnet=True))
                 data = json.loads(raw)
                 if data.get("success"):
@@ -283,7 +292,7 @@ class QuantCopilotChat:
                 ]
 
             # 3. Diagnóstico Cuantitativo y VaR de Riesgo
-            elif any(w in q_lower for w in ["riesgo", "var", "cvar", "estres", "salud", "drawdown", "caida"]):
+            elif _has_word(q_lower, ["riesgo", "var", "cvar", "estres", "salud", "drawdown", "caida"]):
                 raw = await loop.run_in_executor(None, lambda: binance_analyze_portfolio_risk(use_testnet=True))
                 data = json.loads(raw)
                 if data.get("success"):
@@ -315,7 +324,7 @@ class QuantCopilotChat:
                 ]
 
             # 4. Precio de Mercado y Funding Rate
-            elif any(w in q_lower for w in ["precio", "cotizacion", "funding", "tasa", "btc", "eth", "sol"]):
+            elif _has_word(q_lower, ["precio", "cotizacion", "funding", "tasa", "btc", "eth", "sol"]):
                 sym = "BTCUSDT"
                 if "eth" in q_lower:
                     sym = "ETHUSDT"
@@ -344,7 +353,7 @@ class QuantCopilotChat:
                 ]
 
             # 5. Cancelación de Órdenes
-            elif any(w in q_lower for w in ["cancelar", "cancela", "cerrar ordenes", "limpiar"]):
+            elif _has_word(q_lower, ["cancelar", "cancela", "cerrar ordenes", "limpiar"]):
                 raw = await loop.run_in_executor(None, lambda: binance_cancel_all_orders(symbol="BTCUSDT", use_testnet=True))
                 data = json.loads(raw)
                 if data.get("success"):
@@ -357,7 +366,7 @@ class QuantCopilotChat:
                 ]
 
             # 6. Preguntas educativas o de funcionamiento de la plataforma
-            elif any(w in q_lower for w in ["que es", "como funciona", "ayuda", "mle", "halving", "sharpe", "sortino"]):
+            elif _has_word(q_lower, ["que es", "como funciona", "ayuda", "mle", "halving", "sharpe", "sortino"]):
                 reply_text = (
                     "💡 **Guía de la Plataforma Cuantitativa:**\n\n"
                     "• **Value at Risk (VaR 95%):** Máxima pérdida estimada a 1 día con 95% de confianza estadística.\n"
