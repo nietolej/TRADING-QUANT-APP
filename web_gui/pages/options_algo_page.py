@@ -484,6 +484,11 @@ class OptionsAlgoPage:
             self.algo_status_badge.props('color=emerald-800')
             self.btn_cancel_algo.set_visibility(False)
             self.btn_start_algo.set_visibility(True)
+        elif task.status == "COMPLETED_WITH_ERRORS":
+            self.algo_status_badge.set_text(f'COMPLETADO CON ERRORES ⚠️ ({task.failed_slices} tajadas fallidas)')
+            self.algo_status_badge.props('color=amber-800')
+            self.btn_cancel_algo.set_visibility(False)
+            self.btn_start_algo.set_visibility(True)
 
     def _empty_fig(self, text: str) -> go.Figure:
         fig = go.Figure()

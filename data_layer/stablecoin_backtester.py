@@ -94,7 +94,11 @@ class StablecoinBacktester:
             ).sort_values('timestamp').reset_index(drop=True)
 
             merged.drop(columns=['date_only'], inplace=True, errors='ignore')
-            merged['stables_mcap'] = merged['stables_mcap'].ffill().bfill()
+            # Solo ffill: bfill rellenaría un gap con el primer valor FUTURO conocido de la
+            # serie (look-ahead), aunque aquí el merge sea 'inner' y el riesgo sea menor que
+            # en un left-join, un hueco interno de la serie de stablecoins no debe rellenarse
+            # con un dato que en ese momento aún no existía.
+            merged['stables_mcap'] = merged['stables_mcap'].ffill()
             self.df_merged = merged
             logger.info(f"StablecoinBacktester: {len(self.df_merged)} registros diarios cargados con éxito.")
         except Exception as e:

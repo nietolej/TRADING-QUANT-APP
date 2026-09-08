@@ -121,8 +121,13 @@ class ConditionEvaluator:
             
             # Aproximación del lookback asumiendo datos diarios para on-chain
             past_val = df[metric].shift(lookback_days)
-            pct_change = (df[metric] - past_val) / past_val * 100
-            return pct_change > min_change_pct
+            # Si past_val es 0 (o NaN por estar al inicio de la serie), la división genera
+            # +/-inf o NaN. inf > min_change_pct evalúa True, disparando una señal de
+            # "incremento" falsa que no representa un cambio real. Esas filas deben quedar
+            # sin señal (False), no un comparador silenciosamente engañado por -inf/inf.
+            pct_change = (df[metric] - past_val) / past_val.replace(0, np.nan) * 100
+            pct_change = pct_change.replace([np.inf, -np.inf], np.nan)
+            return (pct_change > min_change_pct).fillna(False)
             
         return pd.Series(False, index=df.index)
 

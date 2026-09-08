@@ -106,15 +106,36 @@ class StablecoinEmissionEMAStrategy(BaseStrategy):
             if stables_df is not None and not stables_df.empty:
                 # Merge con tolerancia de fecha
                 df['date_only'] = df['timestamp'].dt.floor('D')
+                stables_df = stables_df.sort_values('timestamp').copy()
                 stables_df['date_only'] = stables_df['timestamp'].dt.floor('D')
+                # Lag de 1 día: proveedores tipo CoinGecko/DefiLlama publican el market cap
+                # "de hoy" con retraso (snapshot de cierre de día, no garantizado disponible
+                # desde la primera vela de ese mismo día). Usar shift(1) asegura que el valor
+                # unido es el del día anterior — el único garantizado como ya conocido.
+                stables_df['stables_mcap'] = stables_df['stables_mcap'].shift(1)
                 merged_s = pd.merge(
                     df[['date_only']],
                     stables_df[['date_only', 'stables_mcap']],
                     on='date_only',
                     how='left'
                 )
-                df['stables_mcap'] = merged_s['stables_mcap'].ffill().bfill()
+                # Solo ffill (arrastra el último valor conocido en días sin dato, ej. fines
+                # de semana). NUNCA bfill: eso rellenaría el tramo inicial del histórico
+                # (antes de que exista el primer dato on-chain real) con el primer valor
+                # FUTURO conocido de la serie — un look-ahead bias que invalidaría cualquier
+                # señal generada en ese tramo.
+                df['stables_mcap'] = merged_s['stables_mcap'].ffill()
                 df.drop(columns=['date_only'], inplace=True, errors='ignore')
+
+                # Recortar el backtest a partir de la primera fecha con dato real: antes de
+                # eso no hay ninguna señal on-chain válida posible.
+                first_valid = df['stables_mcap'].first_valid_index()
+                if first_valid is not None and first_valid != df.index[0]:
+                    logger.info(
+                        "StablecoinEmissionEMAStrategy: recortando barras iniciales (antes de %s) "
+                        "sin dato on-chain real disponible.", first_valid
+                    )
+                    df = df.loc[first_valid:].copy()
             else:
                 logger.warning("Datos de Stablecoins no disponibles; usando serie aproximada.")
                 df['stables_mcap'] = 1e9

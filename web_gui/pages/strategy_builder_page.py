@@ -561,7 +561,25 @@ def render_strategy_builder():
                             sl_desc_label = ui.label(SL_EXPLANATIONS.get(state['sl_type'], '')).classes(
                                 'text-xs text-rose-300/90 bg-rose-950/40 p-2.5 rounded-lg border border-rose-800/40 w-full mb-3 leading-relaxed'
                             )
-                            
+
+                            # Tipos de SL que el backtest recalcula vela a vela (trailing/break-even/
+                            # chandelier) pero que el motor de ejecución EN VIVO/paper aún NO implementa:
+                            # el SL se fija una sola vez al abrir y no se vuelve a mover. Pendiente de
+                            # analizar/implementar en execution_engine/paper_trader.py.
+                            _LIVE_UNSUPPORTED_SL_TYPES = {'trailing_percent', 'break_even', 'chandelier'}
+                            with ui.row().classes(
+                                'items-start gap-2 bg-amber-950/50 border border-amber-700/50 rounded-lg p-2.5 w-full mb-3'
+                            ) as sl_live_warning_row:
+                                ui.icon('warning', size='1.1rem').classes('text-amber-400 mt-0.5')
+                                ui.label(
+                                    '⚠️ RIESGO EN VIVO: este tipo de Stop Loss es dinámico (trailing/break-even/'
+                                    'chandelier) y el backtest SÍ lo recalcula vela a vela, pero el motor de '
+                                    'ejecución en vivo/paper todavía NO lo implementa — el SL queda fijo en el '
+                                    'nivel inicial durante todo el trade real. El bot alertará al arrancar si '
+                                    'detecta esta configuración. [Pendiente de analizar/implementar]'
+                                ).classes('text-[11px] text-amber-200 leading-relaxed flex-1')
+                            sl_live_warning_row.set_visibility(state['sl_type'] in _LIVE_UNSUPPORTED_SL_TYPES)
+
                             def _on_sl_type_change(e):
                                 val = e.value if hasattr(e, 'value') else e
                                 sl_desc_label.set_text(SL_EXPLANATIONS.get(val, ''))
@@ -572,7 +590,8 @@ def render_strategy_builder():
                                 sl_atr_row.set_visibility(val == 'atr')
                                 sl_chan_row.set_visibility(val == 'chandelier')
                                 sl_swing_row.set_visibility(val == 'swing')
-                            
+                                sl_live_warning_row.set_visibility(val in _LIVE_UNSUPPORTED_SL_TYPES)
+
                             sl_type_select.on_value_change(_on_sl_type_change)
 
                             # Campos Contextuales SL

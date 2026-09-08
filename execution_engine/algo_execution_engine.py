@@ -57,6 +57,8 @@ class AlgoExecutionTask:
         self.completed_at: Optional[datetime] = None
         self.error_message: Optional[str] = None
         self._is_cancelled = False
+        self.failed_slices = 0
+        self.failed_quantity = 0.0
 
     @property
     def progress_pct(self) -> float:
@@ -194,13 +196,15 @@ class AlgoExecutionEngine:
 
             current_price = self.get_current_price(task.symbol)
             fill_price = current_price
+            slice_filled = True
 
             # Si es modo testnet, enviar orden real
             if task.mode == "BINANCE_TESTNET":
-                try:
-                    if not self.testnet_client:
-                        logger.warning("Cliente Binance no disponible para tajada %d TWAP Testnet", i+1)
-                    else:
+                if not self.testnet_client:
+                    logger.warning("Cliente Binance no disponible para tajada %d TWAP Testnet", i+1)
+                    slice_filled = False
+                else:
+                    try:
                         order, err = self.testnet_client.place_futures_order(
                             symbol=task.symbol,
                             side=task.side,
@@ -208,19 +212,30 @@ class AlgoExecutionEngine:
                             order_type="MARKET",
                             verify_execution=True
                         )
-                        if err:
+                        if err or not order:
                             logger.warning("Fallo en tajada %d TWAP Testnet: %s", i+1, err)
-                        if order and order.get("avgPrice"):
+                            slice_filled = False
+                        elif order.get("avgPrice"):
                             fill_price = float(order.get("avgPrice"))
-                except Exception as e:
-                    logger.error("Error enviando tajada a Binance: %s", e)
+                    except Exception as e:
+                        logger.error("Error enviando tajada a Binance: %s", e)
+                        slice_filled = False
 
-            # Actualizar estadísticas de ejecución
-            cost = slice_qty * fill_price
-            task.total_cost_usd += cost
-            task.executed_quantity += slice_qty
-            remaining_qty = max(0.0, remaining_qty - slice_qty)
-            task.executed_vwap = task.total_cost_usd / task.executed_quantity if task.executed_quantity > 0 else fill_price
+            # Actualizar estadísticas de ejecución.
+            # Antes se contaba la tajada como ejecutada aunque la orden real hubiese sido
+            # rechazada/fallida en el exchange, inflando executed_quantity con precio de
+            # mercado simulado y dejando que la tarea terminara marcada COMPLETED aunque
+            # una parte real de la cantidad nunca se ejecutó.
+            if slice_filled:
+                cost = slice_qty * fill_price
+                task.total_cost_usd += cost
+                task.executed_quantity += slice_qty
+                remaining_qty = max(0.0, remaining_qty - slice_qty)
+                task.executed_vwap = task.total_cost_usd / task.executed_quantity if task.executed_quantity > 0 else fill_price
+            else:
+                task.failed_slices += 1
+                task.failed_quantity += slice_qty
+                remaining_qty = max(0.0, remaining_qty - slice_qty)
             task.slices_completed += 1
 
             slice_record = {
@@ -228,6 +243,7 @@ class AlgoExecutionEngine:
                 "timestamp": datetime.now().strftime("%H:%M:%S"),
                 "quantity": slice_qty,
                 "price": fill_price,
+                "status": "FILLED" if slice_filled else "FAILED",
                 "accum_vwap": round(task.executed_vwap, 2),
                 "progress_pct": task.progress_pct
             }
@@ -247,7 +263,15 @@ class AlgoExecutionEngine:
             await asyncio.sleep(sleep_time)
 
         if not task._is_cancelled:
-            task.status = "COMPLETED"
+            if task.failed_slices > 0:
+                task.status = "COMPLETED_WITH_ERRORS"
+                task.error_message = (
+                    f"{task.failed_slices} de {task.slices_completed} tajadas fallaron "
+                    f"en el exchange ({task.failed_quantity:.6f} {task.symbol} no ejecutados)."
+                )
+                logger.warning("TWAP %s finalizado con errores: %s", task.task_id, task.error_message)
+            else:
+                task.status = "COMPLETED"
             task.completed_at = datetime.now()
 
         if task.task_id in self.active_tasks:

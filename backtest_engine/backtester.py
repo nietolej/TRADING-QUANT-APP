@@ -16,7 +16,7 @@ class Backtester:
         account_mode: str = "spot_cash",
         leverage: float = 1.0,
         initial_base_capital: float = None,
-        entry_on_next_open: bool = False
+        entry_on_next_open: bool = True
     ):
         self.strategy = strategy
         self.initial_capital = initial_capital
@@ -25,8 +25,11 @@ class Backtester:
         self.account_mode = account_mode  # "spot_cash" | "coin_margined_hold"
         self.leverage = float(leverage) if leverage else 1.0
         self.initial_base_capital = initial_base_capital
-        self.entry_on_next_open = entry_on_next_open  # Si True: entra al Open de la vela siguiente (más realista)
-        self.use_vectorbt = (account_mode == "spot_cash")  # Flag to use vectorized backtesting by default
+        self.entry_on_next_open = entry_on_next_open  # Si True (default, realista): entra al Open de la vela siguiente
+        # run_vectorized (vectorbt) no soporta entry_on_next_open: siempre entra al close de la
+        # misma vela que genero la señal (look-ahead). Solo se usa cuando el propio usuario
+        # desactiva explicitamente el modo realista, aceptando ese sesgo a cambio de velocidad.
+        self.use_vectorbt = (account_mode == "spot_cash") and not entry_on_next_open
 
     def run_vectorized(self, df: pd.DataFrame) -> dict:
         """
@@ -158,12 +161,36 @@ class Backtester:
         entry_price = 0.0
         sl_price = 0.0
         tp_price = 0.0
+        liq_price = None   # Precio de liquidación forzosa (solo coin_margined_hold apalancado)
+        entry_margin = 0.0  # Margen (en quote) comprometido en la posición apalancada actual
         current_trade = {}
         pending_entry_side = None   # 'long' | 'short' | None — señal pendiente para entrar al Open siguiente
         
         trades = []
         equity = []
-        
+
+        def _leverage_cap_and_liq(qty, entry_p, effective_cap, side):
+            """Solo coin_margined_hold: antes no existia ningun tope de tamaño de posicion
+            ni de riesgo de margen (a diferencia del modo spot, que si limita qty al capital
+            disponible) — con leverage alto y una vela adversa, capital/hold_balance podian
+            volverse negativos sin que el motor lo detectara como cuenta liquidada. Ahora:
+            1) limita qty al notional maximo que el margen (effective_cap) soporta con el
+               apalancamiento configurado, y
+            2) calcula un precio de liquidacion isolated-margin aproximado (ignora fees y el
+               buffer de margen de mantenimiento real del exchange, por lo que es conservador:
+               en la practica un exchange real liquidaria un poco antes que este precio)."""
+            if entry_p <= 0 or self.leverage <= 0:
+                return qty, 0.0, None
+            max_notional = effective_cap * self.leverage
+            if qty * entry_p > max_notional:
+                qty = max_notional / entry_p
+            margin = (qty * entry_p) / self.leverage
+            if side == 'long':
+                liq_p = entry_p * (1.0 - 1.0 / self.leverage)
+            else:
+                liq_p = entry_p * (1.0 + 1.0 / self.leverage)
+            return qty, margin, liq_p
+
         for i in range(len(df)):
             row = df.iloc[i]
             timestamp = df.index[i] if isinstance(df.index, pd.DatetimeIndex) else i
@@ -194,24 +221,26 @@ class Backtester:
                 'benchmark_base': initial_hold_base
             })
             
-            # Revisar condiciones de salida o SL/TP si estamos en posición
+            # Revisar condiciones de salida o SL/TP si estamos en posición.
+            # IMPORTANTE (orden): el SL/TP se comprueba con el nivel vigente desde el CIERRE
+            # de la barra anterior, NUNCA con un trailing recalculado usando el high/low de
+            # esta misma barra — el dato OHLC no dice si el high o el low ocurrió primero
+            # dentro de la vela, así que usar el high de la vela para mover el stop y luego
+            # el low de la MISMA vela para dispararlo asume una secuencia intrabarra que no
+            # se puede conocer y puede generar una salida que nunca habría ocurrido (o evitar
+            # una que sí). El trailing se actualiza DESPUÉS, solo si no hubo salida, para que
+            # rija recién en la barra siguiente.
             if position > 0:
-                # Actualizar Trailing Stop Loss (incluye chandelier y break-even)
-                current_atr = row.get('ATR', None)
-                sl_price = self.strategy.risk_manager.update_trailing_sl(
-                    current_sl=sl_price, 
-                    current_price=close_p, 
-                    current_high=row['high'], 
-                    current_low=row['low'], 
-                    current_atr=current_atr, 
-                    side="long",
-                    entry_price=entry_price
-                )
-                
                 exit_reason = None
                 exit_p = close_p
-                
-                if sl_price is not None and row['low'] <= sl_price:
+
+                # Liquidación forzosa (solo apalancado): tiene prioridad sobre SL/TP propios,
+                # igual que en un exchange real la liquidación ocurre sin esperar la orden del
+                # usuario. liq_price es fijo desde la entrada (no se recalcula por barra).
+                if is_coin_m and liq_price is not None and row['low'] <= liq_price:
+                    exit_reason = "LIQUIDATION"
+                    exit_p = liq_price
+                elif sl_price is not None and row['low'] <= sl_price:
                     exit_reason = "SL"
                     exit_p = sl_price
                 elif tp_price is not None and tp_price > 0 and row['high'] >= tp_price:
@@ -220,15 +249,19 @@ class Backtester:
                 elif row.get('exit_long', False):
                     exit_reason = "Signal"
                     exit_p = close_p
-                    
+
                 if exit_reason:
                     # Slippage & comisiones
                     exit_p = exit_p * (1 - self.slippage_pct)
                     revenue = position * exit_p
                     commission = revenue * self.commission_pct
-                    
+
                     pnl = revenue - (position * entry_price) - commission
-                    
+                    if exit_reason == "LIQUIDATION":
+                        # Perdida total del margen usado (isolated margin): no se puede perder
+                        # mas que el margen inicial de la posicion, ni tampoco menos.
+                        pnl = -entry_margin
+
                     if is_coin_m:
                         pnl_base = pnl / exit_p if exit_p > 0 else 0.0
                         hold_balance += pnl_base
@@ -236,7 +269,7 @@ class Backtester:
                     else:
                         capital += revenue - commission
                         pnl_base = pnl / exit_p if exit_p > 0 else 0.0
-                    
+
                     trades.append({
                         'entry_time': current_trade.get('entry_time', timestamp),
                         'exit_time': timestamp,
@@ -251,24 +284,32 @@ class Backtester:
                         'hold_balance': hold_balance
                     })
                     position = 0.0
-            
+                    liq_price = None
+                    entry_margin = 0.0
+                else:
+                    # Sin salida esta barra: recien ahora se actualiza el trailing (incluye
+                    # chandelier y break-even) con el high/low de ESTA barra, para que rija
+                    # desde la barra siguiente — ver comentario mas arriba sobre por que no
+                    # se hace antes de comprobar el SL/TP de esta misma barra.
+                    current_atr = row.get('ATR', None)
+                    sl_price = self.strategy.risk_manager.update_trailing_sl(
+                        current_sl=sl_price,
+                        current_price=close_p,
+                        current_high=row['high'],
+                        current_low=row['low'],
+                        current_atr=current_atr,
+                        side="long",
+                        entry_price=entry_price
+                    )
+
             elif position < 0:
-                # Actualizar Trailing Stop Loss (Inverso: SL baja cuando precio baja)
-                current_atr = row.get('ATR', None)
-                sl_price = self.strategy.risk_manager.update_trailing_sl(
-                    current_sl=sl_price, 
-                    current_price=close_p, 
-                    current_high=row['high'], 
-                    current_low=row['low'], 
-                    current_atr=current_atr, 
-                    side="short",
-                    entry_price=entry_price
-                )
-                
                 exit_reason = None
                 exit_p = close_p
-                
-                if sl_price is not None and sl_price > 0 and row['high'] >= sl_price:
+
+                if is_coin_m and liq_price is not None and row['high'] >= liq_price:
+                    exit_reason = "LIQUIDATION"
+                    exit_p = liq_price
+                elif sl_price is not None and sl_price > 0 and row['high'] >= sl_price:
                     exit_reason = "SL"
                     exit_p = sl_price
                 elif tp_price is not None and tp_price > 0 and row['low'] <= tp_price:
@@ -277,16 +318,18 @@ class Backtester:
                 elif row.get('exit_short', False):
                     exit_reason = "Signal"
                     exit_p = close_p
-                    
+
                 if exit_reason:
                     # Slippage & comisiones
                     exit_p = exit_p * (1 + self.slippage_pct)
                     cost = abs(position) * exit_p
                     commission = cost * self.commission_pct
-                    
+
                     revenue = abs(position) * entry_price
                     pnl = revenue - cost - commission
-                    
+                    if exit_reason == "LIQUIDATION":
+                        pnl = -entry_margin
+
                     if is_coin_m:
                         pnl_base = pnl / exit_p if exit_p > 0 else 0.0
                         hold_balance += pnl_base
@@ -294,7 +337,7 @@ class Backtester:
                     else:
                         capital -= cost + commission
                         pnl_base = pnl / exit_p if exit_p > 0 else 0.0
-                    
+
                     trades.append({
                         'entry_time': current_trade.get('entry_time', timestamp),
                         'exit_time': timestamp,
@@ -309,6 +352,21 @@ class Backtester:
                         'hold_balance': hold_balance
                     })
                     position = 0.0
+                    liq_price = None
+                    entry_margin = 0.0
+                else:
+                    # Actualizar Trailing Stop Loss (Inverso: SL baja cuando precio baja),
+                    # solo si no hubo salida esta barra (ver mismo motivo que en el lado long).
+                    current_atr = row.get('ATR', None)
+                    sl_price = self.strategy.risk_manager.update_trailing_sl(
+                        current_sl=sl_price,
+                        current_price=close_p,
+                        current_high=row['high'],
+                        current_low=row['low'],
+                        current_atr=current_atr,
+                        side="short",
+                        entry_price=entry_price
+                    )
             
             # ── Ejecución de entrada pendiente (modo entry_on_next_open) ──────────
             # Si la vela anterior generó señal, ahora ejecutamos al Open de esta vela
@@ -324,6 +382,7 @@ class Backtester:
                     if is_coin_m:
                         effective_cap = hold_balance * entry_p
                         qty = self.strategy.risk_manager.compute_position_size(effective_cap, entry_p, sl) * self.leverage
+                        qty, margin, liq_p = _leverage_cap_and_liq(qty, entry_p, effective_cap, 'long')
                     else:
                         qty = self.strategy.risk_manager.compute_position_size(capital, entry_p, sl)
                         max_qty = capital / (entry_p * (1 + self.commission_pct))
@@ -334,6 +393,7 @@ class Backtester:
                     if is_coin_m:
                         if hold_balance > 0 and qty > 1e-6:
                             position = qty; entry_price = entry_p; sl_price = sl; tp_price = tp
+                            entry_margin = margin; liq_price = liq_p
                             current_trade = {'entry_time': timestamp, 'side': 'long', 'quantity': qty}
                     else:
                         if capital >= (cost + commission) - 1e-6 and qty > 1e-6:
@@ -346,6 +406,7 @@ class Backtester:
                     if is_coin_m:
                         effective_cap = hold_balance * entry_p
                         qty = self.strategy.risk_manager.compute_position_size(effective_cap, entry_p, sl) * self.leverage
+                        qty, margin, liq_p = _leverage_cap_and_liq(qty, entry_p, effective_cap, 'short')
                     else:
                         qty = self.strategy.risk_manager.compute_position_size(capital, entry_p, sl)
                         max_qty = capital / (entry_p * (1 + self.commission_pct))
@@ -356,6 +417,7 @@ class Backtester:
                     if is_coin_m:
                         if hold_balance > 0 and qty > 1e-6:
                             position = -qty; entry_price = entry_p; sl_price = sl; tp_price = tp
+                            entry_margin = margin; liq_price = liq_p
                             current_trade = {'entry_time': timestamp, 'side': 'short', 'quantity': qty}
                     else:
                         if capital >= (revenue + commission) - 1e-6 and qty > 1e-6:
@@ -376,21 +438,24 @@ class Backtester:
                         if is_coin_m:
                             effective_cap = hold_balance * entry_p
                             qty = self.strategy.risk_manager.compute_position_size(effective_cap, entry_p, sl) * self.leverage
+                            qty, margin, liq_p = _leverage_cap_and_liq(qty, entry_p, effective_cap, 'long')
                         else:
                             qty = self.strategy.risk_manager.compute_position_size(capital, entry_p, sl)
                             max_qty = capital / (entry_p * (1 + self.commission_pct))
                             if qty > max_qty:
                                 qty = max_qty
-                            
+
                         cost = qty * entry_p
                         commission = cost * self.commission_pct
-                        
+
                         if is_coin_m:
                             if hold_balance > 0 and qty > 1e-6:
                                 position = qty
                                 entry_price = entry_p
                                 sl_price = sl
                                 tp_price = tp
+                                entry_margin = margin
+                                liq_price = liq_p
                                 current_trade = {
                                     'entry_time': timestamp,
                                     'side': 'long',
@@ -419,21 +484,24 @@ class Backtester:
                         if is_coin_m:
                             effective_cap = hold_balance * entry_p
                             qty = self.strategy.risk_manager.compute_position_size(effective_cap, entry_p, sl) * self.leverage
+                            qty, margin, liq_p = _leverage_cap_and_liq(qty, entry_p, effective_cap, 'short')
                         else:
                             qty = self.strategy.risk_manager.compute_position_size(capital, entry_p, sl)
                             max_qty = capital / (entry_p * (1 + self.commission_pct))
                             if qty > max_qty:
                                 qty = max_qty
-                            
+
                         revenue = qty * entry_p
                         commission = revenue * self.commission_pct
-                        
+
                         if is_coin_m:
                             if hold_balance > 0 and qty > 1e-6:
                                 position = -qty
                                 entry_price = entry_p
                                 sl_price = sl
                                 tp_price = tp
+                                entry_margin = margin
+                                liq_price = liq_p
                                 current_trade = {
                                     'entry_time': timestamp,
                                     'side': 'short',
@@ -451,6 +519,66 @@ class Backtester:
                                     'side': 'short',
                                     'quantity': qty
                                 }
+
+        # Forzar el cierre de cualquier posición abierta al terminar el rango de datos.
+        # Antes, una posición abierta al final del backtest sumaba su PnL no realizado a la
+        # equity curve (afectando CAGR/Sharpe/drawdown) pero NUNCA aparecía como trade cerrado
+        # (no afectaba total_trades/win_rate/profit_factor) — dos secciones del mismo reporte
+        # contaban historias distintas del mismo backtest, y ese resultado dependía de un
+        # corte de fechas arbitrario, no de una señal de salida real.
+        if position > 0:
+            exit_p = close_p * (1 - self.slippage_pct)
+            revenue = position * exit_p
+            commission = revenue * self.commission_pct
+            pnl = revenue - (position * entry_price) - commission
+            if is_coin_m:
+                pnl_base = pnl / exit_p if exit_p > 0 else 0.0
+                hold_balance += pnl_base
+                capital = hold_balance * exit_p
+            else:
+                capital += revenue - commission
+                pnl_base = pnl / exit_p if exit_p > 0 else 0.0
+            trades.append({
+                'entry_time': current_trade.get('entry_time', timestamp),
+                'exit_time': timestamp,
+                'side': 'long',
+                'entry_price': entry_price,
+                'exit_price': exit_p,
+                'quantity': position,
+                'pnl': pnl,
+                'pnl_base': pnl_base,
+                'exit_reason': 'EOD_CLOSE',
+                'portfolio_value': capital,
+                'hold_balance': hold_balance
+            })
+            position = 0.0
+        elif position < 0:
+            exit_p = close_p * (1 + self.slippage_pct)
+            cost = abs(position) * exit_p
+            commission = cost * self.commission_pct
+            revenue = abs(position) * entry_price
+            pnl = revenue - cost - commission
+            if is_coin_m:
+                pnl_base = pnl / exit_p if exit_p > 0 else 0.0
+                hold_balance += pnl_base
+                capital = hold_balance * exit_p
+            else:
+                capital -= cost + commission
+                pnl_base = pnl / exit_p if exit_p > 0 else 0.0
+            trades.append({
+                'entry_time': current_trade.get('entry_time', timestamp),
+                'exit_time': timestamp,
+                'side': 'short',
+                'entry_price': entry_price,
+                'exit_price': exit_p,
+                'quantity': abs(position),
+                'pnl': pnl,
+                'pnl_base': pnl_base,
+                'exit_reason': 'EOD_CLOSE',
+                'portfolio_value': capital,
+                'hold_balance': hold_balance
+            })
+            position = 0.0
 
         # Calcular Métricas
         trades_df = pd.DataFrame(trades)
@@ -475,7 +603,7 @@ class Backtester:
         }
         
         trade_metrics = calculate_metrics(trades_df, initial_quote_cap)
-        eq_metrics = calculate_equity_curve_metrics(equity_df['equity'])
+        eq_metrics = calculate_equity_curve_metrics(equity_df['equity'], timeframe=self.strategy.timeframe)
         
         def _calc_fees(tdf):
             if tdf.empty: return 0.0, 0.0

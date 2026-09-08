@@ -106,7 +106,10 @@ class PaperTrader:
         self._last_open_ts: float = 0.0
 
         self._client: Optional[BinanceTestnetClient] = None
-        self._lock = threading.Lock()
+        # RLock (no Lock simple) porque _save_state()/to_dict() puede invocarse desde
+        # dentro de una sección ya protegida por este mismo lock (ver sync de posición
+        # de Binance), y un Lock normal produciria un deadlock del hilo del bot.
+        self._lock = threading.RLock()
         self._polling_thread: Optional[threading.Thread] = None
 
         # Notificador de Telegram — opcional; no rompe si no está configurado
@@ -119,6 +122,49 @@ class PaperTrader:
     # ──────────────────────────────────────────────────────────────
     # Ciclo de vida
     # ──────────────────────────────────────────────────────────────
+
+    # Tipos de Stop Loss que el backtester SÍ recalcula vela a vela (ver
+    # backtest_engine/backtester.py y RiskManager.update_trailing_sl) pero que este motor
+    # de ejecución en vivo/paper AÚN NO implementa: compute_sl_tp solo calcula el SL una
+    # vez, al abrir la posición, y jamás se vuelve a mover mientras el trade sigue abierto.
+    # PENDIENTE DE ANALIZAR/IMPLEMENTAR: aplicar update_trailing_sl en el loop de polling
+    # de _poll_binance_klines y re-emitir la orden condicional SL en Binance cuando cambie.
+    _LIVE_UNSUPPORTED_SL_TYPES = {
+        "trailing_percent", "trailing", "break_even", "breakeven",
+        "chandelier", "chandelier_exit",
+    }
+
+    def _warn_if_dynamic_sl_unsupported_live(self):
+        """Alerta si la estrategia usa un SL dinámico que solo se respeta en backtest.
+
+        Riesgo: el Stop Loss se fija una sola vez al entrar y nunca se mueve, aunque el
+        backtest con el que se validó la estrategia SÍ lo iba desplazando (protegiendo
+        ganancias / moviendo a break-even). En vivo, el bot queda con más riesgo del que
+        el backtest sugiere. Esto es una funcionalidad pendiente, no un valor por defecto.
+        """
+        try:
+            raw_sl_type = str(
+                self.strategy.risk_manager.sl_config.get("type", "")
+            ).lower().strip().replace(" ", "_")
+            is_dynamic_flagged = (
+                raw_sl_type == "dynamic"
+                and str(self.strategy.risk_manager.sl_config.get("dynamic_method", "")).lower() == "chandelier"
+            )
+            if raw_sl_type in self._LIVE_UNSUPPORTED_SL_TYPES or is_dynamic_flagged:
+                self._notify(
+                    f"⚠️ RIESGO: la estrategia usa Stop Loss tipo '{raw_sl_type}' "
+                    f"(trailing/break-even/chandelier), que en este motor de ejecución en vivo "
+                    f"NO se recalcula tras la entrada — el SL queda fijo en el nivel inicial "
+                    f"durante todo el trade, a diferencia del backtest. El riesgo real puede ser "
+                    f"mayor al esperado. [Pendiente de analizar/implementar]"
+                )
+                logger.warning(
+                    "[%s] SL dinámico '%s' configurado pero no soportado por el motor en vivo "
+                    "(pendiente de implementar trailing/break-even/chandelier en tiempo real).",
+                    self.name, raw_sl_type,
+                )
+        except Exception as e:
+            logger.debug("No se pudo evaluar el tipo de SL dinámico para alerta: %s", e)
 
     def start(self, reset_started_at: bool = True):
         """Descarga histórico de velas y conecta el polling de Binance."""
@@ -135,6 +181,7 @@ class PaperTrader:
             f"🚀 Iniciando Bot '{self.name}' | {self.symbol} {self.timeframe} | "
             f"Balance: {self.current_balance:,.2f} {self.currency}"
         )
+        self._warn_if_dynamic_sl_unsupported_live()
 
         try:
             self._client = BinanceTestnetClient(use_testnet=self.use_testnet)
@@ -299,14 +346,28 @@ class PaperTrader:
                                         # podria abrir una SEGUNDA posición mientras ya hay una expuesta y sin
                                         # que el SL/TP interno la vigile.
                                         adopted_side = "long" if pos_amt > 0 else "short"
-                                        self.position = Position(adopted_side, entry_p if entry_p > 0 else mark_p, abs(pos_amt), datetime.now())
+                                        adopted_entry = entry_p if entry_p > 0 else mark_p
+                                        self.position = Position(adopted_side, adopted_entry, abs(pos_amt), datetime.now())
                                         try:
                                             idx = len(self.klines_df) - 1
                                             sl_p, tp_p = self.strategy.risk_manager.compute_sl_tp(self.klines_df, idx, adopted_side)
                                             self.position.sl_price = sl_p
                                             self.position.tp_price = tp_p
-                                        except Exception:
-                                            pass
+                                        except Exception as e_sltp:
+                                            # Sin un fallback, la posicion huerfana quedaba adoptada SIN SL/TP
+                                            # (None/None) y sin que nadie se enterase: una posicion real
+                                            # desprotegida. Usar el mismo colchon de emergencia (2%/4%) que
+                                            # _open_position aplica cuando compute_sl_tp falla.
+                                            logger.warning(
+                                                "[%s] compute_sl_tp fallo al adoptar posicion huerfana: %s",
+                                                self.name, e_sltp,
+                                            )
+                                            self.position.sl_price = adopted_entry * (0.98 if adopted_side == "long" else 1.02)
+                                            self.position.tp_price = adopted_entry * (1.04 if adopted_side == "long" else 0.96)
+                                            self._notify(
+                                                "⚠️ No se pudo calcular SL/TP de estrategia para la posición huérfana "
+                                                "adoptada; se aplicó un SL/TP de emergencia (2%/4%)."
+                                            )
                                         self._notify(
                                             f"⚠️ Posición huérfana detectada en Binance ({adopted_side.upper()} "
                                             f"{abs(pos_amt):.6f} @ {entry_p:.4f}) y adoptada por el bot para evitar duplicar exposición."
@@ -333,7 +394,22 @@ class PaperTrader:
                                         self._had_open_binance_pos = False
 
                     except Exception as e_pos:
-                        logger.debug(f"[{self.name}] Error sync binance position: {e_pos}")
+                        # A nivel debug esto quedaba invisible en logs de produccion: una
+                        # desincronizacion persistente con Binance (posicion/SL/TP reales
+                        # desconocidos para el bot) pasaba desapercibida indefinidamente.
+                        self._sync_failure_count = getattr(self, '_sync_failure_count', 0) + 1
+                        logger.warning(
+                            "[%s] Error sync binance position (fallo consecutivo #%d): %s",
+                            self.name, self._sync_failure_count, e_pos,
+                        )
+                        if self._sync_failure_count == 5:
+                            self._notify(
+                                f"⚠️ Desincronización persistente con Binance detectada "
+                                f"({self._sync_failure_count} fallos consecutivos). "
+                                f"El bot puede no reflejar la posición real del exchange."
+                            )
+                    else:
+                        self._sync_failure_count = 0
 
             except Exception as e:
                 logger.error(f"[{self.name}] Error polling klines: {e}")
@@ -460,57 +536,64 @@ class PaperTrader:
                 logger.warning("Error guardando estado del bot %s: %s", self.name, e)
 
     def to_dict(self) -> dict:
-        """Serializa el estado completo del bot a un diccionario JSON-friendly."""
-        pos_data = None
-        if self.position:
-            pos_data = {
-                "side": self.position.side,
-                "entry_price": float(self.position.entry_price),
-                "quantity": float(self.position.quantity),
-                "entry_timestamp": str(self.position.entry_timestamp),
-                "sl_price": float(self.position.sl_price) if self.position.sl_price is not None else None,
-                "tp_price": float(self.position.tp_price) if self.position.tp_price is not None else None,
+        """Serializa el estado completo del bot a un diccionario JSON-friendly.
+
+        Protegido por self._lock (RLock): sin esto, el hilo de polling puede estar
+        mutando self.position/trade_history a mitad de camino (ver sync de posición
+        de Binance) mientras save_state_to_disk() itera todos los bots, produciendo
+        una foto de estado inconsistente/parcial persistida a disco.
+        """
+        with self._lock:
+            pos_data = None
+            if self.position:
+                pos_data = {
+                    "side": self.position.side,
+                    "entry_price": float(self.position.entry_price),
+                    "quantity": float(self.position.quantity),
+                    "entry_timestamp": str(self.position.entry_timestamp),
+                    "sl_price": float(self.position.sl_price) if self.position.sl_price is not None else None,
+                    "tp_price": float(self.position.tp_price) if self.position.tp_price is not None else None,
+                }
+
+            # Serializar historial de trades asegurando tipos estándar
+            trades_clean = []
+            for t in self.trade_history:
+                trades_clean.append({
+                    "entry_time": str(t.get("entry_time")),
+                    "exit_time": str(t.get("exit_time")),
+                    "side": t.get("side"),
+                    "entry_price": float(t.get("entry_price", 0.0)),
+                    "exit_price": float(t.get("exit_price", 0.0)),
+                    "sl_price": float(t.get("sl_price")) if t.get("sl_price") is not None else None,
+                    "tp_price": float(t.get("tp_price")) if t.get("tp_price") is not None else None,
+                    "quantity": float(t.get("quantity", 0.0)),
+                    "pnl": float(t.get("pnl", 0.0)),
+                    "pnl_pct": float(t.get("pnl_pct", 0.0)),
+                    "reason": t.get("reason"),
+                })
+
+            return {
+                "bot_id": self.bot_id,
+                "name": self.name,
+                "strategy_yaml_path": self.strategy_yaml_path,
+                "symbol": self.symbol,
+                "timeframe": self.timeframe,
+                "initial_balance": float(self.initial_balance),
+                "current_balance": float(self.current_balance),
+                "currency": self.currency,
+                "use_testnet": bool(self.use_testnet),
+                "status": self.status,
+                "status_message": self.status_message,
+                "is_running": bool(self.is_running),
+                "started_at": self.started_at,
+                "unexecuted_orders": self.unexecuted_orders[-100:],
+                "custom_parameters": self.custom_parameters,
+                "order_types": self.order_types,
+                "position": pos_data,
+                "trade_history": trades_clean,
+                "stats": self.stats,
+                "log_lines": self.log_lines[-40:],
             }
-
-        # Serializar historial de trades asegurando tipos estándar
-        trades_clean = []
-        for t in self.trade_history:
-            trades_clean.append({
-                "entry_time": str(t.get("entry_time")),
-                "exit_time": str(t.get("exit_time")),
-                "side": t.get("side"),
-                "entry_price": float(t.get("entry_price", 0.0)),
-                "exit_price": float(t.get("exit_price", 0.0)),
-                "sl_price": float(t.get("sl_price")) if t.get("sl_price") is not None else None,
-                "tp_price": float(t.get("tp_price")) if t.get("tp_price") is not None else None,
-                "quantity": float(t.get("quantity", 0.0)),
-                "pnl": float(t.get("pnl", 0.0)),
-                "pnl_pct": float(t.get("pnl_pct", 0.0)),
-                "reason": t.get("reason"),
-            })
-
-        return {
-            "bot_id": self.bot_id,
-            "name": self.name,
-            "strategy_yaml_path": self.strategy_yaml_path,
-            "symbol": self.symbol,
-            "timeframe": self.timeframe,
-            "initial_balance": float(self.initial_balance),
-            "current_balance": float(self.current_balance),
-            "currency": self.currency,
-            "use_testnet": bool(self.use_testnet),
-            "status": self.status,
-            "status_message": self.status_message,
-            "is_running": bool(self.is_running),
-            "started_at": self.started_at,
-            "unexecuted_orders": self.unexecuted_orders[-100:],
-            "custom_parameters": self.custom_parameters,
-            "order_types": self.order_types,
-            "position": pos_data,
-            "trade_history": trades_clean,
-            "stats": self.stats,
-            "log_lines": self.log_lines[-40:],
-        }
 
     def restore_from_dict(self, data: dict):
         """Restaura el estado guardado del bot desde un diccionario."""
@@ -960,7 +1043,20 @@ class PaperTrader:
             if sl_tp_res.get("sl_order"):
                 self._notify(f"🛡️ ORDEN SL ({sl_type}) COLOCADA @ {sl_price:.4f} | ID: {sl_tp_res['sl_order'].get('orderId')}")
             if sl_tp_res.get("errors"):
-                self._notify(f"⚠️ Binance SL/TP Info: {', '.join(sl_tp_res['errors'])}")
+                # Esto no es informativo: si la orden condicional de SL o TP no quedo colocada
+                # en el exchange, la posicion real queda "desnuda" (sin proteccion del lado del
+                # servidor) y solo la vigila el loop interno del bot mientras el proceso siga
+                # vivo. Un _notify de "Info" pasaba desapercibido; se escala a alerta critica.
+                self._trigger_critical_order_alert(
+                    "Fallo al colocar orden(es) condicional(es) SL/TP en Binance — posición sin protección en el exchange",
+                    {
+                        "Símbolo": self.symbol,
+                        "Lado": side.upper(),
+                        "SL colocado": bool(sl_tp_res.get("sl_order")),
+                        "TP colocado": bool(sl_tp_res.get("tp_order")),
+                        "Errores": ", ".join(sl_tp_res["errors"]),
+                    }
+                )
 
         # Abrir posición interna una vez confirmada la ejecución
         self.position = Position(side, price, quantity, ts)
@@ -1155,9 +1251,24 @@ class PaperTrader:
         # ── Guardarraíl 3: Circuit Breaker de Pérdida Diaria (solo cuentas reales) ──
         if not self.use_testnet:
             today = datetime.now().date()
+
+            def _exit_date(raw_exit_time):
+                # exit_time llega como datetime en trades recien cerrados, pero como str
+                # tras restaurar el estado desde disco (to_dict lo serializa con str()).
+                # Sin este fallback, todos los trades pre-reinicio quedaban fuera del
+                # calculo y el circuit breaker de perdida diaria podia no dispararse.
+                if isinstance(raw_exit_time, datetime):
+                    return raw_exit_time.date()
+                if isinstance(raw_exit_time, str):
+                    try:
+                        return datetime.fromisoformat(raw_exit_time).date()
+                    except ValueError:
+                        return None
+                return None
+
             daily_pnl = sum(
                 t.get("pnl", 0.0) for t in self.trade_history
-                if isinstance(t.get("exit_time"), datetime) and t["exit_time"].date() == today
+                if _exit_date(t.get("exit_time")) == today
             )
             daily_pnl_pct = (daily_pnl / self.initial_balance * 100.0) if self.initial_balance > 0 else 0.0
             from execution_engine.security_manager import check_circuit_breaker

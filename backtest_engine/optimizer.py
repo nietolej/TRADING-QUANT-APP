@@ -184,7 +184,7 @@ def _optimizer_worker(
             equity_curve.index = pd.to_datetime(equity_curve.index)
 
         if equity_curve is not None and not equity_curve.empty:
-            eq_metrics = calculate_equity_curve_metrics(equity_curve['equity'])
+            eq_metrics = calculate_equity_curve_metrics(equity_curve['equity'], timeframe=strategy.timeframe)
             trade_metrics = (
                 calculate_metrics(trades_df, initial_capital)
                 if trades_df is not None and not trades_df.empty

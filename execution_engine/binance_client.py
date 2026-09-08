@@ -748,6 +748,23 @@ class BinanceTestnetClient:
             except Exception:
                 pass
 
+            # Verificación final: todos los pasos anteriores tragan sus propias excepciones
+            # (para intentar el resto de vías de cancelación aunque una falle), asi que sin
+            # esta comprobación el metodo reportaba "True, None" incluso si NINGUNA de las
+            # cancelaciones tuvo exito realmente (ej. permisos de API insuficientes) — un
+            # falso positivo critico para quien lo usa como parte del kill switch.
+            remaining = 0
+            try:
+                still_open = self.client.futures_get_open_orders(symbol=binance_symbol) or []
+                remaining = len(still_open)
+            except Exception as e_check:
+                logger.debug("No se pudo verificar órdenes remanentes tras cancelar %s: %s", binance_symbol, e_check)
+
+            if remaining > 0:
+                msg = f"{remaining} orden(es) siguen abiertas en {binance_symbol} tras el intento de cancelación"
+                logger.warning(msg)
+                return False, msg
+
             logger.info("Órdenes abiertas y condicionales (Algo) canceladas con éxito para %s", binance_symbol)
             return True, None
         except Exception as e:

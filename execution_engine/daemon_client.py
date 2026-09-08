@@ -293,7 +293,11 @@ class DaemonClient:
                 res = requests.post(f"{self.base_url}/api/bots/{bot_id}/start", timeout=5.0)
                 return res.status_code == 200
             except Exception as e:
-                logger.error("Error arrancando bot en daemon: %s", e)
+                # El daemon esta online (tiene los bots reales) pero esta peticion fallo:
+                # NO caer al bot_manager local, que es una instancia distinta y vacia en
+                # este proceso: reportar el fallo real en vez de una falsa señal.
+                logger.error("Error arrancando bot en daemon (online pero request fallo): %s", e)
+                return False
 
         from execution_engine.bot_manager import bot_manager
         bot = bot_manager.get_bot(bot_id)
@@ -310,7 +314,8 @@ class DaemonClient:
                 res = requests.post(f"{self.base_url}/api/bots/{bot_id}/stop", timeout=5.0)
                 return res.status_code == 200
             except Exception as e:
-                logger.error("Error deteniendo bot en daemon: %s", e)
+                logger.error("Error deteniendo bot en daemon (online pero request fallo): %s", e)
+                return False
 
         from execution_engine.bot_manager import bot_manager
         bot = bot_manager.get_bot(bot_id)
@@ -331,7 +336,8 @@ class DaemonClient:
                 )
                 return res.status_code == 200
             except Exception as e:
-                logger.error("Error reseteando bot en daemon: %s", e)
+                logger.error("Error reseteando bot en daemon (online pero request fallo): %s", e)
+                return False
 
         from execution_engine.bot_manager import bot_manager
         bot = bot_manager.get_bot(bot_id)
@@ -346,10 +352,10 @@ class DaemonClient:
         if self.is_daemon_online():
             try:
                 res = requests.patch(f"{self.base_url}/api/bots/{bot_id}", json=kwargs, timeout=3.0)
-                if res.status_code == 200:
-                    return True
+                return res.status_code == 200
             except Exception as e:
-                logger.error("Error actualizando config en daemon: %s", e)
+                logger.error("Error actualizando config en daemon (online pero request fallo): %s", e)
+                return False
 
         from execution_engine.bot_manager import bot_manager
         bot = bot_manager.get_bot(bot_id)
@@ -365,8 +371,9 @@ class DaemonClient:
             try:
                 res = requests.post(f"{self.base_url}/api/bots/start_all", timeout=5.0)
                 return res.status_code == 200
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("Error arrancando todos los bots en daemon (online pero request fallo): %s", e)
+                return False
 
         from execution_engine.bot_manager import bot_manager
         bot_manager.start_all()
@@ -378,8 +385,9 @@ class DaemonClient:
             try:
                 res = requests.post(f"{self.base_url}/api/bots/stop_all", timeout=5.0)
                 return res.status_code == 200
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error("Error deteniendo todos los bots en daemon (online pero request fallo): %s", e)
+                return False
 
         from execution_engine.bot_manager import bot_manager
         bot_manager.stop_all()
@@ -431,8 +439,25 @@ class DaemonClient:
                 res = requests.post(f"{self.base_url}/api/emergency_kill", timeout=5.0)
                 if res.status_code == 200:
                     return res.json()
-            except Exception:
-                pass
+                logger.error(
+                    "Kill switch: daemon online devolvio status %s en emergency_kill",
+                    res.status_code,
+                )
+            except Exception as e:
+                # CRITICO: el daemon esta online (con los bots reales operando) pero la
+                # peticion de kill switch fallo. Caer al bot_manager local aqui detendria
+                # una instancia vacia distinta y devolveria un falso "exito", dejando los
+                # bots reales del daemon operando sin que nadie se entere. Reportar el
+                # fallo real en su lugar para que el usuario reintente o mate el proceso.
+                logger.error("Kill switch: fallo la peticion al daemon (SIGUE ONLINE): %s", e)
+            return {
+                "status": "error",
+                "message": (
+                    "El Trading Daemon esta online pero no respondio al kill switch. "
+                    "Los bots reales pueden seguir operando. Reintenta o detén el proceso "
+                    "del daemon manualmente."
+                ),
+            }
 
         from execution_engine.bot_manager import bot_manager
         from execution_engine.security_manager import set_real_trading_enabled

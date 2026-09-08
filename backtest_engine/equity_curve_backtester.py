@@ -356,7 +356,7 @@ class EquityCurveBacktester:
         
         # Métricas de la Estrategia Real
         trade_metrics = calculate_metrics(r_trades_df, self.initial_capital)
-        eq_metrics = calculate_equity_curve_metrics(r_equity_df['equity'])
+        eq_metrics = calculate_equity_curve_metrics(r_equity_df['equity'], timeframe=self.strategy.timeframe)
         
         run_results.update(trade_metrics)
         run_results.update(eq_metrics)

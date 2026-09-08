@@ -1967,8 +1967,14 @@ class LiveMonitorPage:
                 ui.button('Cancelar', on_click=dlg.close).props('outline text-color=gray-400')
                 def _do_kill():
                     dlg.close()
-                    daemon_client.emergency_kill()
-                    ui.notify('🚨 KILL SWITCH ACTIVADO: Todos los bots detenidos.', type='negative', close_button=True)
+                    result = daemon_client.emergency_kill()
+                    if result.get('status') == 'error':
+                        ui.notify(
+                            f"❌ Kill switch NO se pudo confirmar: {result.get('message', 'error desconocido')}",
+                            type='negative', close_button=True, timeout=0,
+                        )
+                    else:
+                        ui.notify('🚨 KILL SWITCH ACTIVADO: Todos los bots detenidos.', type='negative', close_button=True)
                     self._refresh_ui_elements(force_dom_rebuild=True)
                 ui.button('DETENER TODO AHORA', color='red', on_click=_do_kill).classes('font-bold')
         dlg.open()
