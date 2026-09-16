@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from api.routes import backtest_router, data_router
 from data_layer.storage import init_db
+from reconciliation.api import router as reconciliation_router
 
 init_db()
 
@@ -28,6 +29,7 @@ app.add_middleware(
 # Include routers
 app.include_router(backtest_router.router, prefix="/api/backtest", tags=["Backtest"])
 app.include_router(data_router.router, prefix="/api/data", tags=["Data Catalog"])
+app.include_router(reconciliation_router, prefix="/api/reconciliation", tags=["Reconciliation"])
 
 @app.get("/api")
 def read_root():

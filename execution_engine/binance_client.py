@@ -1,6 +1,7 @@
 import os
 import time
 import math
+import uuid
 import logging
 from typing import Dict, Any, Optional, List, Tuple
 from dotenv import load_dotenv
@@ -74,6 +75,31 @@ def format_binance_error(e: Exception) -> str:
     if "Read timed out" in raw or "Connection" in raw:
         return f"🔌 No se pudo conectar con Binance (timeout o red no disponible): {raw}"
     return raw
+
+
+# Prefijo con el que se etiqueta (newClientOrderId) toda orden enviada a Binance por esta
+# app, para poder identificarla en el historial del exchange y distinguirla de órdenes
+# manuales u otros bots que compartan la misma cuenta. Usado por el módulo separado
+# reconciliation/ para detectar huérfanos (ver reconciliation/models.py).
+APP_CLIENT_ORDER_PREFIX = "QTAPP_"
+
+
+def _new_client_order_id() -> str:
+    return f"{APP_CLIENT_ORDER_PREFIX}{uuid.uuid4().hex[:20]}"
+
+
+def _log_order_to_ledger(**kwargs) -> None:
+    """
+    Registra en el ledger de reconciliación (módulo separado, ver reconciliation/order_ledger.py)
+    el resultado de un intento de orden. Es "best-effort": el ledger es una capa de auditoría
+    añadida, así que un fallo aquí (import roto, DB bloqueada, etc.) nunca debe interrumpir el
+    envío de órdenes reales a Binance.
+    """
+    try:
+        from reconciliation.order_ledger import log_app_order
+        log_app_order(**kwargs)
+    except Exception as e:
+        logger.debug("No se pudo registrar la orden en el ledger de reconciliación: %s", e)
 
 
 def get_binance_credentials() -> Dict[str, Any]:
@@ -475,12 +501,14 @@ class BinanceTestnetClient:
             return None, "Cliente de Binance no disponible (restricción geográfica o red)"
 
         o_type = order_type.upper()
+        client_order_id = _new_client_order_id()
         try:
             params = {
                 "symbol": binance_symbol,
                 "side": binance_side,
                 "type": o_type,
-                "quantity": qty
+                "quantity": qty,
+                "newClientOrderId": client_order_id
             }
             if o_type == "LIMIT":
                 if price is None or price <= 0:
@@ -492,6 +520,13 @@ class BinanceTestnetClient:
             order_id = order.get("orderId")
             initial_status = str(order.get("status", "")).upper()
             logger.info("Orden %s (%s) creada en Binance Futures. ID: %s, Estado inicial: %s", o_type, binance_side, order_id, initial_status)
+            _log_order_to_ledger(
+                symbol=binance_symbol, side=binance_side, action="OPEN", order_type=o_type,
+                requested_qty=qty, requested_price=price, use_testnet=self.use_testnet,
+                status="SENT_OK", binance_order_id=order_id, client_order_id=client_order_id,
+                exchange_status=initial_status, executed_qty=order.get("executedQty"),
+                avg_price=order.get("avgPrice"),
+            )
 
             if verify_execution and order_id:
                 expected = ["FILLED"] if o_type == "MARKET" else ["NEW", "PARTIALLY_FILLED", "FILLED"]
@@ -509,6 +544,11 @@ class BinanceTestnetClient:
             return order, None
         except Exception as e:
             logger.error("Error enviando orden %s a Binance Futures: %s", o_type, e)
+            _log_order_to_ledger(
+                symbol=binance_symbol, side=binance_side, action="OPEN", order_type=o_type,
+                requested_qty=qty, requested_price=price, use_testnet=self.use_testnet,
+                status="SEND_FAILED", client_order_id=client_order_id, error=str(e),
+            )
             return None, format_binance_error(e)
 
     def close_futures_position(
@@ -539,13 +579,15 @@ class BinanceTestnetClient:
         close_side = "SELL" if side.lower() == "long" else "BUY"
 
         o_type = order_type.upper()
+        client_order_id = _new_client_order_id()
         try:
             params = {
                 "symbol": binance_symbol,
                 "side": close_side,
                 "type": o_type,
                 "quantity": qty,
-                "reduceOnly": True
+                "reduceOnly": True,
+                "newClientOrderId": client_order_id
             }
             if o_type == "LIMIT":
                 if price is not None and price > 0:
@@ -561,6 +603,13 @@ class BinanceTestnetClient:
             order_id = order.get("orderId")
             initial_status = str(order.get("status", "")).upper()
             logger.info("Cierre de posición %s (%s) enviado a Binance Futures. ID: %s, Estado inicial: %s", o_type, close_side, order_id, initial_status)
+            _log_order_to_ledger(
+                symbol=binance_symbol, side=close_side, action="CLOSE", order_type=params["type"],
+                requested_qty=qty, requested_price=price, use_testnet=self.use_testnet,
+                status="SENT_OK", binance_order_id=order_id, client_order_id=client_order_id,
+                exchange_status=initial_status, executed_qty=order.get("executedQty"),
+                avg_price=order.get("avgPrice"),
+            )
 
             if verify_execution and order_id:
                 expected = ["FILLED"] if params["type"] == "MARKET" else ["NEW", "PARTIALLY_FILLED", "FILLED"]
@@ -577,6 +626,11 @@ class BinanceTestnetClient:
             return order, None
         except Exception as e:
             logger.error("Error cerrando posición en Binance Futures: %s", e)
+            _log_order_to_ledger(
+                symbol=binance_symbol, side=close_side, action="CLOSE", order_type=o_type,
+                requested_qty=qty, requested_price=price, use_testnet=self.use_testnet,
+                status="SEND_FAILED", client_order_id=client_order_id, error=str(e),
+            )
             return None, format_binance_error(e)
 
     def place_futures_sl_tp(
@@ -604,6 +658,7 @@ class BinanceTestnetClient:
 
         # 1. Take Profit
         if tp_price and tp_price > 0:
+            tp_client_order_id = _new_client_order_id()
             try:
                 tp_type = "TAKE_PROFIT" if tp_order_type.upper() == "LIMIT" else "TAKE_PROFIT_MARKET"
                 tp_params = {
@@ -612,7 +667,8 @@ class BinanceTestnetClient:
                     "type": tp_type,
                     "stopPrice": self.format_price(binance_symbol, tp_price),
                     "quantity": qty,
-                    "reduceOnly": True
+                    "reduceOnly": True,
+                    "newClientOrderId": tp_client_order_id
                 }
                 if tp_type == "TAKE_PROFIT":
                     tp_params["price"] = self.format_price(binance_symbol, tp_price)
@@ -621,12 +677,24 @@ class BinanceTestnetClient:
                 tp_res = self.client.futures_create_order(**tp_params)
                 results["tp_order"] = tp_res
                 logger.info("Orden TP (%s) enviada a Binance: %s", tp_type, tp_res)
+                _log_order_to_ledger(
+                    symbol=binance_symbol, side=close_side, action="TAKE_PROFIT", order_type=tp_type,
+                    requested_qty=qty, requested_price=tp_price, use_testnet=self.use_testnet,
+                    status="SENT_OK", binance_order_id=tp_res.get("orderId"), client_order_id=tp_client_order_id,
+                    exchange_status=str(tp_res.get("status", "")).upper(),
+                )
             except Exception as e:
                 logger.warning("No se pudo colocar orden TP en Binance: %s", e)
                 results["errors"].append(f"TP Error: {e}")
+                _log_order_to_ledger(
+                    symbol=binance_symbol, side=close_side, action="TAKE_PROFIT", order_type=tp_order_type.upper(),
+                    requested_qty=qty, requested_price=tp_price, use_testnet=self.use_testnet,
+                    status="SEND_FAILED", client_order_id=tp_client_order_id, error=str(e),
+                )
 
         # 2. Stop Loss
         if sl_price and sl_price > 0:
+            sl_client_order_id = _new_client_order_id()
             try:
                 sl_type = "STOP" if sl_order_type.upper() == "LIMIT" else "STOP_MARKET"
                 sl_params = {
@@ -635,7 +703,8 @@ class BinanceTestnetClient:
                     "type": sl_type,
                     "stopPrice": self.format_price(binance_symbol, sl_price),
                     "quantity": qty,
-                    "reduceOnly": True
+                    "reduceOnly": True,
+                    "newClientOrderId": sl_client_order_id
                 }
                 if sl_type == "STOP":
                     sl_params["price"] = self.format_price(binance_symbol, sl_price)
@@ -644,9 +713,20 @@ class BinanceTestnetClient:
                 sl_res = self.client.futures_create_order(**sl_params)
                 results["sl_order"] = sl_res
                 logger.info("Orden SL (%s) enviada a Binance: %s", sl_type, sl_res)
+                _log_order_to_ledger(
+                    symbol=binance_symbol, side=close_side, action="STOP_LOSS", order_type=sl_type,
+                    requested_qty=qty, requested_price=sl_price, use_testnet=self.use_testnet,
+                    status="SENT_OK", binance_order_id=sl_res.get("orderId"), client_order_id=sl_client_order_id,
+                    exchange_status=str(sl_res.get("status", "")).upper(),
+                )
             except Exception as e:
                 logger.warning("No se pudo colocar orden SL en Binance: %s", e)
                 results["errors"].append(f"SL Error: {e}")
+                _log_order_to_ledger(
+                    symbol=binance_symbol, side=close_side, action="STOP_LOSS", order_type=sl_order_type.upper(),
+                    requested_qty=qty, requested_price=sl_price, use_testnet=self.use_testnet,
+                    status="SEND_FAILED", client_order_id=sl_client_order_id, error=str(e),
+                )
 
         return results
 
