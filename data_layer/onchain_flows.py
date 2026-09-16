@@ -137,30 +137,39 @@ class BlockExplorerClient:
 
     def fetch_exchange_flows(self, symbol: str, start_date: datetime):
         """
-        Calcula y guarda Inflows (depósitos) y Outflows (retiros) de Exchanges.
+        Calcula y guarda Inflows (depósitos), Outflows (retiros) y el Netflow diario
+        derivado (Inflow - Outflow) de Exchanges, a partir de transferencias on-chain
+        reales (no estimadas) vía Etherscan.
         """
         contract = self.TOKENS.get(symbol.upper())
         if not contract:
             return 0
-            
+
         records = []
         decimals = 6
-        
+        daily_inflow: dict = {}
+        daily_outflow: dict = {}
+
         for wallet in self.EXCHANGE_WALLETS:
             logger.info(f"Descargando Exchange Flows para {symbol} en wallet {wallet}")
             min_ts = start_date.replace(tzinfo=timezone.utc).timestamp()
             txs = self._fetch_etherscan_transfers(contract, wallet, min_timestamp=min_ts)
-            
+
             for tx in txs:
                 try:
                     val = float(tx['value']) / (10 ** decimals)
                     ts = datetime.fromtimestamp(int(tx['timeStamp']), tz=timezone.utc)
                     if ts < start_date.replace(tzinfo=timezone.utc):
                         continue
-                        
+
                     # Si el exchange recibe, es un Inflow. Si envía, es un Outflow.
                     is_inflow = tx['to'].lower() == wallet.lower()
-                    
+                    day_key = ts.date()
+                    if is_inflow:
+                        daily_inflow[day_key] = daily_inflow.get(day_key, 0.0) + val
+                    else:
+                        daily_outflow[day_key] = daily_outflow.get(day_key, 0.0) + val
+
                     records.append({
                         "metric_name": "Exchange_Inflow" if is_inflow else "Exchange_Outflow",
                         "symbol": symbol,
@@ -170,11 +179,70 @@ class BlockExplorerClient:
                     })
                 except Exception as e:
                     pass
-                    
+
             time.sleep(0.5) # Rate limit
-            
+
+        # Netflow diario derivado (Inflow - Outflow); positivo = más depósitos que retiros.
+        # Se calcula a partir de las mismas transferencias reales ya descargadas, no es un
+        # dato inventado ni un proxy de otra fuente.
+        for day in sorted(set(daily_inflow) | set(daily_outflow)):
+            net = daily_inflow.get(day, 0.0) - daily_outflow.get(day, 0.0)
+            records.append({
+                "metric_name": "Exchange_Netflow",
+                "symbol": symbol,
+                "timestamp": datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc),
+                "value": net,
+                "source": "etherscan"
+            })
+
         return self._save_records(records)
-        
+
+    def fetch_exchange_reserve(self, symbol: str) -> int:
+        """
+        Descarga el balance REAL actual (no derivado/estimado) de las wallets de exchange
+        rastreadas, vía el endpoint gratuito `tokenbalance` de Etherscan — es el saldo
+        on-chain real de esas direcciones en este momento, no una aproximación.
+        """
+        contract = self.TOKENS.get(symbol.upper())
+        if not contract:
+            return 0
+        if not self.etherscan_key:
+            raise ValueError("Falta configurar 'ETHERSCAN_API_KEY' en el archivo .env")
+
+        decimals = 6
+        total_balance = 0.0
+        url = "https://api.etherscan.io/v2/api"
+
+        for wallet in self.EXCHANGE_WALLETS:
+            params = {
+                "chainid": 1,
+                "module": "account",
+                "action": "tokenbalance",
+                "contractaddress": contract,
+                "address": wallet,
+                "tag": "latest",
+                "apikey": self.etherscan_key
+            }
+            try:
+                res = requests.get(url, params=params, timeout=15)
+                data = res.json()
+                if data.get("status") == "1":
+                    total_balance += float(data.get("result", 0)) / (10 ** decimals)
+                else:
+                    logger.warning(f"Etherscan tokenbalance falló para {wallet}: {data.get('message')}")
+            except Exception as e:
+                logger.warning(f"Error consultando balance de {wallet}: {e}")
+            time.sleep(0.25)
+
+        record = {
+            "metric_name": "Exchange_Reserve",
+            "symbol": symbol,
+            "timestamp": datetime.now(timezone.utc),
+            "value": total_balance,
+            "source": "etherscan"
+        }
+        return self._save_records([record])
+
     def fetch_total_supply(self, symbol: str, start_date: datetime):
         """
         Descarga el Total Supply histórico (Market Cap) usando la API gratuita de CoinGecko.

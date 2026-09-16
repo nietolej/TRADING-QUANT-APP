@@ -21,13 +21,27 @@ CRYPTOQUANT_METRICS = [
     'sopr', 'active_addresses', 'funding_rates', 'open_interest',
     'estimated_leverage_ratio', 'taker_buy_sell_ratio', 'nupl', 'stock_to_flow'
 ]
-STABLECOIN_METRICS = ['Mint', 'Burn', 'Exchange_Inflow', 'Exchange_Outflow', 'Total_Supply']
+STABLECOIN_METRICS = [
+    'Mint', 'Burn', 'Exchange_Inflow', 'Exchange_Outflow', 'Exchange_Netflow',
+    'Exchange_Reserve', 'Total_Supply'
+]
 
 # Subconjunto de CRYPTOQUANT_METRICS que Binance también publica gratis y sin API key
 # (endpoints públicos de Futures) — ver data_sources/binance_public_provider.py. El resto
 # de métricas de CryptoQuant (mvrv, sopr, puell_multiple, exchange_netflow, etc.) son
 # cálculos propietarios sin equivalente público gratuito.
 FREE_BINANCE_METRICS = {'funding_rates', 'open_interest', 'taker_buy_sell_ratio'}
+
+# Métricas que Glassnode también publica en su tier gratuito (Tier 1, requiere una API key
+# gratuita sin tarjeta de crédito en glassnode.com/studio) — a diferencia de CryptoQuant,
+# que exige una suscripción de pago para cualquier métrica. Se prefiere Glassnode por
+# defecto para estas, y CryptoQuant queda como única opción para lo que Glassnode no cubre
+# (nvt_golden_cross, miner_netflow, stock_to_flow, estimated_leverage_ratio).
+GLASSNODE_METRICS = {
+    'sopr', 'puell_multiple', 'mvrv', 'nupl', 'active_addresses',
+    'exchange_netflow', 'exchange_inflow', 'exchange_outflow', 'exchange_reserve',
+    'miner_reserve'
+}
 
 METRICS_BY_SYMBOL = {
     'BTC': CRYPTOQUANT_METRICS + ['Total_Supply'],
@@ -64,6 +78,9 @@ def fetch_data_async(symbol, days, metric=None):
                 # Sin costo ni API key: usa los endpoints públicos de Binance Futures en
                 # vez de CryptoQuant para las métricas que Binance sí publica gratis.
                 provider = 'binance_public'
+            elif mapped_metric in GLASSNODE_METRICS:
+                # Glassnode tiene tier gratuito (requiere key sin costo); CryptoQuant no.
+                provider = 'glassnode'
             else:
                 provider = 'cryptoquant'
 
@@ -81,12 +98,15 @@ def fetch_data_async(symbol, days, metric=None):
             db.close()
             
     if symbol in ['USDT', 'USDC']:
-        # Legacy BlockExplorer metrics (para Stablecoins)
+        # BlockExplorer (Etherscan) metrics para Stablecoins: Mint/Burn, Inflow/Outflow,
+        # Netflow (derivado de los dos anteriores) y Reserve (balance real actual de las
+        # wallets rastreadas) — todas vía datos on-chain reales, gratis.
         client = BlockExplorerClient()
         mints_burns = client.fetch_stablecoin_supply(symbol, start_date)
-        flows = client.fetch_exchange_flows(symbol, start_date)
+        flows = client.fetch_exchange_flows(symbol, start_date)  # incluye Netflow derivado
+        reserve = client.fetch_exchange_reserve(symbol)
         supply = client.fetch_total_supply(symbol, start_date)
-        records_saved += (mints_burns + flows + supply)
+        records_saved += (mints_burns + flows + reserve + supply)
     
     # 2. Asegurar que tenemos precios históricos en DB
     market_symbol = f"{symbol}/USDT" if symbol != "USDT" else "BTC/USDT"
@@ -313,6 +333,8 @@ def render_onchain_analyzer():
                     'Burn': 'Destrucción de tokens (contracción monetaria). Representa retiros de liquidez del mercado hacia cuentas bancarias tradicionales. Suele ser una señal Bajista (Bearish).',
                     'Exchange_Inflow': 'Depósitos desde billeteras privadas hacia Exchanges. Un Inflow masivo de stablecoins representa "poder de compra" (municiones) listo para dispararse (Bullish).',
                     'Exchange_Outflow': 'Retiros desde Exchanges hacia billeteras frías. En el caso de stablecoins, indica una reducción en la liquidez inmediata para comprar activos (Bearish).',
+                    'Exchange_Netflow': 'Inflow menos Outflow diario. Positivo = más depósitos que retiros (poder de compra acumulándose, Bullish); negativo = más retiros que depósitos (Bearish).',
+                    'Exchange_Reserve': 'Balance actual real (on-chain) de la stablecoin en las wallets de exchange rastreadas. Sube = más liquidez disponible para comprar; baja = liquidez saliendo del exchange.',
                     'Total_Supply': 'Oferta Total Circulante de la Stablecoin en todo el mercado cripto global (incluye todas las redes). Representa la masa monetaria total (Liquidez Global).',
                     'exchange_netflow': 'Diferencia entre Inflow y Outflow en exchanges. Valores positivos indican más depósitos (Bearish para BTC), valores negativos indican más retiros (Bullish).',
                     'exchange_reserve': 'Cantidad total de monedas guardadas en las wallets de los exchanges. Si sube, hay mayor presión de venta. Si baja, los inversores están acumulando en wallets frías.',
