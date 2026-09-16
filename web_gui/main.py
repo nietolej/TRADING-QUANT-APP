@@ -285,6 +285,8 @@ def create_gui(app):
                 menu_item('Machine Learning', 'psychology', 'ml')
                 menu_item('Filtro MLE', 'thermostat', 'mle')
                 menu_item('Análisis On-Chain', 'currency_exchange', 'onchain')
+
+                ui.label('OPERATIVA EN VIVO').classes('text-[10px] font-extrabold text-slate-500 tracking-wider px-3 pt-4 pb-0.5 font-mono')
                 menu_item('Live Monitor', 'play_circle', 'live')
                 menu_item('Cartera & Riesgo Binance', 'account_balance_wallet', 'binance_account')
                 menu_item('Operativa Binance (Spot/Fut)', 'receipt_long', 'binance_operations')
