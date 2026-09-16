@@ -69,6 +69,10 @@ class BlockExplorerClient:
 
             status = data.get("status")
             message = str(data.get("message", "")).strip()
+            # Etherscan a veces deja el texto descriptivo real en "result" (con "message"
+            # en genérico "NOTOK") y a veces en "message" — se revisan ambos campos.
+            result_field = data.get("result")
+            detail_text = f"{message} {result_field if isinstance(result_field, str) else ''}".lower()
 
             if status == "1":
                 batch = data.get("result", [])
@@ -80,8 +84,22 @@ class BlockExplorerClient:
                 last_ts = int(batch[-1]['timeStamp'])
                 if last_ts < min_timestamp:
                     break  # Alcanzamos el límite de fecha histórico solicitado
-            elif message.lower() == "no transactions found":
+            elif "no transactions found" in detail_text:
                 # Resultado legítimo: sin actividad en el rango pedido (no es un error).
+                break
+            elif "result window is too large" in detail_text:
+                # Límite duro y documentado de Etherscan: page * offset <= 10000, o sea un
+                # máximo de 10 páginas de 1000 (~10.000 transferencias) por dirección/token.
+                # Con sort=desc ya se trajeron las 10.000 más recientes; para tokens muy
+                # transaccionados (USDT/USDC) en rangos largos (365 días) es habitual
+                # tocar este techo. No es un fallo de la sincronización, es una limitación
+                # de la API gratuita: se corta aquí y se usa lo ya descargado en vez de
+                # abortar toda la sincronización.
+                logger.warning(
+                    f"Etherscan alcanzó su límite de paginación (10.000 registros) para "
+                    f"{contract_address}/{target_address}; el histórico más antiguo del "
+                    f"rango pedido puede quedar incompleto."
+                )
                 break
             else:
                 # Error real de la API (key inválida, rate limit, parámetros
