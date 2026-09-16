@@ -17,6 +17,7 @@ from .pages.binance_operations_page import render_binance_operations_page
 from .pages.binance_p2p_page import render_binance_p2p_page
 from .pages.derivatives_analyzer_page import render_derivatives_analyzer_page
 from .pages.options_algo_page import render_options_algo_page
+from .pages.reconciliation_page import render_reconciliation_page
 from .components.api_credentials_dialog import open_api_credentials_dialog
 from .components.quant_copilot import render_quant_copilot
 
@@ -243,6 +244,7 @@ def create_gui_bots(app):
                 menu_item('P2P Binance (Real)', 'handshake', 'binance_p2p')
                 menu_item('Derivados & Futuros', 'query_stats', 'derivatives')
                 menu_item('Opciones & TWAP/POV', 'hub', 'options_algo')
+                menu_item('Conciliación App ↔ Binance', 'fact_check', 'reconciliation')
 
                 copilot_holder = [None]
 
@@ -289,6 +291,9 @@ def create_gui_bots(app):
 
             with ui.column().classes('w-full h-full') as pages['options_algo']:
                 render_options_algo_page()
+
+            with ui.column().classes('w-full h-full') as pages['reconciliation']:
+                render_reconciliation_page()
 
         copilot_holder[0] = render_quant_copilot()
 

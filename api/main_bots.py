@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from data_layer.storage import init_db
+from reconciliation.api import router as reconciliation_router
 
 init_db()
 
@@ -20,6 +21,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(reconciliation_router, prefix="/api/reconciliation", tags=["Reconciliation"])
 
 @app.get("/api")
 def read_root():
