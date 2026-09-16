@@ -15,7 +15,7 @@ class DefiLlamaProvider(BaseOnChainProvider):
         if metric_name == "stablecoin_market_cap":
             url = "https://stablecoins.llama.fi/stablecoincharts/all"
             try:
-                response = requests.get(url)
+                response = requests.get(url, timeout=15)
                 response.raise_for_status()
                 data = response.json()
                 
@@ -49,7 +49,7 @@ class DefiLlamaProvider(BaseOnChainProvider):
             url = f"https://stablecoins.llama.fi/stablecoincharts/all?stablecoin={sc_id}"
             
             try:
-                response = requests.get(url)
+                response = requests.get(url, timeout=15)
                 response.raise_for_status()
                 data = response.json()
                 

@@ -28,7 +28,12 @@ class BlockExplorerClient:
             "USDC": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
         }
 
-        # Wallets calientes de Exchanges conocidos (mock-ups de direcciones reales para la arquitectura)
+        # LIMITACIÓN CONOCIDA: solo 2 wallets calientes de Binance. Exchange_Inflow/Outflow
+        # es por tanto una muestra pequeña y sesgada hacia un solo exchange, no un flujo de
+        # mercado representativo (Coinbase, Kraken, OKX, etc. no están cubiertos). No se
+        # agregan más direcciones aquí sin verificarlas contra una fuente confiable (ej.
+        # Etherscan Label Cloud / Arkham) — una dirección incorrecta contaminaría los datos
+        # guardados en la BD de forma silenciosa.
         self.EXCHANGE_WALLETS = [
             "0x28C6c06298d514Db089934071355E5743bf21d60", # Binance 14
             "0xF977814e90dA44bFA03b6295A0616a897441aceC"  # Binance 8
@@ -56,23 +61,33 @@ class BlockExplorerClient:
                 "apikey": self.etherscan_key
             }
             try:
-                res = requests.get(url, params=params)
+                res = requests.get(url, params=params, timeout=15)
                 data = res.json()
-                if data.get("status") == "1":
-                    batch = data.get("result", [])
-                    all_results.extend(batch)
-                    
-                    if len(batch) < 1000:
-                        break  # No hay más resultados disponibles
-                        
-                    last_ts = int(batch[-1]['timeStamp'])
-                    if last_ts < min_timestamp:
-                        break  # Alcanzamos el límite de fecha histórico solicitado
-                else:
-                    break
             except Exception as e:
-                logger.error(f"Error fetching from Etherscan: {e}")
+                logger.error(f"Error de red consultando Etherscan: {e}")
                 break
+
+            status = data.get("status")
+            message = str(data.get("message", "")).strip()
+
+            if status == "1":
+                batch = data.get("result", [])
+                all_results.extend(batch)
+
+                if len(batch) < 1000:
+                    break  # No hay más resultados disponibles
+
+                last_ts = int(batch[-1]['timeStamp'])
+                if last_ts < min_timestamp:
+                    break  # Alcanzamos el límite de fecha histórico solicitado
+            elif message.lower() == "no transactions found":
+                # Resultado legítimo: sin actividad en el rango pedido (no es un error).
+                break
+            else:
+                # Error real de la API (key inválida, rate limit, parámetros
+                # malformados...): antes se trataba igual que "sin resultados" y la
+                # sincronización reportaba éxito con 0 registros, ocultando el fallo real.
+                raise RuntimeError(f"Etherscan devolvió un error (status={status}): {message or data.get('result')}")
                 
             time.sleep(0.3)  # Rate limit para APIs gratuitas
             
@@ -106,7 +121,10 @@ class BlockExplorerClient:
                 is_mint = tx['from'].lower() == self.ZERO_ADDRESS.lower()
                 
                 records.append({
-                    "metric_name": f"{symbol}_Mint" if is_mint else f"{symbol}_Burn",
+                    # Nombre "desnudo" (sin prefijo de símbolo), consistente con el resto
+                    # de proveedores (CryptoQuant/DefiLlama/CoinGecko/Glassnode), que ya
+                    # guardan el símbolo aparte en la columna `symbol`.
+                    "metric_name": "Mint" if is_mint else "Burn",
                     "symbol": symbol,
                     "timestamp": ts,
                     "value": val,
@@ -144,7 +162,7 @@ class BlockExplorerClient:
                     is_inflow = tx['to'].lower() == wallet.lower()
                     
                     records.append({
-                        "metric_name": f"{symbol}_Exchange_Inflow" if is_inflow else f"{symbol}_Exchange_Outflow",
+                        "metric_name": "Exchange_Inflow" if is_inflow else "Exchange_Outflow",
                         "symbol": symbol,
                         "timestamp": ts,
                         "value": val,
@@ -190,7 +208,7 @@ class BlockExplorerClient:
         }
         
         try:
-            res = requests.get(url, params=params)
+            res = requests.get(url, params=params, timeout=15)
             data = res.json()
             market_caps = data.get("market_caps", [])
             
@@ -202,7 +220,7 @@ class BlockExplorerClient:
                 
                 if ts >= start_date.replace(tzinfo=timezone.utc):
                     records.append({
-                        "metric_name": f"{symbol}_Total_Supply",
+                        "metric_name": "Total_Supply",
                         "symbol": symbol,
                         "timestamp": ts,
                         "value": val,

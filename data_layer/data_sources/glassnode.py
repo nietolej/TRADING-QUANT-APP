@@ -68,7 +68,7 @@ class GlassnodeProvider(BaseOnChainProvider):
         }
 
         try:
-            response = requests.get(url, params=params)
+            response = requests.get(url, params=params, timeout=15)
             
             # Glassnode devuelve 401 si la API key es inválida, 
             # y 403 si la métrica requiere un Tier de pago (Tier 2/3)

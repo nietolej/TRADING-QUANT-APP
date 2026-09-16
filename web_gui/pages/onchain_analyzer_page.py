@@ -10,23 +10,43 @@ from data_layer.market_data import MarketDataManager
 import asyncio
 import concurrent.futures
 
+# Métricas soportadas por símbolo: la UI solo debe ofrecer combinaciones válidas, ya que
+# antes un mismo dropdown mezclaba métricas de stablecoins (Mint/Burn, vía Etherscan) con
+# métricas de CryptoQuant (solo BTC/ETH) y una combinación inválida (ej. BTC + Mint) caía
+# silenciosamente en el proveedor equivocado, devolviendo "0 nuevos registros" sin explicar
+# por qué.
+CRYPTOQUANT_METRICS = [
+    'exchange_netflow', 'exchange_inflow', 'exchange_outflow', 'exchange_reserve',
+    'miner_reserve', 'miner_netflow', 'puell_multiple', 'mvrv', 'nvt_golden_cross',
+    'sopr', 'active_addresses', 'funding_rates', 'open_interest',
+    'estimated_leverage_ratio', 'taker_buy_sell_ratio', 'nupl', 'stock_to_flow'
+]
+STABLECOIN_METRICS = ['Mint', 'Burn', 'Exchange_Inflow', 'Exchange_Outflow', 'Total_Supply']
+
+METRICS_BY_SYMBOL = {
+    'BTC': CRYPTOQUANT_METRICS + ['Total_Supply'],
+    'ETH': list(CRYPTOQUANT_METRICS),
+    'USDT': list(STABLECOIN_METRICS),
+    'USDC': list(STABLECOIN_METRICS),
+}
+
 def fetch_data_async(symbol, days, metric=None):
     """
     Función síncrona que envuelve las llamadas pesadas de APIs para correr en threadpool.
     """
     start_date = datetime.now(timezone.utc) - timedelta(days=days)
-    
-    cryptoquant_metrics = [
-        'exchange_netflow', 'exchange_inflow', 'exchange_outflow', 'exchange_reserve',
-        'miner_reserve', 'miner_netflow', 'puell_multiple', 'mvrv', 'nvt_golden_cross', 
-        'sopr', 'active_addresses', 'funding_rates', 'open_interest', 
-        'estimated_leverage_ratio', 'taker_buy_sell_ratio', 'nupl', 'stock_to_flow'
-    ]
-    
-    records_saved = 0
+
+    valid_metrics_lower = {m.lower() for m in METRICS_BY_SYMBOL.get(symbol, [])}
     metric_lower = metric.lower() if metric else ""
-    
-    if metric_lower in cryptoquant_metrics or symbol in ['BTC', 'ETH']:
+    if metric_lower not in valid_metrics_lower:
+        raise ValueError(
+            f"La métrica '{metric}' no aplica para el símbolo '{symbol}'. "
+            f"Métricas válidas para {symbol}: {', '.join(METRICS_BY_SYMBOL.get(symbol, []))}."
+        )
+
+    records_saved = 0
+
+    if symbol in ['BTC', 'ETH']:
         # Usar CryptoQuant provider
         db = SessionLocal()
         mgr = OnChainDataManager(db)
@@ -82,22 +102,32 @@ def render_onchain_analyzer():
                 value='BTC',
                 label='Activo / Moneda'
             ).classes('w-48')
-            
+
             days_input = ui.number(
-                label='Días de Histórico', 
-                value=30, 
-                min=1, 
+                label='Días de Histórico',
+                value=30,
+                min=1,
                 max=3650
             ).classes('w-32')
-            
+
+            # Las opciones de métrica se filtran según el símbolo elegido (ver
+            # _on_symbol_change más abajo): antes el dropdown mezclaba métricas de
+            # stablecoins con métricas de CryptoQuant sin importar el símbolo, permitiendo
+            # combinaciones sin sentido (ej. BTC + Mint) que fallaban en silencio.
             metric_select = ui.select(
-                options=[
-                    'Mint', 'Burn', 'Exchange_Inflow', 'Exchange_Outflow', 'Total_Supply',
-                    'exchange_netflow', 'exchange_reserve', 'miner_reserve', 'puell_multiple', 'mvrv', 'nupl'
-                ],
-                value='Exchange_Inflow',
+                options=METRICS_BY_SYMBOL['BTC'],
+                value=METRICS_BY_SYMBOL['BTC'][0],
                 label='Métrica On-Chain'
             ).classes('w-64')
+
+            def _on_symbol_change():
+                valid_metrics = METRICS_BY_SYMBOL.get(symbol_select.value, [])
+                metric_select.options = valid_metrics
+                if valid_metrics and metric_select.value not in valid_metrics:
+                    metric_select.value = valid_metrics[0]
+                metric_select.update()
+
+            symbol_select.on_value_change(lambda e: _on_symbol_change())
 
             fetch_btn = ui.button('Sincronizar APIs', icon='sync').classes('bg-amber-500 text-slate-900 font-bold')
             plot_btn = ui.button('Graficar Datos', icon='insights').classes('bg-slate-700 text-white font-bold')

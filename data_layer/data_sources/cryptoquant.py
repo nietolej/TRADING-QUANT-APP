@@ -75,7 +75,7 @@ class CryptoQuantProvider(BaseOnChainProvider):
         }
 
         try:
-            response = requests.get(url, headers=self.headers, params=params)
+            response = requests.get(url, headers=self.headers, params=params, timeout=15)
             response.raise_for_status()
             data = response.json()
             
