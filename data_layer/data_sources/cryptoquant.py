@@ -22,36 +22,42 @@ class CryptoQuantProvider(BaseOnChainProvider):
     def fetch_metric(self, metric_name: str, symbol: str, start_date: datetime, end_date: datetime) -> pd.DataFrame:
         if not self.api_key or self.api_key == "tu_clave_api_aqui":
             raise ValueError("API Key de CryptoQuant no configurada en el archivo .env")
-            
-        # CryptoQuant espera el activo (ej. BTC) en lugar del par completo
+
+        if start_date.tzinfo is None:
+            start_date = start_date.replace(tzinfo=timezone.utc)
+        if end_date and end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
+
+        # CryptoQuant espera el activo (ej. BTC) en lugar del par completo. Solo BTC y ETH
+        # tienen cobertura de métricas en la API v1; cualquier otro símbolo cae a BTC por
+        # defecto. Este `asset` DEBE usarse al construir cada endpoint: antes quedaba
+        # calculado pero sin usar, y todos los endpoints estaban hardcodeados a /btc/, así
+        # que pedir métricas de ETH devolvía (y guardaba en la BD) datos de Bitcoin
+        # etiquetados como si fueran de otro activo.
         asset = symbol.split('/')[0].lower() if '/' in symbol else symbol.lower()
-        
+        if asset not in ["btc", "eth"]:
+            asset = "btc"
+
         # Mapeo de métricas internas a endpoints de CryptoQuant
         endpoint_map = {
-            "exchange_netflow": f"/btc/exchange-flows/netflow?exchange=all_exchange&window=day",
-            "exchange_inflow": f"/btc/exchange-flows/inflow?exchange=all_exchange&window=day",
-            "exchange_outflow": f"/btc/exchange-flows/outflow?exchange=all_exchange&window=day",
-            "exchange_reserve": f"/btc/exchange-flows/reserve?exchange=all_exchange&window=day",
-            "miner_reserve": f"/btc/miner-flows/reserve?window=day",
-            "miner_netflow": f"/btc/miner-flows/netflow?window=day",
-            "puell_multiple": f"/btc/market-data/puell-multiple?window=day",
-            "mvrv": f"/btc/market-data/mvrv?window=day",
-            "nvt_golden_cross": f"/btc/market-data/nvt-golden-cross?window=day",
-            "sopr": f"/btc/market-data/sopr?window=day",
-            "active_addresses": f"/btc/network-data/active-addresses?window=day",
-            "funding_rates": f"/btc/market-data/funding-rates?window=day",
-            "open_interest": f"/btc/market-data/open-interest?window=day",
-            "estimated_leverage_ratio": f"/btc/market-data/estimated-leverage-ratio?window=day",
-            "taker_buy_sell_ratio": f"/btc/market-data/taker-buy-sell-ratio?window=day",
-            "nupl": f"/btc/market-data/nupl?window=day",
-            "stock_to_flow": f"/btc/market-data/stock-to-flow?window=day"
+            "exchange_netflow": f"/{asset}/exchange-flows/netflow?exchange=all_exchange&window=day",
+            "exchange_inflow": f"/{asset}/exchange-flows/inflow?exchange=all_exchange&window=day",
+            "exchange_outflow": f"/{asset}/exchange-flows/outflow?exchange=all_exchange&window=day",
+            "exchange_reserve": f"/{asset}/exchange-flows/reserve?exchange=all_exchange&window=day",
+            "miner_reserve": f"/{asset}/miner-flows/reserve?window=day",
+            "miner_netflow": f"/{asset}/miner-flows/netflow?window=day",
+            "puell_multiple": f"/{asset}/market-data/puell-multiple?window=day",
+            "mvrv": f"/{asset}/market-data/mvrv?window=day",
+            "nvt_golden_cross": f"/{asset}/market-data/nvt-golden-cross?window=day",
+            "sopr": f"/{asset}/market-data/sopr?window=day",
+            "active_addresses": f"/{asset}/network-data/active-addresses?window=day",
+            "funding_rates": f"/{asset}/market-data/funding-rates?window=day",
+            "open_interest": f"/{asset}/market-data/open-interest?window=day",
+            "estimated_leverage_ratio": f"/{asset}/market-data/estimated-leverage-ratio?window=day",
+            "taker_buy_sell_ratio": f"/{asset}/market-data/taker-buy-sell-ratio?window=day",
+            "nupl": f"/{asset}/market-data/nupl?window=day",
+            "stock_to_flow": f"/{asset}/market-data/stock-to-flow?window=day"
         }
-        
-        # Por ahora CryptoQuant API v1 a menudo requiere especificar si es btc o eth
-        # Usaremos BTC para el ejemplo si el activo es BTC
-        if asset not in ["btc", "eth"]:
-            asset = "btc" # Default to BTC for CryptoQuant metrics if symbol is GLOBAL or generic
-
 
         endpoint = endpoint_map.get(metric_name)
         if not endpoint:

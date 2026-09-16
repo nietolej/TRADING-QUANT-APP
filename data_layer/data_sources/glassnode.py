@@ -20,7 +20,16 @@ class GlassnodeProvider(BaseOnChainProvider):
     def fetch_metric(self, metric_name: str, symbol: str, start_date: datetime, end_date: datetime) -> pd.DataFrame:
         if not self.api_key or self.api_key == "tu_clave_glassnode_aqui":
             raise ValueError("API Key de Glassnode no configurada en el archivo .env")
-            
+
+        # Sin esto, un start_date "naive" (ej. venido de la BD) hacía que .timestamp() lo
+        # interpretara como hora LOCAL en vez de UTC (desplazando la ventana de descarga
+        # por el offset horario del servidor), y la comparación tz-aware/naive más abajo
+        # lanzaba TypeError.
+        if start_date.tzinfo is None:
+            start_date = start_date.replace(tzinfo=timezone.utc)
+        if end_date and end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=timezone.utc)
+
         asset = symbol.split('/')[0].upper() if '/' in symbol else symbol.upper()
         
         # Mapeo de métricas internas a endpoints de Glassnode

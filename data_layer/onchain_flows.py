@@ -234,31 +234,44 @@ class BlockExplorerClient:
                     "source": rec['source']
                 }
             
-        saved_count = 0
-        for key, rec in grouped_records.items():
-            exists = self.db.query(OnChainMetric).filter_by(
-                metric_name=rec['metric_name'], 
-                symbol=rec['symbol'], 
-                timestamp=rec['timestamp']
-            ).first()
-            
-            if not exists:
-                metric_obj = OnChainMetric(
-                    metric_name=rec['metric_name'],
-                    symbol=rec['symbol'],
-                    timestamp=rec['timestamp'],
-                    value=rec['value'],
-                    source=rec['source']
-                )
-                self.db.add(metric_obj)
-                saved_count += 1
-                
+        # Una sola consulta de existencia por cada (metric_name, symbol) presente en el
+        # batch, en vez de un SELECT por registro (antes: hasta cientos de idas y vueltas
+        # a la BD por sincronización, una por cada transferencia de Etherscan).
+        by_metric_symbol: dict = {}
+        for (metric_name, symbol, ts), rec in grouped_records.items():
+            by_metric_symbol.setdefault((metric_name, symbol), []).append(ts)
+
+        existing_keys = set()
+        for (metric_name, symbol), timestamps in by_metric_symbol.items():
+            rows = self.db.query(OnChainMetric.timestamp).filter(
+                OnChainMetric.metric_name == metric_name,
+                OnChainMetric.symbol == symbol,
+                OnChainMetric.timestamp.in_(timestamps)
+            ).all()
+            for (ts,) in rows:
+                existing_keys.add((metric_name, symbol, ts))
+
+        new_objects = [
+            OnChainMetric(
+                metric_name=rec['metric_name'],
+                symbol=rec['symbol'],
+                timestamp=rec['timestamp'],
+                value=rec['value'],
+                source=rec['source']
+            )
+            for key, rec in grouped_records.items() if key not in existing_keys
+        ]
+
+        if not new_objects:
+            return 0
+
         try:
+            self.db.bulk_save_objects(new_objects)
             self.db.commit()
-            logger.info(f"Guardados {saved_count} nuevos registros on-chain flow.")
+            logger.info(f"Guardados {len(new_objects)} nuevos registros on-chain flow.")
         except Exception as e:
             self.db.rollback()
             logger.error(f"Error al guardar en BD: {e}")
             raise e
-            
-        return saved_count
+
+        return len(new_objects)
