@@ -39,13 +39,19 @@ class BlockExplorerClient:
             "0xF977814e90dA44bFA03b6295A0616a897441aceC"  # Binance 8
         ]
 
-    def _fetch_etherscan_transfers(self, contract_address: str, target_address: str, min_timestamp: float = 0, max_pages: int = 50) -> list:
-        if not self.etherscan_key:
-            raise ValueError("Falta configurar 'ETHERSCAN_API_KEY' en el archivo .env")
-            
+    def _fetch_etherscan_page_window(self, contract_address: str, target_address: str, end_block: int, min_timestamp: float, max_pages: int) -> tuple:
+        """
+        Trae hasta `max_pages` páginas (offset 1000) dentro de una sola ventana de
+        `endblock`. Etherscan rechaza page*offset > 10000, así que con max_pages=10 nunca
+        se toca ese límite duro dentro de una ventana; en cambio se detecta si la ventana
+        se "llenó" (10 páginas completas) para que el llamador abra una ventana más
+        antigua en vez de perder el histórico previo a la página 10.
+
+        Returns: (resultados: list, ventana_llena: bool)
+        """
         url = "https://api.etherscan.io/v2/api"
-        all_results = []
-        
+        window_results = []
+
         for page in range(1, max_pages + 1):
             params = {
                 "chainid": 1,
@@ -56,7 +62,7 @@ class BlockExplorerClient:
                 "page": page,
                 "offset": 1000,
                 "startblock": 0,
-                "endblock": 99999999,
+                "endblock": end_block,
                 "sort": "desc",
                 "apikey": self.etherscan_key
             }
@@ -65,7 +71,7 @@ class BlockExplorerClient:
                 data = res.json()
             except Exception as e:
                 logger.error(f"Error de red consultando Etherscan: {e}")
-                break
+                return window_results, False
 
             status = data.get("status")
             message = str(data.get("message", "")).strip()
@@ -76,39 +82,68 @@ class BlockExplorerClient:
 
             if status == "1":
                 batch = data.get("result", [])
-                all_results.extend(batch)
+                window_results.extend(batch)
 
                 if len(batch) < 1000:
-                    break  # No hay más resultados disponibles
+                    return window_results, False  # No hay más resultados en absoluto
 
                 last_ts = int(batch[-1]['timeStamp'])
                 if last_ts < min_timestamp:
-                    break  # Alcanzamos el límite de fecha histórico solicitado
+                    return window_results, False  # Ya cubrimos el rango de fechas pedido
             elif "no transactions found" in detail_text:
-                # Resultado legítimo: sin actividad en el rango pedido (no es un error).
-                break
-            elif "result window is too large" in detail_text:
-                # Límite duro y documentado de Etherscan: page * offset <= 10000, o sea un
-                # máximo de 10 páginas de 1000 (~10.000 transferencias) por dirección/token.
-                # Con sort=desc ya se trajeron las 10.000 más recientes; para tokens muy
-                # transaccionados (USDT/USDC) en rangos largos (365 días) es habitual
-                # tocar este techo. No es un fallo de la sincronización, es una limitación
-                # de la API gratuita: se corta aquí y se usa lo ya descargado en vez de
-                # abortar toda la sincronización.
-                logger.warning(
-                    f"Etherscan alcanzó su límite de paginación (10.000 registros) para "
-                    f"{contract_address}/{target_address}; el histórico más antiguo del "
-                    f"rango pedido puede quedar incompleto."
-                )
-                break
+                # Resultado legítimo: sin actividad en esta ventana (no es un error).
+                return window_results, False
             else:
                 # Error real de la API (key inválida, rate limit, parámetros
                 # malformados...): antes se trataba igual que "sin resultados" y la
                 # sincronización reportaba éxito con 0 registros, ocultando el fallo real.
-                raise RuntimeError(f"Etherscan devolvió un error (status={status}): {message or data.get('result')}")
-                
+                raise RuntimeError(f"Etherscan devolvió un error (status={status}): {message or result_field}")
+
             time.sleep(0.3)  # Rate limit para APIs gratuitas
-            
+
+        # El for terminó las max_pages sin cortar antes: la ventana se llenó por completo,
+        # es probable que haya más historia por debajo del bloque más antiguo obtenido.
+        return window_results, True
+
+    def _fetch_etherscan_transfers(self, contract_address: str, target_address: str, min_timestamp: float = 0, max_windows: int = 500) -> list:
+        """
+        Descarga TODAS las transferencias de un token para una dirección desde el bloque
+        más reciente hasta `min_timestamp` (o hasta el origen del contrato si
+        min_timestamp=0), sin perder historial: Etherscan limita cada consulta a 10
+        páginas de 1000 (10.000 registros) por rango de bloques, así que al llenarse una
+        ventana se usa el `blockNumber` de la transferencia más antigua obtenida como
+        nuevo `endblock` y se abre una ventana siguiente desde la página 1 — permitiendo
+        recorrer todo el histórico en tramos de 10.000 en vez de perder todo lo anterior
+        a la página 10 de la primera ventana.
+        """
+        if not self.etherscan_key:
+            raise ValueError("Falta configurar 'ETHERSCAN_API_KEY' en el archivo .env")
+
+        all_results = []
+        end_block = 99999999
+
+        for _ in range(max_windows):
+            window_results, window_full = self._fetch_etherscan_page_window(
+                contract_address, target_address, end_block, min_timestamp, max_pages=10
+            )
+            all_results.extend(window_results)
+
+            if not window_results or not window_full:
+                break
+
+            oldest = min(window_results, key=lambda tx: int(tx['blockNumber']))
+            oldest_block = int(oldest['blockNumber'])
+            oldest_ts = int(oldest['timeStamp'])
+            if oldest_ts < min_timestamp or oldest_block <= 1:
+                break
+            end_block = oldest_block - 1
+        else:
+            logger.warning(
+                f"Se alcanzó el límite de seguridad de {max_windows} ventanas consultando "
+                f"Etherscan para {contract_address}/{target_address}; puede haber histórico "
+                f"más antiguo sin descargar."
+            )
+
         return all_results
 
     def fetch_stablecoin_supply(self, symbol: str, start_date: datetime):
