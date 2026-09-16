@@ -23,6 +23,12 @@ CRYPTOQUANT_METRICS = [
 ]
 STABLECOIN_METRICS = ['Mint', 'Burn', 'Exchange_Inflow', 'Exchange_Outflow', 'Total_Supply']
 
+# Subconjunto de CRYPTOQUANT_METRICS que Binance también publica gratis y sin API key
+# (endpoints públicos de Futures) — ver data_sources/binance_public_provider.py. El resto
+# de métricas de CryptoQuant (mvrv, sopr, puell_multiple, exchange_netflow, etc.) son
+# cálculos propietarios sin equivalente público gratuito.
+FREE_BINANCE_METRICS = {'funding_rates', 'open_interest', 'taker_buy_sell_ratio'}
+
 METRICS_BY_SYMBOL = {
     'BTC': CRYPTOQUANT_METRICS + ['Total_Supply'],
     'ETH': list(CRYPTOQUANT_METRICS),
@@ -47,7 +53,6 @@ def fetch_data_async(symbol, days, metric=None):
     records_saved = 0
 
     if symbol in ['BTC', 'ETH']:
-        # Usar CryptoQuant provider
         db = SessionLocal()
         mgr = OnChainDataManager(db)
         try:
@@ -55,9 +60,13 @@ def fetch_data_async(symbol, days, metric=None):
             if mapped_metric == 'total_supply':
                 mapped_metric = 'btc_market_cap' if symbol == 'BTC' else 'stablecoin_market_cap'
                 provider = 'coingecko' if symbol == 'BTC' else 'defillama'
+            elif mapped_metric in FREE_BINANCE_METRICS:
+                # Sin costo ni API key: usa los endpoints públicos de Binance Futures en
+                # vez de CryptoQuant para las métricas que Binance sí publica gratis.
+                provider = 'binance_public'
             else:
                 provider = 'cryptoquant'
-                
+
             count = mgr.update_historical_data(
                 metric_name=mapped_metric,
                 symbol=symbol,
@@ -323,7 +332,15 @@ def render_onchain_analyzer():
                         ui.label('Unidades nativas de Tokens (Escala Lineal)')
                     with ui.column().classes('gap-1'):
                         ui.label('📡 Fuente de Datos').classes('font-bold text-slate-300')
-                        source_text = 'CoinGecko API (Global Market Cap)' if 'Total_Supply' in metric_suffix else 'Etherscan API (Ethereum Mainnet)'
+                        # Se toma del propio dato descargado (columna `source`) en vez de
+                        # adivinarlo por el nombre de la métrica: antes siempre decía
+                        # "Etherscan" para cualquier métrica que no fuera Total_Supply, lo
+                        # cual era incorrecto para todo lo que viniera de CryptoQuant,
+                        # Glassnode o Binance.
+                        if 'source' in df_onchain.columns and not df_onchain['source'].empty:
+                            source_text = df_onchain['source'].mode().iloc[0]
+                        else:
+                            source_text = 'Desconocida'
                         ui.label(source_text)
                 
             # Renderizar Tabla de los últimos 100 registros crudos

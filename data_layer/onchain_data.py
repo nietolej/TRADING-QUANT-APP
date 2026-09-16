@@ -6,6 +6,7 @@ from .data_sources.defillama import DefiLlamaProvider
 from .data_sources.cryptoquant import CryptoQuantProvider
 from .data_sources.coingecko import CoinGeckoProvider
 from .data_sources.glassnode import GlassnodeProvider
+from .data_sources.binance_public_provider import BinancePublicOnChainProvider
 
 class OnChainDataManager:
     def __init__(self, db_session: Session = None):
@@ -14,7 +15,10 @@ class OnChainDataManager:
             'defillama': DefiLlamaProvider(),
             'cryptoquant': CryptoQuantProvider(),
             'coingecko': CoinGeckoProvider(),
-            'glassnode': GlassnodeProvider()
+            'glassnode': GlassnodeProvider(),
+            # Único proveedor sin API key: cubre funding_rates, open_interest y
+            # taker_buy_sell_ratio usando los endpoints públicos de Binance Futures.
+            'binance_public': BinancePublicOnChainProvider(),
         }
 
     def update_historical_data(self, metric_name: str, symbol: str, start_date: datetime, provider_name: str):
