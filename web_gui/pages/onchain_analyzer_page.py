@@ -32,11 +32,13 @@ STABLECOIN_METRICS = [
 # cálculos propietarios sin equivalente público gratuito.
 FREE_BINANCE_METRICS = {'funding_rates', 'open_interest', 'taker_buy_sell_ratio'}
 
-# Métricas que Glassnode también publica en su tier gratuito (Tier 1, requiere una API key
-# gratuita sin tarjeta de crédito en glassnode.com/studio) — a diferencia de CryptoQuant,
-# que exige una suscripción de pago para cualquier métrica. Se prefiere Glassnode por
-# defecto para estas, y CryptoQuant queda como única opción para lo que Glassnode no cubre
-# (nvt_golden_cross, miner_netflow, stock_to_flow, estimated_leverage_ratio).
+# Métricas que Glassnode también publica. CORRECCIÓN (2026-09-16): a diferencia de lo que
+# se asumió inicialmente, el API de Glassnode NO tiene tier gratuito — su propia
+# documentación confirma que hasta el "Light API" (14 días de historia, resolución diaria,
+# 50 llamadas/día) exige el plan de pago "Advanced" (~USD 49-99/mes). Se deja como
+# alternativa a CryptoQuant únicamente porque puede resultar más barata según el caso, NO
+# porque sea gratuita — ambas requieren pagar. exchange_reserve de BTC es la única de este
+# grupo con alternativa 100% gratuita (ver blockchain_info_provider.py).
 GLASSNODE_METRICS = {
     'sopr', 'puell_multiple', 'mvrv', 'nupl', 'active_addresses',
     'exchange_netflow', 'exchange_inflow', 'exchange_outflow', 'exchange_reserve',
@@ -74,12 +76,20 @@ def fetch_data_async(symbol, days, metric=None):
             if mapped_metric == 'total_supply':
                 mapped_metric = 'btc_market_cap' if symbol == 'BTC' else 'stablecoin_market_cap'
                 provider = 'coingecko' if symbol == 'BTC' else 'defillama'
+            elif mapped_metric == 'exchange_reserve' and symbol == 'BTC':
+                # Sin costo ni API key en absoluto: balance real de una wallet de Binance
+                # públicamente verificada (ver blockchain_info_provider.py). Preferida sobre
+                # Glassnode/CryptoQuant, que para esta métrica exigen suscripción de pago.
+                provider = 'blockchain_info'
             elif mapped_metric in FREE_BINANCE_METRICS:
                 # Sin costo ni API key: usa los endpoints públicos de Binance Futures en
                 # vez de CryptoQuant para las métricas que Binance sí publica gratis.
                 provider = 'binance_public'
             elif mapped_metric in GLASSNODE_METRICS:
-                # Glassnode tiene tier gratuito (requiere key sin costo); CryptoQuant no.
+                # NOTA: Glassnode NO es gratis (se verificó el 2026-09-16 en su propia
+                # documentación) — el API mínimo (Light API) exige plan "Advanced" de pago.
+                # Se deja como alternativa a CryptoQuant solo porque suele ser más barato,
+                # no porque sea gratuita; requiere GLASSNODE_API_KEY de una cuenta de pago.
                 provider = 'glassnode'
             else:
                 provider = 'cryptoquant'
