@@ -4,6 +4,7 @@ import requests
 import pandas as pd
 from datetime import datetime, timezone
 import logging
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from .storage import OnChainMetric, SessionLocal
 from .data_sources.defillama import DefiLlamaProvider
@@ -147,6 +148,32 @@ class BlockExplorerClient:
 
         return all_results
 
+    def _get_last_synced_timestamp(self, metric_names: list, symbol: str):
+        """
+        Último timestamp ya guardado para estas métricas/símbolo, considerando también
+        las variantes con prefijo de símbolo de versiones anteriores del código (ver
+        onchain_analyzer_page.py:metric_name_candidates). None si nunca se sincronizó.
+        """
+        all_names = list(metric_names) + [f"{symbol}_{name}" for name in metric_names]
+        last_ts = self.db.query(func.max(OnChainMetric.timestamp)).filter(
+            OnChainMetric.metric_name.in_(all_names),
+            OnChainMetric.symbol == symbol
+        ).scalar()
+        return last_ts.replace(tzinfo=timezone.utc) if last_ts else None
+
+    def _effective_start(self, requested_start: datetime, metric_names: list, symbol: str) -> datetime:
+        """
+        Sincronización incremental: si ya hay datos guardados más recientes que
+        `requested_start`, se continúa desde ahí en vez de repaginar todo el rango
+        pedido en Etherscan en cada click de "Sincronizar APIs" (antes: cada sync
+        volvía a descargar desde `requested_start` sin importar lo ya guardado).
+        """
+        requested_start = requested_start.replace(tzinfo=timezone.utc)
+        last_ts = self._get_last_synced_timestamp(metric_names, symbol)
+        if last_ts and last_ts > requested_start:
+            return last_ts
+        return requested_start
+
     def fetch_stablecoin_supply(self, symbol: str, start_date: datetime):
         """
         Calcula y guarda Mints y Burns (basados en transferencias desde/hacia la dirección cero).
@@ -155,21 +182,22 @@ class BlockExplorerClient:
         if not contract:
             logger.error(f"Token {symbol} no soportado en BlockExplorerClient.")
             return 0
-            
-        logger.info(f"Descargando transferencias a Zero Address (Mints/Burns) para {symbol}")
+
+        effective_start = self._effective_start(start_date, ['Mint', 'Burn'], symbol)
+        logger.info(f"Descargando transferencias a Zero Address (Mints/Burns) para {symbol} desde {effective_start}")
         # Asumimos Mints (de 0x0 a cualquier lugar) y Burns (de cualquier lugar a 0x0)
         # Al filtrar por "address" = 0x0 en Etherscan, nos trae transferencias donde 0x0 es from o to.
-        min_ts = start_date.replace(tzinfo=timezone.utc).timestamp()
+        min_ts = effective_start.timestamp()
         txs = self._fetch_etherscan_transfers(contract, self.ZERO_ADDRESS, min_timestamp=min_ts)
-        
+
         records = []
         decimals = 6 # USDT y USDC usan 6 decimales
-        
+
         for tx in txs:
             try:
                 val = float(tx['value']) / (10 ** decimals)
                 ts = datetime.fromtimestamp(int(tx['timeStamp']), tz=timezone.utc)
-                if ts < start_date.replace(tzinfo=timezone.utc):
+                if ts < effective_start:
                     continue
                     
                 is_mint = tx['from'].lower() == self.ZERO_ADDRESS.lower()
@@ -199,21 +227,26 @@ class BlockExplorerClient:
         if not contract:
             return 0
 
+        # Sincronización incremental (ver fetch_stablecoin_supply): Netflow es derivado
+        # de Inflow/Outflow en este mismo run, así que basta con el último timestamp de
+        # esas dos.
+        effective_start = self._effective_start(start_date, ['Exchange_Inflow', 'Exchange_Outflow'], symbol)
+
         records = []
         decimals = 6
         daily_inflow: dict = {}
         daily_outflow: dict = {}
 
         for wallet in self.EXCHANGE_WALLETS:
-            logger.info(f"Descargando Exchange Flows para {symbol} en wallet {wallet}")
-            min_ts = start_date.replace(tzinfo=timezone.utc).timestamp()
+            logger.info(f"Descargando Exchange Flows para {symbol} en wallet {wallet} desde {effective_start}")
+            min_ts = effective_start.timestamp()
             txs = self._fetch_etherscan_transfers(contract, wallet, min_timestamp=min_ts)
 
             for tx in txs:
                 try:
                     val = float(tx['value']) / (10 ** decimals)
                     ts = datetime.fromtimestamp(int(tx['timeStamp']), tz=timezone.utc)
-                    if ts < start_date.replace(tzinfo=timezone.utc):
+                    if ts < effective_start:
                         continue
 
                     # Si el exchange recibe, es un Inflow. Si envía, es un Outflow.
