@@ -1658,36 +1658,52 @@ def render_halving_analyzer():
         def render_backtest_tab():
             backtest_container.clear()
 
-            # Si no hay resultados calculados previamente, intentar ejecutar backtest inicial
+            # Si no hay resultados calculados previamente, ejecutar el backtest inicial
+            # en un hilo aparte (run.io_bound) en vez de sincronicamente: dashboard()
+            # renderiza TODAS las pestanas de forma eager en el request inicial de '/',
+            # asi que calcular esto en el hilo del event loop congelaba la app entera
+            # (todas las peticiones, para todos los usuarios) durante todo el backtest.
             if bt_state["last_results"] is None:
-                try:
-                    bt_state["last_results"] = bt_engine.run_backtest(
-                        initial_capital=bt_state["initial_capital"],
-                        commission_pct=bt_state["commission_pct"],
-                        slippage_pct=bt_state["slippage_pct"],
-                        ema_fast=bt_state["ema_fast"],
-                        ema_slow=bt_state["ema_slow"],
-                        ema_trend=bt_state["ema_trend"],
-                        trend_mode=bt_state["trend_mode"],
-                        flow_window=bt_state["flow_window"],
-                        z_window=bt_state["z_window"],
-                        z_entry_threshold=bt_state["z_entry_threshold"],
-                        z_exit_threshold=bt_state["z_exit_threshold"],
-                        halving_filter_enabled=bt_state["halving_filter_enabled"],
-                        min_post_halving_days=bt_state["min_post_halving_days"],
-                        max_post_halving_days=bt_state["max_post_halving_days"],
-                        stop_loss_pct=bt_state["stop_loss_pct"],
-                        take_profit_pct=bt_state["take_profit_pct"],
-                        trailing_stop=bt_state["trailing_stop"]
-                    )
-                except Exception as err:
-                    with backtest_container:
-                        with ui.card().classes('w-full bg-[#111827] border border-amber-500/30 p-6 rounded-xl text-center'):
-                            ui.icon('warning', size='2.5rem', color='amber')
-                            ui.label('No se pudieron calcular los resultados iniciales del backtest de Stablecoins').classes('text-base font-bold text-white mt-2')
-                            ui.label(f'{err}').classes('text-xs text-slate-400 mt-1 font-mono')
-                            ui.button('Sincronizar y Reintentar', icon='refresh', on_click=lambda: on_refresh()).props('flat outline text-color=amber-400 size=sm').classes('mt-4 self-center')
-                    return
+                with backtest_container:
+                    ui.spinner('dots', size='lg', color='amber').classes('mx-auto mt-6')
+                    ui.label('Calculando backtest inicial de Stablecoins...').classes('text-xs text-slate-400 text-center mt-2 font-mono w-full')
+
+                async def _compute_initial_backtest():
+                    try:
+                        bt_state["last_results"] = await run.io_bound(
+                            lambda: bt_engine.run_backtest(
+                                initial_capital=bt_state["initial_capital"],
+                                commission_pct=bt_state["commission_pct"],
+                                slippage_pct=bt_state["slippage_pct"],
+                                ema_fast=bt_state["ema_fast"],
+                                ema_slow=bt_state["ema_slow"],
+                                ema_trend=bt_state["ema_trend"],
+                                trend_mode=bt_state["trend_mode"],
+                                flow_window=bt_state["flow_window"],
+                                z_window=bt_state["z_window"],
+                                z_entry_threshold=bt_state["z_entry_threshold"],
+                                z_exit_threshold=bt_state["z_exit_threshold"],
+                                halving_filter_enabled=bt_state["halving_filter_enabled"],
+                                min_post_halving_days=bt_state["min_post_halving_days"],
+                                max_post_halving_days=bt_state["max_post_halving_days"],
+                                stop_loss_pct=bt_state["stop_loss_pct"],
+                                take_profit_pct=bt_state["take_profit_pct"],
+                                trailing_stop=bt_state["trailing_stop"]
+                            )
+                        )
+                    except Exception as err:
+                        backtest_container.clear()
+                        with backtest_container:
+                            with ui.card().classes('w-full bg-[#111827] border border-amber-500/30 p-6 rounded-xl text-center'):
+                                ui.icon('warning', size='2.5rem', color='amber')
+                                ui.label('No se pudieron calcular los resultados iniciales del backtest de Stablecoins').classes('text-base font-bold text-white mt-2')
+                                ui.label(f'{err}').classes('text-xs text-slate-400 mt-1 font-mono')
+                                ui.button('Sincronizar y Reintentar', icon='refresh', on_click=lambda: on_refresh()).props('flat outline text-color=amber-400 size=sm').classes('mt-4 self-center')
+                        return
+                    render_backtest_tab()
+
+                background_tasks.create(_compute_initial_backtest())
+                return
 
             res = bt_state["last_results"]
             if not res or "metrics" not in res:

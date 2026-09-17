@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import plotly.graph_objects as from_plotly
 from plotly.subplots import make_subplots
@@ -9,6 +10,11 @@ from data_layer.onchain_data import OnChainDataManager
 from data_layer.market_data import MarketDataManager
 import asyncio
 import concurrent.futures
+
+
+def _glassnode_key_configured() -> bool:
+    key = os.getenv("GLASSNODE_API_KEY")
+    return bool(key) and key != "tu_clave_glassnode_aqui"
 
 # Métricas soportadas por símbolo: la UI solo debe ofrecer combinaciones válidas, ya que
 # antes un mismo dropdown mezclaba métricas de stablecoins (Mint/Burn, vía Etherscan) con
@@ -85,11 +91,16 @@ def fetch_data_async(symbol, days, metric=None):
                 # Sin costo ni API key: usa los endpoints públicos de Binance Futures en
                 # vez de CryptoQuant para las métricas que Binance sí publica gratis.
                 provider = 'binance_public'
-            elif mapped_metric in GLASSNODE_METRICS:
+            elif mapped_metric in GLASSNODE_METRICS and _glassnode_key_configured():
                 # NOTA: Glassnode NO es gratis (se verificó el 2026-09-16 en su propia
                 # documentación) — el API mínimo (Light API) exige plan "Advanced" de pago.
-                # Se deja como alternativa a CryptoQuant solo porque suele ser más barato,
-                # no porque sea gratuita; requiere GLASSNODE_API_KEY de una cuenta de pago.
+                # Se usa solo si GLASSNODE_API_KEY está configurada (cuenta de pago propia);
+                # de lo contrario cae a CryptoQuant, que cubre el mismo conjunto de métricas
+                # (ver GLASSNODE_METRICS ⊆ CRYPTOQUANT_METRICS) y sí puede estar ya pagado.
+                # Antes esto se enrutaba SIEMPRE a Glassnode sin verificar la key, así que
+                # cualquier cuenta con solo CryptoQuant configurado (el caso común) fallaba
+                # en 9 de las 17 métricas de BTC/ETH con "API Key de Glassnode no configurada",
+                # aunque CryptoQuant ya tenía cobertura y credenciales válidas para todas ellas.
                 provider = 'glassnode'
             else:
                 provider = 'cryptoquant'

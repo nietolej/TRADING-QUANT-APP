@@ -46,17 +46,26 @@ class CryptoQuantProvider(BaseOnChainProvider):
             "exchange_reserve": f"/{asset}/exchange-flows/reserve?exchange=all_exchange&window=day",
             "miner_reserve": f"/{asset}/miner-flows/reserve?window=day",
             "miner_netflow": f"/{asset}/miner-flows/netflow?window=day",
-            "puell_multiple": f"/{asset}/market-data/puell-multiple?window=day",
-            "mvrv": f"/{asset}/market-data/mvrv?window=day",
-            "nvt_golden_cross": f"/{asset}/market-data/nvt-golden-cross?window=day",
-            "sopr": f"/{asset}/market-data/sopr?window=day",
-            "active_addresses": f"/{asset}/network-data/active-addresses?window=day",
+            # Rutas verificadas contra el OpenAPI spec real de CryptoQuant
+            # (https://docs.cryptoquant.com/openapi/v1.json): puell-multiple, nvt-golden-cross,
+            # nupl y stock-to-flow viven bajo 'network-indicator', no 'market-data' (devolvian
+            # 404 con la ruta anterior); mvrv y sopr viven bajo 'market-indicator'; y
+            # 'active-addresses' no existe como tal, el campo real es 'addresses-count' bajo
+            # 'network-data'. Nota: ninguno de estos 6 indicadores existe para ETH en el spec
+            # (solo estimated_leverage_ratio sí), asi que para ETH seguiran devolviendo 404.
+            "puell_multiple": f"/{asset}/network-indicator/puell-multiple?window=day",
+            "mvrv": f"/{asset}/market-indicator/mvrv?window=day",
+            "nvt_golden_cross": f"/{asset}/network-indicator/nvt-golden-cross?window=day",
+            "sopr": f"/{asset}/market-indicator/sopr?window=day",
+            "active_addresses": f"/{asset}/network-data/addresses-count?window=day",
             "funding_rates": f"/{asset}/market-data/funding-rates?window=day",
             "open_interest": f"/{asset}/market-data/open-interest?window=day",
-            "estimated_leverage_ratio": f"/{asset}/market-data/estimated-leverage-ratio?window=day",
-            "taker_buy_sell_ratio": f"/{asset}/market-data/taker-buy-sell-ratio?window=day",
-            "nupl": f"/{asset}/market-data/nupl?window=day",
-            "stock_to_flow": f"/{asset}/market-data/stock-to-flow?window=day"
+            "estimated_leverage_ratio": f"/{asset}/market-indicator/estimated-leverage-ratio?window=day",
+            # 'taker-buy-sell-ratio' no existe en la API real; el endpoint correcto es
+            # 'taker-buy-sell-stats' (verificado contra el OpenAPI spec).
+            "taker_buy_sell_ratio": f"/{asset}/market-data/taker-buy-sell-stats?window=day",
+            "nupl": f"/{asset}/network-indicator/nupl?window=day",
+            "stock_to_flow": f"/{asset}/network-indicator/stock-to-flow?window=day"
         }
 
         endpoint = endpoint_map.get(metric_name)
