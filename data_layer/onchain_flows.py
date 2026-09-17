@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import logging
 from sqlalchemy.orm import Session
 from .storage import OnChainMetric, SessionLocal
+from .data_sources.defillama import DefiLlamaProvider
 
 logger = logging.getLogger(__name__)
 
@@ -298,60 +299,46 @@ class BlockExplorerClient:
 
     def fetch_total_supply(self, symbol: str, start_date: datetime):
         """
-        Descarga el Total Supply histórico (Market Cap) usando la API gratuita de CoinGecko.
-        Para stablecoins (precio = 1 USD), Market Cap == Circulating / Total Supply.
+        Descarga el Total Supply histórico (oferta circulante) vía DefiLlama, que
+        publica el histórico diario completo desde que empezó a trackear cada stablecoin
+        (sin tope de 365 días como el tier gratuito de CoinGecko que se usaba antes —
+        ver auditoría 2026-09-17). Gratis, sin API key.
         """
-        cg_ids = {
-            "USDT": "tether",
-            "USDC": "usd-coin"
+        defillama_metrics = {
+            "USDT": "usdt_market_cap",
+            "USDC": "usdc_market_cap",
         }
-        
-        coin_id = cg_ids.get(symbol.upper())
-        if not coin_id:
-            logger.error(f"Símbolo {symbol} no mapeado en CoinGecko.")
+
+        metric_name = defillama_metrics.get(symbol.upper())
+        if not metric_name:
+            logger.error(f"Símbolo {symbol} no mapeado en DefiLlamaProvider para Total Supply.")
             return 0
-            
-        logger.info(f"Descargando Total Supply (CoinGecko) para {symbol}")
-        
-        # Calcular los días desde start_date hasta hoy
-        days = (datetime.now(timezone.utc) - start_date.replace(tzinfo=timezone.utc)).days
-        if days < 1:
-            days = 1
-            
-        if days > 365:
-            logger.warning(f"CoinGecko API pública limita a 365 días. Acotando de {days} a 365.")
-            days = 365
-            
-        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-        params = {
-            "vs_currency": "usd",
-            "days": days
-        }
-        
+
+        logger.info(f"Descargando Total Supply (DefiLlama) para {symbol}")
+
         try:
-            res = requests.get(url, params=params, timeout=15)
-            data = res.json()
-            market_caps = data.get("market_caps", [])
-            
-            records = []
-            for item in market_caps:
-                ts_ms = item[0]
-                val = float(item[1])
-                ts = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
-                
-                if ts >= start_date.replace(tzinfo=timezone.utc):
-                    records.append({
-                        "metric_name": "Total_Supply",
-                        "symbol": symbol,
-                        "timestamp": ts,
-                        "value": val,
-                        "source": "coingecko"
-                    })
-                    
-            return self._save_records(records)
+            df = DefiLlamaProvider().fetch_metric(
+                metric_name, symbol, start_date.replace(tzinfo=timezone.utc), datetime.now(timezone.utc)
+            )
         except Exception as e:
-            logger.error(f"Error fetching Total Supply from CoinGecko: {e}")
+            logger.error(f"Error fetching Total Supply from DefiLlama: {e}")
             return 0
+
+        if df.empty:
+            return 0
+
+        records = [
+            {
+                "metric_name": "Total_Supply",
+                "symbol": symbol,
+                "timestamp": rec["timestamp"],
+                "value": rec["value"],
+                "source": "defillama",
+            }
+            for rec in df.to_dict(orient="records")
+        ]
+
+        return self._save_records(records)
 
     def _save_records(self, records: list) -> int:
         if not records:

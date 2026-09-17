@@ -32,6 +32,16 @@ STABLECOIN_METRICS = [
     'Exchange_Reserve', 'Total_Supply'
 ]
 
+# Métricas de flujo (aditivas): representan una cantidad que ocurrió durante el período
+# (transferencias, depósitos/retiros), así que sumarlas dentro del día y rellenar huecos
+# con 0 es correcto. El resto de métricas del módulo son niveles/ratios (MVRV, SOPR,
+# reservas, funding rate, open interest, active addresses...) — sumar varias lecturas del
+# mismo día o rellenar un hueco con 0 falsea el valor (ej. un MVRV de 0 en un día sin dato
+# se ve idéntico a un MVRV real de 0). Ver auditoría 2026-09-17.
+FLOW_METRICS = {
+    'mint', 'burn', 'exchange_inflow', 'exchange_outflow', 'exchange_netflow',
+}
+
 # Subconjunto de CRYPTOQUANT_METRICS que Binance también publica gratis y sin API key
 # (endpoints públicos de Futures) — ver data_sources/binance_public_provider.py. El resto
 # de métricas de CryptoQuant (mvrv, sopr, puell_multiple, exchange_netflow, etc.) son
@@ -56,7 +66,56 @@ METRICS_BY_SYMBOL = {
     'ETH': list(CRYPTOQUANT_METRICS),
     'USDT': list(STABLECOIN_METRICS),
     'USDC': list(STABLECOIN_METRICS),
+    # Vista combinada: mismas métricas que un stablecoin individual, pero agregando
+    # USDT + USDC (ej. Total_Supply combinado = oferta total de ambos stablecoins).
+    'USDT+USDC': list(STABLECOIN_METRICS),
 }
+
+
+def _symbols_for(selection: str) -> list:
+    """'USDT+USDC' -> ['USDT', 'USDC']; cualquier otro símbolo -> [símbolo]."""
+    return selection.split('+') if '+' in selection else [selection]
+
+
+def _market_symbol_for(selection: str) -> str:
+    """Par de mercado usado como referencia de precio para el símbolo/selección elegida."""
+    symbols = _symbols_for(selection)
+    if len(symbols) > 1 or symbols[0] == 'USDT':
+        # USDT/USDT no es un par válido, y para la vista combinada no hay un único par
+        # representativo, así que se usa BTC/USDT como referencia general de mercado.
+        return 'BTC/USDT'
+    return f"{symbols[0]}/USDT"
+
+# Métricas cuya profundidad histórica real está topada por la fuente gratuita usada (no
+# por esta app) — ver auditoría 2026-09-17. cap_days=0 significa "sin histórico en
+# absoluto, solo el valor actual en cada sincronización". Se usa para avisar al usuario
+# en vez de dejar que un rango de días pedido parezca engañosamente completo.
+METRIC_HISTORY_CAVEATS = {
+    'exchange_reserve': (0, (
+        'Esta fuente solo expone el balance ACTUAL de la(s) wallet(s) rastreada(s), no '
+        'histórico: cada sincronización agrega un único punto "ahora". La serie mostrada '
+        'solo cubre desde que empezaste a sincronizar, no los {days} días pedidos.'
+    )),
+    'open_interest': (30, (
+        'Binance Futures solo expone los últimos 30 días en este endpoint. Pediste {days} '
+        'días; los anteriores a hace 30 días no existen en la fuente.'
+    )),
+    'taker_buy_sell_ratio': (30, (
+        'Binance Futures solo expone los últimos 30 días en este endpoint. Pediste {days} '
+        'días; los anteriores a hace 30 días no existen en la fuente.'
+    )),
+}
+
+
+def _history_caveat(metric_suffix: str, days: int) -> str:
+    """Devuelve un aviso de límite histórico para la métrica/rango pedido, o '' si no aplica."""
+    entry = METRIC_HISTORY_CAVEATS.get(metric_suffix.lower())
+    if not entry:
+        return ''
+    cap_days, template = entry
+    if days <= cap_days:
+        return ''
+    return template.format(days=days)
 
 def fetch_data_async(symbol, days, metric=None):
     """
@@ -79,9 +138,11 @@ def fetch_data_async(symbol, days, metric=None):
         mgr = OnChainDataManager(db)
         try:
             mapped_metric = metric_lower
-            if mapped_metric == 'total_supply':
-                mapped_metric = 'btc_market_cap' if symbol == 'BTC' else 'stablecoin_market_cap'
-                provider = 'coingecko' if symbol == 'BTC' else 'defillama'
+            if mapped_metric == 'total_supply' and symbol == 'BTC':
+                # Oferta circulante real de BTC (no market cap) desde el bloque génesis,
+                # vía el endpoint público de Charts de blockchain.info — reemplaza a
+                # CoinGecko, que topaba el histórico a 365 días (ver auditoría 2026-09-17).
+                provider = 'blockchain_info'
             elif mapped_metric == 'exchange_reserve' and symbol == 'BTC':
                 # Sin costo ni API key en absoluto: balance real de una wallet de Binance
                 # públicamente verificada (ver blockchain_info_provider.py). Preferida sobre
@@ -118,20 +179,34 @@ def fetch_data_async(symbol, days, metric=None):
         finally:
             db.close()
             
-    if symbol in ['USDT', 'USDC']:
+    # 'USDT+USDC' es la vista combinada: se sincroniza cada stablecoin por separado con
+    # el mismo cliente, sumando los registros nuevos de ambos.
+    stablecoin_symbols = [s for s in _symbols_for(symbol) if s in ('USDT', 'USDC')]
+    if stablecoin_symbols:
         # BlockExplorer (Etherscan) metrics para Stablecoins: Mint/Burn, Inflow/Outflow,
         # Netflow (derivado de los dos anteriores) y Reserve (balance real actual de las
         # wallets rastreadas) — todas vía datos on-chain reales, gratis.
+        #
+        # Se llama SOLO al fetch que corresponde a la métrica pedida, no a las 4 juntas:
+        # antes, elegir "Total_Supply" (una sola llamada rápida a DefiLlama) igual
+        # disparaba fetch_exchange_flows contra las wallets calientes de Binance
+        # (altísimo volumen de transferencias, paginación de Etherscan con sleep de
+        # 0.3-0.5s por página) y podía tardar varios minutos o parecer colgado — ver
+        # auditoría 2026-09-17.
         client = BlockExplorerClient()
-        mints_burns = client.fetch_stablecoin_supply(symbol, start_date)
-        flows = client.fetch_exchange_flows(symbol, start_date)  # incluye Netflow derivado
-        reserve = client.fetch_exchange_reserve(symbol)
-        supply = client.fetch_total_supply(symbol, start_date)
-        records_saved += (mints_burns + flows + reserve + supply)
-    
+        for sym in stablecoin_symbols:
+            if metric_lower in ('mint', 'burn'):
+                records_saved += client.fetch_stablecoin_supply(sym, start_date)
+            elif metric_lower in ('exchange_inflow', 'exchange_outflow', 'exchange_netflow'):
+                records_saved += client.fetch_exchange_flows(sym, start_date)  # incluye Netflow derivado
+            elif metric_lower == 'exchange_reserve':
+                records_saved += client.fetch_exchange_reserve(sym)
+            elif metric_lower == 'total_supply':
+                records_saved += client.fetch_total_supply(sym, start_date)
+
     # 2. Asegurar que tenemos precios históricos en DB
-    market_symbol = f"{symbol}/USDT" if symbol != "USDT" else "BTC/USDT"
-    
+    market_symbol = _market_symbol_for(symbol)
+
     market_mgr = MarketDataManager()
     market_mgr.update_historical_data(market_symbol, '1d', start_date)
     
@@ -148,7 +223,7 @@ def render_onchain_analyzer():
         # Contenedor Superior: Controles
         with ui.row().classes('w-full items-end gap-4 bg-obsidian p-4 rounded-xl border border-slate-800 mb-6'):
             symbol_select = ui.select(
-                options=['BTC', 'ETH', 'USDT', 'USDC'],
+                options=['BTC', 'ETH', 'USDT', 'USDC', 'USDT+USDC'],
                 value='BTC',
                 label='Activo / Moneda'
             ).classes('w-48')
@@ -202,7 +277,11 @@ def render_onchain_analyzer():
             fetch_btn.disable()
             loading_spinner.set_visibility(True)
             ui.notify(f"Descargando datos on-chain para {symbol} (últimos {days} días)...", type='info')
-            
+
+            caveat = _history_caveat(metric, days)
+            if caveat:
+                ui.notify(caveat, type='warning', multi_line=True, timeout=10000, close_button=True)
+
             try:
                 loop = asyncio.get_running_loop()
                 with concurrent.futures.ThreadPoolExecutor() as pool:
@@ -229,16 +308,16 @@ def render_onchain_analyzer():
             info_container.classes(remove='hidden')
             table_container.clear()
             
+            symbols = _symbols_for(symbol)
+
             # Consultar Datos On-Chain
             db = SessionLocal()
             try:
                 mapped_metric = metric_suffix.lower()
-                if mapped_metric == 'total_supply' and symbol == 'BTC':
-                    mapped_metric = 'btc_market_cap'
 
                 query = db.query(OnChainMetric).filter(
                     OnChainMetric.metric_name.in_([metric_name, metric_suffix, mapped_metric]),
-                    OnChainMetric.symbol == symbol,
+                    OnChainMetric.symbol.in_(symbols),
                     OnChainMetric.timestamp >= start_date.replace(tzinfo=None)
                 ).order_by(OnChainMetric.timestamp.asc())
 
@@ -256,54 +335,108 @@ def render_onchain_analyzer():
                 
             df_onchain['timestamp'] = pd.to_datetime(df_onchain['timestamp']).dt.tz_localize('UTC')
             df_onchain.set_index('timestamp', inplace=True)
-            
-            # Agrupar diario para mejor visualización
-            if 'Total_Supply' in metric_name or 'market_cap' in mapped_metric:
-                df_onchain_daily = df_onchain[['value']].resample('1D').last()
-            else:
-                df_onchain_daily = df_onchain[['value']].resample('1D').sum().fillna(0)
-            
+
+            # Agrupar diario para mejor visualización. Solo las métricas de flujo (ver
+            # FLOW_METRICS) son aditivas; Total_Supply/market_cap y el resto (niveles y
+            # ratios: MVRV, SOPR, reservas, funding rate...) deben tomar el último valor
+            # del día, no sumarlo.
+            is_flow = mapped_metric in FLOW_METRICS
+
             # Alinear fechas para asegurar un eje X continuo (evita barras invisibles en Plotly)
             date_range = pd.date_range(
-                start=start_date.date(), 
-                end=datetime.now(timezone.utc).date(), 
+                start=start_date.date(),
+                end=datetime.now(timezone.utc).date(),
                 freq='1D'
             )
-            df_onchain_daily.index = df_onchain_daily.index.tz_localize(None).normalize()
-            
-            if 'Total_Supply' in metric_name or 'market_cap' in mapped_metric:
-                df_onchain_daily = df_onchain_daily.reindex(date_range).ffill().dropna()
+
+            # Se agrega primero DENTRO de cada símbolo (sum para flujos, last para
+            # niveles) y recién después se combinan los símbolos sumando sus series
+            # diarias. Es necesario para la vista 'USDT+USDC': un `.resample().last()`
+            # sobre las filas de ambos símbolos mezcladas tomaría el último valor
+            # cronológico de CUALQUIERA de los dos (no la suma de ambos), dando un
+            # "Total_Supply combinado" incorrecto. Con un solo símbolo (caso normal),
+            # este camino da exactamente el mismo resultado que antes.
+            per_symbol_series = {}
+            for sym in symbols:
+                sub = df_onchain.loc[df_onchain['symbol'] == sym, ['value']]
+                if sub.empty:
+                    continue
+                sub_daily = sub.resample('1D').sum() if is_flow else sub.resample('1D').last()
+                sub_daily.index = sub_daily.index.tz_localize(None).normalize()
+                if is_flow:
+                    sub_daily = sub_daily.reindex(date_range, fill_value=0)
+                else:
+                    sub_daily = sub_daily.reindex(date_range).ffill().dropna()
+                per_symbol_series[sym] = sub_daily['value']
+
+            combined = pd.concat(list(per_symbol_series.values()), axis=1)
+            # min_count=1: si NINGÚN símbolo tiene dato todavía para un día (ej. antes del
+            # lanzamiento de ambos), el resultado queda NaN (se descarta más abajo) en vez
+            # de mostrar 0 como si fuera un valor real conocido.
+            combined_value = combined.sum(axis=1, skipna=True, min_count=1)
+            if is_flow:
+                combined_value = combined_value.fillna(0)
             else:
-                df_onchain_daily = df_onchain_daily.reindex(date_range, fill_value=0)
+                combined_value = combined_value.dropna()
+            df_onchain_daily = combined_value.to_frame('value')
 
             # Consultar Precio de Mercado para Eje Secundario
-            market_symbol = f"{symbol}/USDT" if symbol != "USDT" else "BTC/USDT"
+            market_symbol = _market_symbol_for(symbol)
             market_mgr = MarketDataManager()
             df_market = market_mgr.get_data(market_symbol, '1d', start_date)
             
             # Crear Gráfico Plotly con Subplots (Eje Secundario)
             fig = make_subplots(specs=[[{"secondary_y": True}]])
-            
+
             # Añadir Serie On-Chain (Barras o Línea según la métrica)
             is_supply = ('Total_Supply' in metric_name or 'market_cap' in mapped_metric)
             bar_color = '#10b981' if 'inflow' in metric_name.lower() or 'mint' in metric_name.lower() else '#ef4444'
-            
+
+            # Vista combinada (USDT+USDC): además del total, se grafica cada símbolo por
+            # separado para poder comparar el aporte de cada uno al combinado.
+            is_combo = len(symbols) > 1
+            combined_name = f'Combinado ({"+".join(symbols)})_{metric_suffix}' if is_combo else metric_name
+            SYMBOL_COLORS = {'USDT': '#26a17b', 'USDC': '#2775ca'}  # colores de marca de cada stablecoin
+
             if is_supply:
+                if is_combo:
+                    for sym, series in per_symbol_series.items():
+                        fig.add_trace(
+                            from_plotly.Scatter(
+                                x=series.index.astype(str).tolist(),
+                                y=series.tolist(),
+                                name=f'{sym}_{metric_suffix}',
+                                line=dict(color=SYMBOL_COLORS.get(sym, '#94a3b8'), width=1.5, dash='dot'),
+                            ),
+                            secondary_y=False,
+                        )
                 fig.add_trace(
                     from_plotly.Scatter(
-                        x=df_onchain_daily.index.astype(str).tolist(), 
-                        y=df_onchain_daily['value'].tolist(), 
-                        name=metric_name, 
-                        line=dict(color='#3b82f6', width=3)
+                        x=df_onchain_daily.index.astype(str).tolist(),
+                        y=df_onchain_daily['value'].tolist(),
+                        name=combined_name,
+                        line=dict(color='#e2e8f0' if is_combo else '#3b82f6', width=3)
                     ),
                     secondary_y=False,
                 )
             else:
+                if is_combo:
+                    for sym, series in per_symbol_series.items():
+                        fig.add_trace(
+                            from_plotly.Bar(
+                                x=series.index.astype(str).tolist(),
+                                y=series.tolist(),
+                                name=f'{sym}_{metric_suffix}',
+                                marker_color=SYMBOL_COLORS.get(sym, '#94a3b8'),
+                                opacity=0.6,
+                            ),
+                            secondary_y=False,
+                        )
                 fig.add_trace(
                     from_plotly.Bar(
-                        x=df_onchain_daily.index.astype(str).tolist(), 
-                        y=df_onchain_daily['value'].tolist(), 
-                        name=metric_name, 
+                        x=df_onchain_daily.index.astype(str).tolist(),
+                        y=df_onchain_daily['value'].tolist(),
+                        name=combined_name,
                         marker_color=bar_color,
                         opacity=0.8
                     ),
@@ -325,8 +458,14 @@ def render_onchain_analyzer():
             # Calcular padding dinámico para Total_Supply para que la línea no toque el borde inferior
             yaxis_config = dict(showgrid=True, gridcolor='#1e293b', title='Volumen (Tokens)')
             if is_supply:
-                min_y = df_onchain_daily['value'].min()
-                max_y = df_onchain_daily['value'].max()
+                # En la vista combinada, USDT/USDC individuales quedan muy por debajo del
+                # total (ej. ~73B y ~183B vs. un combinado de ~257B): el rango del eje Y
+                # debe cubrir también esas series individuales, no solo la combinada, o
+                # sus líneas punteadas quedan fuera de vista (por debajo del borde
+                # inferior del gráfico).
+                series_for_range = [df_onchain_daily['value']] + (list(per_symbol_series.values()) if is_combo else [])
+                min_y = min(s.min() for s in series_for_range)
+                max_y = max(s.max() for s in series_for_range)
                 if pd.notna(min_y) and pd.notna(max_y):
                     padding = (max_y - min_y) * 0.2 if min_y != max_y else min_y * 0.1
                     yaxis_config['range'] = [min_y - padding, max_y + padding]
@@ -340,7 +479,8 @@ def render_onchain_analyzer():
                 yaxis=yaxis_config,
                 yaxis2=dict(showgrid=False, title='Precio (USDT)'),
                 margin=dict(l=40, r=40, t=60, b=40),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                barmode='group' if (is_combo and not is_supply) else 'overlay',
             )
 
             with chart_container:
@@ -349,6 +489,13 @@ def render_onchain_analyzer():
             # Renderizar Leyenda de Información
             with info_container:
                 ui.label('Ficha Técnica de la Métrica').classes('text-lg font-bold text-slate-300 mb-2')
+
+                plot_caveat = _history_caveat(metric_suffix, days)
+                if plot_caveat:
+                    with ui.row().classes('items-start gap-2 w-full bg-amber-950/40 border border-amber-800 rounded-lg px-3 py-2 mb-3'):
+                        ui.icon('warning', color='amber').classes('mt-0.5')
+                        ui.label(plot_caveat).classes('text-sm text-amber-300 whitespace-normal flex-1')
+
                 descriptions = {
                     'Mint': 'Creación de nuevos tokens (expansión monetaria). Muestra la entrada de dinero fiat al ecosistema. Generalmente es una señal Alcista (Bullish).',
                     'Burn': 'Destrucción de tokens (contracción monetaria). Representa retiros de liquidez del mercado hacia cuentas bancarias tradicionales. Suele ser una señal Bajista (Bearish).',
@@ -356,7 +503,7 @@ def render_onchain_analyzer():
                     'Exchange_Outflow': 'Retiros desde Exchanges hacia billeteras frías. En el caso de stablecoins, indica una reducción en la liquidez inmediata para comprar activos (Bearish).',
                     'Exchange_Netflow': 'Inflow menos Outflow diario. Positivo = más depósitos que retiros (poder de compra acumulándose, Bullish); negativo = más retiros que depósitos (Bearish).',
                     'Exchange_Reserve': 'Balance actual real (on-chain) de la stablecoin en las wallets de exchange rastreadas. Sube = más liquidez disponible para comprar; baja = liquidez saliendo del exchange.',
-                    'Total_Supply': 'Oferta Total Circulante de la Stablecoin en todo el mercado cripto global (incluye todas las redes). Representa la masa monetaria total (Liquidez Global).',
+                    'Total_Supply': 'Oferta total circulante real del activo (BTC: emitido on-chain según el calendario de minería; Stablecoins: circulante en todo el mercado cripto global). Representa la masa monetaria total (Liquidez Global).',
                     'exchange_netflow': 'Diferencia entre Inflow y Outflow en exchanges. Valores positivos indican más depósitos (Bearish para BTC), valores negativos indican más retiros (Bullish).',
                     'exchange_reserve': 'Cantidad total de monedas guardadas en las wallets de los exchanges. Si sube, hay mayor presión de venta. Si baja, los inversores están acumulando en wallets frías.',
                     'miner_reserve': 'Cantidad de monedas en las carteras de los mineros. Una caída indica que los mineros están vendiendo para cubrir gastos (Bearish).',
@@ -396,6 +543,10 @@ def render_onchain_analyzer():
                 {'name': 'value', 'label': 'Valor (Tokens)', 'field': 'value', 'align': 'right'},
                 {'name': 'source', 'label': 'Fuente', 'field': 'source', 'align': 'center'},
             ]
+            # En la vista combinada (USDT+USDC) las filas mezclan ambos símbolos, así que
+            # se agrega la columna para poder distinguirlas.
+            if len(symbols) > 1:
+                columns.insert(1, {'name': 'symbol', 'label': 'Símbolo', 'field': 'symbol', 'align': 'left'})
             
             with table_container:
                 ui.label('Últimos Registros Crudos').classes('text-lg font-bold text-slate-300 mb-2 mt-4')
