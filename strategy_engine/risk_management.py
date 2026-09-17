@@ -44,6 +44,14 @@ class RiskManager:
         # 1. CÁLCULO DE STOP LOSS (SL)
         # ═════════════════════════════════════════════════════════════
         raw_sl_type = str(self.sl_config.get("type", "fixed")).lower().strip().replace(" ", "_")
+        if raw_sl_type == "dynamic":
+            # Igual que el Take Profit (ver mas abajo): "dynamic" no es un metodo de calculo
+            # en si mismo, es un indicador de que el metodo real vive en dynamic_method
+            # (atr/chandelier/swing). Sin este remapeo, cualquier SL configurado como
+            # type=dynamic, dynamic_method=chandelier caia siempre en la rama ATR generica
+            # de mas abajo (coincide con la lista ["atr","volatility","dynamic"]), calculando
+            # un stop distinto al que luego usa update_trailing_sl en cada vela siguiente.
+            raw_sl_type = str(self.sl_config.get("dynamic_method", self.sl_config.get("method", "atr"))).lower().strip().replace(" ", "_")
         sl_val = float(self.sl_config.get("value", 2.0))
         sl_price = None
 
@@ -54,7 +62,7 @@ class RiskManager:
             else:
                 sl_price = entry_price * (1.0 + pct)
 
-        elif raw_sl_type in ["atr", "volatility", "dynamic"]:
+        elif raw_sl_type in ["atr", "volatility"]:
             atr_period = int(self.sl_config.get("atr_period", 14))
             atr_mult = float(self.sl_config.get("atr_multiplier", self.sl_config.get("value", 2.0)))
             if 'ATR' not in df.columns or df['ATR'].isnull().all():
@@ -152,10 +160,16 @@ class RiskManager:
             pct = float(self.sizing_config.get("value", 100.0)) / 100.0
             return (capital * pct) / entry_price
 
-        elif method == "fixed_fractional" and sl_price is not None:
+        elif method == "fixed_fractional":
+            # Si no hay sl_price real (ej. paper_trader.py invoca compute_position_size sin
+            # stop en la ruta de cuenta con colateral BTC), NO debe caer al "return capital /
+            # entry_price" del final de la funcion: eso invertia el 100% del capital en un
+            # solo trade en vez del risk_per_trade_pct configurado. Se usa la misma distancia
+            # de riesgo sintetica (2% del precio de entrada) que ya usa el Take Profit
+            # risk_reward mas abajo cuando tampoco hay SL real.
             risk_pct = float(self.sizing_config.get("risk_per_trade_pct", 1.0)) / 100.0
             risk_amount = capital * risk_pct
-            price_risk = abs(entry_price - sl_price)
+            price_risk = abs(entry_price - sl_price) if (sl_price is not None and sl_price > 0) else (entry_price * 0.02)
             if price_risk > 0:
                 return risk_amount / price_risk
 

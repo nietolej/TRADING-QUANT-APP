@@ -87,9 +87,14 @@ class ApiCredentialsManager:
                         with ui.column().classes('w-full gap-3 mt-1'):
                             with ui.column().classes('w-full gap-1'):
                                 ui.label('TESTNET API KEY').classes('text-[10px] font-extrabold text-slate-400 uppercase tracking-wider font-mono')
+                                # Blind Key Pattern: si ya existe, solo se muestra una vista parcial
+                                # enmascarada en el placeholder para no enviar la clave completa al DOM.
+                                t_key_ph = (
+                                    f'{_mask_key(self.creds["testnet_api_key"])} (Configurada en Servidor)'
+                                    if self.creds['testnet_api_key'] else 'Ingresa tu API Key de Testnet...'
+                                )
                                 self.input_testnet_key = ui.input(
-                                    placeholder='Ingresa tu API Key de Testnet...',
-                                    value=self.creds['testnet_api_key'],
+                                    placeholder=t_key_ph,
                                     password=True,
                                     password_toggle_button=True
                                 ).props('outlined dense dark').classes('w-full font-mono text-xs')
@@ -142,9 +147,13 @@ class ApiCredentialsManager:
                         with ui.column().classes('w-full gap-3 mt-1'):
                             with ui.column().classes('w-full gap-1'):
                                 ui.label('REAL API KEY (MAINNET)').classes('text-[10px] font-extrabold text-slate-400 uppercase tracking-wider font-mono')
+                                # Blind Key Pattern: jamás exponer la API Key real completa en el DOM del navegador
+                                r_key_ph = (
+                                    f'{_mask_key(self.creds["real_api_key"])} (Configurada en Servidor)'
+                                    if self.creds['real_api_key'] else 'Ingresa tu API Key de Binance Real...'
+                                )
                                 self.input_real_key = ui.input(
-                                    placeholder='Ingresa tu API Key de Binance Real...',
-                                    value=self.creds['real_api_key'],
+                                    placeholder=r_key_ph,
                                     password=True,
                                     password_toggle_button=True
                                 ).props('outlined dense dark').classes('w-full font-mono text-xs')
@@ -359,8 +368,8 @@ class ApiCredentialsManager:
 
     async def _test_testnet_connection(self):
         """Ejecuta test asíncrono de conectividad con Binance Testnet."""
-        k = (self.input_testnet_key.value or "").strip()
-        # Si el input de secret está vacío, usar el secreto preexistente cargado en el backend
+        # Si el input de key/secret está vacío, usar los valores preexistentes cargados en el backend
+        k = (self.input_testnet_key.value or "").strip() or self.creds.get("testnet_api_key", "")
         s = (self.input_testnet_secret.value or "").strip() or self.creds.get("testnet_secret_key", "")
 
         if not k or not s:
@@ -400,8 +409,8 @@ class ApiCredentialsManager:
 
     async def _test_real_connection(self):
         """Ejecuta test asíncrono de conectividad con Binance Real."""
-        k = (self.input_real_key.value or "").strip()
-        # Si el input de secret está vacío, usar el secreto preexistente del backend
+        # Si el input de key/secret está vacío, usar los valores preexistentes del backend
+        k = (self.input_real_key.value or "").strip() or self.creds.get("real_api_key", "")
         s = (self.input_real_secret.value or "").strip() or self.creds.get("real_secret_key", "")
 
         if not k or not s:
@@ -441,12 +450,15 @@ class ApiCredentialsManager:
 
     async def _save_credentials_action(self):
         """Guarda las claves en el archivo .env sin sobreescribir secretos con cadenas vacías."""
-        t_key = (self.input_testnet_key.value or "").strip()
+        # Si el usuario no escribió una nueva API Key, conservar la existente (Blind Key Pattern)
+        t_key_input = (self.input_testnet_key.value or "").strip()
+        t_key = t_key_input if t_key_input else self.creds.get("testnet_api_key", "")
         # Si el usuario no escribió un nuevo secret, conservar el existente
         t_sec_input = (self.input_testnet_secret.value or "").strip()
         t_sec = t_sec_input if t_sec_input else self.creds.get("testnet_secret_key", "")
 
-        r_key = (self.input_real_key.value or "").strip()
+        r_key_input = (self.input_real_key.value or "").strip()
+        r_key = r_key_input if r_key_input else self.creds.get("real_api_key", "")
         r_sec_input = (self.input_real_secret.value or "").strip()
         r_sec = r_sec_input if r_sec_input else self.creds.get("real_secret_key", "")
 

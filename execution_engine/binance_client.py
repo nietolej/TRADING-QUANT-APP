@@ -782,6 +782,18 @@ class BinanceTestnetClient:
 
     def cancel_all_open_orders(self, symbol: str) -> Tuple[bool, Optional[str]]:
         """Cancela todas las órdenes abiertas estándar y condicionales (algo SL/TP) pendientes en Binance Futures."""
+        # ── CANDADO DE SEGURIDAD OPERATIVA ──
+        # Cancelar es una mutación autenticada tan real como colocar una orden: si el
+        # candado de cuenta real está cerrado, tampoco debe poder tocar (y desproteger)
+        # órdenes SL/TP reales ya colocadas. Antes esta función no tenía ninguna
+        # comprobación del candado, permitiendo cancelar órdenes reales (vía MCP/API/UI)
+        # incluso en Modo Solo Lectura.
+        if not self.use_testnet and not is_real_trading_enabled():
+            return False, (
+                "⛔ BLOQUEO DE SEGURIDAD OPERATIVA: La cuenta Real está en MODO SOLO LECTURA. "
+                "El candado de trading con dinero real está cerrado."
+            )
+
         if not self.api_key or not self.api_secret:
             return False, "API Key o Secret no configuradas en .env"
         try:

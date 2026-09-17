@@ -180,9 +180,14 @@ class StablecoinEmissionEMAStrategy(BaseStrategy):
                 (df['rel_halving_days'] <= self.max_post_halving_days)
             )
             halving_exhaustion = (df['rel_halving_days'] > self.max_post_halving_days + 30)
+            post_climax_phase = (df['rel_halving_days'] > self.max_post_halving_days)
         else:
             halving_regime = pd.Series(True, index=df.index)
             halving_exhaustion = pd.Series(False, index=df.index)
+            # Con el filtro desactivado, la ventana de "fase post-clímax" que habilita los
+            # SHORT tampoco debe restringirse (igual que halving_regime para los LONG):
+            # antes quedaba fijo al calculo real de rel_halving_days sin importar este toggle.
+            post_climax_phase = pd.Series(True, index=df.index)
 
         # D. Mapeo de Señales
         # Entrada LONG: Tendencia alcista + Impulso de Liquidez + Ventana Halving
@@ -192,7 +197,7 @@ class StablecoinEmissionEMAStrategy(BaseStrategy):
         exit_long = (close_series < df['ema_fast']) | liquidity_contraction | halving_exhaustion
 
         # Entrada SHORT (si aplica): Pérdida de EMA lenta + Contracción de liquidez + Fase post-clímax
-        entry_short = (~bullish_trend) & liquidity_contraction & (df['rel_halving_days'] > self.max_post_halving_days)
+        entry_short = (~bullish_trend) & liquidity_contraction & post_climax_phase
         exit_short = (close_series > df['ema_fast']) | liquidity_expansion
 
         direction = self.config.get("trade_direction", "Long").lower()

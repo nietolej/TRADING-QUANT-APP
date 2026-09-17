@@ -1,5 +1,6 @@
 import os
 import logging
+import html
 from typing import Optional, Dict, Any
 import requests
 from dotenv import load_dotenv
@@ -38,11 +39,11 @@ class TelegramNotifier:
             return
 
         header_icon = "🚨 <b>[ALERTA CRÍTICA]</b>" if is_critical else "⚠️ <b>[ADVERTENCIA]</b>"
-        lines = [f"{header_icon} {title}"]
+        lines = [f"{header_icon} {html.escape(str(title))}"]
 
         if details:
             for k, v in details.items():
-                lines.append(f"• <b>{k}:</b> <code>{v}</code>")
+                lines.append(f"• <b>{html.escape(str(k))}:</b> <code>{html.escape(str(v))}</code>")
 
         message = "\n".join(lines)
         self.send_message(message)

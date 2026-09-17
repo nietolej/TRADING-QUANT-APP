@@ -39,6 +39,7 @@ def analyze_robustness(
         row['max_drawdown_pct'] = float(r.get('max_drawdown_pct', 0))
         row['net_pnl'] = float(r.get('net_pnl', 0))
         row['profit_factor'] = float(r.get('profit_factor', 0))
+        row['profit_factor_reliable'] = bool(r.get('profit_factor_reliable', False))
         row['percent_profitable'] = float(r.get('percent_profitable', 0))
         row['total_trades'] = int(r.get('total_trades', 0))
         row['_raw_result'] = r
@@ -48,13 +49,30 @@ def analyze_robustness(
         return {'status': 'no_valid_records'}
 
     df = pd.DataFrame(records)
+
+    # Igual que en optimizer._sort_key: un profit_factor "inf" con muestra insuficiente
+    # (ver metrics.MIN_TRADES_FOR_RELIABLE_PF) no debe poder dominar la meseta de robustez,
+    # la varianza ANOVA ni las medias de vecindad — se clampa ANTES de todo cálculo vectorizado
+    # para no propagar inf/nan. El dict original (con el profit_factor real) queda intacto en
+    # '_raw_result' para no afectar lo que se muestra en la UI.
+    if target_metric == 'profit_factor' and 'profit_factor_reliable' in df.columns:
+        df['profit_factor'] = df['profit_factor'].where(df['profit_factor_reliable'], -1.0)
+
     param_keys = list(param_ranges.keys())
     N = len(df)
     
     # ─────────────────────────────────────────────────────────────
     # A. CONFIGURACIÓN MÁS ROBUSTA (MESETA / VECTORIZED PLATEAU)
     # ─────────────────────────────────────────────────────────────
-    best_peak_idx = df[target_metric].idxmax() if target_metric != 'max_drawdown_pct' else df['max_drawdown_pct'].abs().idxmin()
+    if target_metric == 'profit_factor':
+        # Igual que en optimizer._sort_key: un profit_factor "inf" con muestra insuficiente
+        # (ver metrics.MIN_TRADES_FOR_RELIABLE_PF) no debe poder ganar la meseta de robustez.
+        effective_metric = df['profit_factor'].where(df['profit_factor_reliable'], -1.0)
+        best_peak_idx = effective_metric.idxmax()
+    elif target_metric != 'max_drawdown_pct':
+        best_peak_idx = df[target_metric].idxmax()
+    else:
+        best_peak_idx = df['max_drawdown_pct'].abs().idxmin()
     best_peak_row = df.loc[best_peak_idx]
 
     param_steps = {}

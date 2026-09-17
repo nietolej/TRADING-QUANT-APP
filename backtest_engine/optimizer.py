@@ -213,6 +213,7 @@ def _optimizer_worker(
             'losing_trades': int(trade_metrics.get('losing_trades', 0)),
             'percent_profitable': round(float(trade_metrics.get('percent_profitable', 0)), 2),
             'profit_factor': round(float(trade_metrics.get('profit_factor', 0)), 2),
+            'profit_factor_reliable': bool(trade_metrics.get('profit_factor_reliable', False)),
             'max_consecutive_losers': int(trade_metrics.get('max_consecutive_losers', 0)),
             'initial_capital': initial_capital,
             'final_equity': round(final_equity, 6),
@@ -231,6 +232,7 @@ def _optimizer_worker(
             'losing_trades': 0,
             'percent_profitable': 0.0,
             'profit_factor': 0.0,
+            'profit_factor_reliable': False,
             'max_consecutive_losers': 0,
             'initial_capital': initial_capital,
             'final_equity': initial_capital,
@@ -322,6 +324,7 @@ def run_grid_search(
                     'losing_trades': 0,
                     'percent_profitable': 0.0,
                     'profit_factor': 0.0,
+                    'profit_factor_reliable': False,
                     'max_consecutive_losers': 0,
                     'initial_capital': initial_capital,
                     'final_equity': initial_capital,
@@ -345,6 +348,11 @@ def run_grid_search(
         # Para drawdown: menor (menos negativo/menor % caída) es mejor
         if optimize_metric == 'max_drawdown_pct':
             val = -abs(val)
+        # profit_factor con muestra insuficiente (ver metrics.MIN_TRADES_FOR_RELIABLE_PF)
+        # no debe poder ganar el ranking solo por ser matemáticamente "inf" (0 perdedoras):
+        # se penaliza por debajo de cualquier resultado confiable, sin tratarlo como error duro.
+        if optimize_metric == 'profit_factor' and not r.get('profit_factor_reliable', False):
+            val = -1.0
         return val
 
     results.sort(key=_sort_key, reverse=True)
