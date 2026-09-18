@@ -646,11 +646,12 @@ class PaperTrader:
         # Restaurar posición abierta si existía
         pos_data = data.get("position")
         if pos_data:
+            raw_entry_ts = pos_data.get("entry_timestamp")
             pos = Position(
                 side=pos_data.get("side", "long"),
                 entry_price=float(pos_data.get("entry_price", 0.0)),
                 quantity=float(pos_data.get("quantity", 0.0)),
-                timestamp=pos_data.get("entry_timestamp"),
+                timestamp=pd.to_datetime(raw_entry_ts) if raw_entry_ts is not None else None,
             )
             pos.sl_price = float(pos_data.get("sl_price")) if pos_data.get("sl_price") is not None else None
             pos.tp_price = float(pos_data.get("tp_price")) if pos_data.get("tp_price") is not None else None
@@ -1352,6 +1353,20 @@ class PaperTrader:
     # Persistencia
     # ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _as_datetime(value):
+        # entry_time/exit_time llegan aqui con tipos heterogeneos: pd.Timestamp en un
+        # cierre normal, pero str cuando la posicion se restauro desde disco (to_dict la
+        # serializa con str()). SQLAlchemy DateTime solo acepta datetime/date de Python,
+        # asi que sin esta normalizacion el INSERT fallaba silenciosamente en runtime.
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, pd.Timestamp):
+            return value.to_pydatetime()
+        if isinstance(value, str):
+            return pd.to_datetime(value).to_pydatetime()
+        return value
+
     def _save_trade_to_db(self, trade: dict):
         db = SessionLocal()
         try:
@@ -1360,8 +1375,8 @@ class PaperTrader:
                 symbol=self.symbol,
                 strategy_name=self.strategy.config.get("strategy_name", "Unknown"),
                 side=trade["side"],
-                entry_time=trade["entry_time"],
-                exit_time=trade["exit_time"],
+                entry_time=self._as_datetime(trade["entry_time"]),
+                exit_time=self._as_datetime(trade["exit_time"]),
                 entry_price=trade["entry_price"],
                 exit_price=trade["exit_price"],
                 pnl=trade["pnl"],
