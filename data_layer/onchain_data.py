@@ -87,17 +87,26 @@ class OnChainDataManager:
             if getattr(ts, 'tzinfo', None) is not None:
                 rec['timestamp'] = ts.astimezone(timezone.utc).replace(tzinfo=None)
 
-        # Una sola consulta para saber qué timestamps ya existen, en vez de un SELECT por
-        # registro (con limit=10000 en CryptoQuant, eso eran hasta 10k idas y vueltas a la
-        # BD en una sola sincronización). Mismo patrón que market_data.py:_save_df_to_db.
+        # Una sola consulta (por lotes) para saber qué timestamps ya existen, en vez de un
+        # SELECT por registro (con limit=10000 en CryptoQuant, eso eran hasta 10k idas y
+        # vueltas a la BD en una sola sincronización). Mismo patrón que
+        # market_data.py:_save_df_to_db. El IN(...) se trocea en lotes de 500: proveedores
+        # con historial completo (ej. Etherscan trayendo TODAS las transacciones Mint/Burn/
+        # Exchange flow de USDT/USDC desde el inicio del contrato) devuelven decenas de
+        # miles de timestamps en una sola descarga, y un único IN() con todos ellos revienta
+        # con "sqlite3.OperationalError: too many SQL variables" (límite de SQLite).
         candidate_timestamps = [rec['timestamp'] for rec in records]
-        existing_ts = {
-            row[0] for row in self.db.query(OnChainMetric.timestamp).filter(
-                OnChainMetric.metric_name == metric_name,
-                OnChainMetric.symbol == symbol,
-                OnChainMetric.timestamp.in_(candidate_timestamps)
-            ).all()
-        }
+        existing_ts = set()
+        batch_size = 500
+        for i in range(0, len(candidate_timestamps), batch_size):
+            batch = candidate_timestamps[i:i + batch_size]
+            existing_ts.update(
+                row[0] for row in self.db.query(OnChainMetric.timestamp).filter(
+                    OnChainMetric.metric_name == metric_name,
+                    OnChainMetric.symbol == symbol,
+                    OnChainMetric.timestamp.in_(batch)
+                ).all()
+            )
 
         new_objects = [
             OnChainMetric(

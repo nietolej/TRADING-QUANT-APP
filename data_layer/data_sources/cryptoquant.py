@@ -58,12 +58,20 @@ class CryptoQuantProvider(BaseOnChainProvider):
             "nvt_golden_cross": f"/{asset}/network-indicator/nvt-golden-cross?window=day",
             "sopr": f"/{asset}/market-indicator/sopr?window=day",
             "active_addresses": f"/{asset}/network-data/addresses-count?window=day",
-            "funding_rates": f"/{asset}/market-data/funding-rates?window=day",
-            "open_interest": f"/{asset}/market-data/open-interest?window=day",
+            # Los endpoints de 'market-data' que son por-exchange (funding rate, open
+            # interest, taker buy/sell) EXIGEN el parámetro 'exchange' o CryptoQuant
+            # responde 400 Bad Request (a diferencia de price-ohlcv, que es agregado y no
+            # lo necesita). Se usa 'binance' porque es el exchange de referencia de esta
+            # app. Confirmado contra la API real (auditoría 2026-09-18): con 'exchange'
+            # devuelven 200 con el plan actual, sin necesidad de upgrade — antes se
+            # etiquetaban como "requieren plan superior" por el mismo 400 que devolvía
+            # cualquier endpoint mal armado, no por falta de acceso real.
+            "funding_rates": f"/{asset}/market-data/funding-rates?window=day&exchange=binance",
+            "open_interest": f"/{asset}/market-data/open-interest?window=day&exchange=binance",
             "estimated_leverage_ratio": f"/{asset}/market-indicator/estimated-leverage-ratio?window=day",
             # 'taker-buy-sell-ratio' no existe en la API real; el endpoint correcto es
             # 'taker-buy-sell-stats' (verificado contra el OpenAPI spec).
-            "taker_buy_sell_ratio": f"/{asset}/market-data/taker-buy-sell-stats?window=day",
+            "taker_buy_sell_ratio": f"/{asset}/market-data/taker-buy-sell-stats?window=day&exchange=binance",
             "nupl": f"/{asset}/network-indicator/nupl?window=day",
             "stock_to_flow": f"/{asset}/network-indicator/stock-to-flow?window=day"
         }
@@ -103,13 +111,23 @@ class CryptoQuantProvider(BaseOnChainProvider):
                 ts = pd.to_datetime(ts_str, utc=True)
                 
                 if start_date <= ts <= (end_date or datetime.now(timezone.utc)):
-                    # Buscar la primera llave numérica
-                    val = None
-                    for k, v in item.items():
-                        if k != "date" and isinstance(v, (int, float)):
-                            val = v
-                            break
-                            
+                    # Preferir la llave que coincide con el nombre de la métrica pedida:
+                    # algunos endpoints devuelven VARIOS campos numéricos en el mismo item
+                    # (ej. taker-buy-sell-stats trae taker_buy_volume, taker_sell_volume,
+                    # taker_buy_ratio, taker_sell_ratio Y taker_buy_sell_ratio). Antes se
+                    # tomaba "la primera llave numérica" por orden de inserción del JSON,
+                    # que para ese endpoint es taker_buy_volume (un volumen en USD, no el
+                    # ratio) — guardaba el dato equivocado bajo el metric_name correcto sin
+                    # ningún error visible. Con un solo campo numérico (caso común) el
+                    # comportamiento no cambia.
+                    val = item.get(metric_name)
+                    if not isinstance(val, (int, float)):
+                        val = None
+                        for k, v in item.items():
+                            if k != "date" and isinstance(v, (int, float)):
+                                val = v
+                                break
+
                     if val is not None:
                         records.append({
                             'timestamp': ts,

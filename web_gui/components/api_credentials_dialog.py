@@ -14,6 +14,12 @@ from execution_engine.security_manager import (
     is_real_trading_enabled,
     set_real_trading_enabled,
 )
+from data_layer.provider_credentials import (
+    list_providers,
+    save_provider_key,
+    create_custom_connection,
+    delete_custom_connection,
+)
 
 
 def _mask_key(key: str) -> str:
@@ -57,6 +63,7 @@ class ApiCredentialsManager:
             with ui.tabs().classes('w-full text-slate-300 border-b border-[#1e293b]') as tabs:
                 tab_testnet = ui.tab('testnet', label='🟡 Futures Testnet (Demo)', icon='science').classes('text-xs md:text-sm font-bold')
                 tab_real = ui.tab('real', label='🌐 Binance Real (Producción)', icon='public').classes('text-xs md:text-sm font-bold')
+                tab_data = ui.tab('data_providers', label='📡 Datos On-Chain / Mercado', icon='travel_explore').classes('text-xs md:text-sm font-bold')
                 tab_guardrails = ui.tab('guardrails', label='🛡️ Candado & Guardarraíles', icon='gavel').classes('text-xs md:text-sm font-bold')
                 tab_guide = ui.tab('guide', label='ℹ️ Guía de Seguridad', icon='shield').classes('text-xs md:text-sm font-bold')
 
@@ -182,7 +189,14 @@ class ApiCredentialsManager:
                             ).props('dense outline color=sky-400').classes('text-xs text-sky-400 font-bold px-3 py-1.5 rounded-lg')
 
                 # ──────────────────────────────────────────────────────────
-                # PANEL 3: CANDADO DE SEGURIDAD Y GUARDARRAÍLES MODULARES
+                # PANEL 3: DATOS ON-CHAIN / MERCADO (CryptoQuant, Glassnode,
+                # CoinGecko, Etherscan, Tronscan...) + Conexiones personalizadas
+                # ──────────────────────────────────────────────────────────
+                with ui.tab_panel('data_providers').classes('p-0 gap-4 flex flex-col'):
+                    self._render_data_providers_panel()
+
+                # ──────────────────────────────────────────────────────────
+                # PANEL 4: CANDADO DE SEGURIDAD Y GUARDARRAÍLES MODULARES
                 # ──────────────────────────────────────────────────────────
                 with ui.tab_panel('guardrails').classes('p-0 gap-4 flex flex-col'):
                     
@@ -268,7 +282,7 @@ class ApiCredentialsManager:
                             ).props('dense outline color=amber-400').classes('text-xs text-amber-300 font-bold px-3 py-1.5 rounded-lg')
 
                 # ──────────────────────────────────────────────────────────
-                # PANEL 4: GUÍA Y PROTOCOLO DE SEGURIDAD
+                # PANEL 5: GUÍA Y PROTOCOLO DE SEGURIDAD
                 # ──────────────────────────────────────────────────────────
                 with ui.tab_panel('guide').classes('p-0 gap-3 flex flex-col'):
                     with ui.card().classes('bg-[#111827] border border-[#1e293b] p-4 rounded-xl w-full text-xs text-slate-300 gap-3'):
@@ -308,6 +322,101 @@ class ApiCredentialsManager:
                         icon='save',
                         on_click=self._save_credentials_action
                     ).classes('bg-amber-500 hover:bg-amber-400 text-black font-extrabold text-xs px-4 py-2 rounded-xl shadow-lg transition-all')
+
+    @ui.refreshable_method
+    def _render_data_providers_panel(self):
+        """Panel con TODAS las API Keys de proveedores de datos on-chain/mercado
+        (CryptoQuant, Glassnode, CoinGecko, Etherscan, Tronscan) más una sección
+        para dar de alta conexiones personalizadas nuevas. Todas se guardan en
+        .env con el mismo patrón de Blind Key que usan las credenciales de
+        Binance: la key completa nunca se manda de vuelta al navegador."""
+        with ui.column().classes('w-full gap-3'):
+            ui.label(
+                'Estas claves alimentan el módulo de Análisis On-Chain y los scripts de ingesta histórica. '
+                'Se guardan localmente en tu archivo .env; esta app nunca las envía a ningún servidor externo.'
+            ).classes('text-xs text-slate-400')
+
+            for provider in list_providers():
+                with ui.card().classes('bg-[#111827] border border-[#1e293b] p-3.5 rounded-xl w-full gap-2'):
+                    with ui.row().classes('w-full justify-between items-center flex-wrap gap-2'):
+                        with ui.row().classes('items-center gap-2'):
+                            ui.icon('travel_explore' if not provider['custom'] else 'link', size='18px').classes('text-sky-400')
+                            ui.label(provider['label']).classes('text-sm font-bold text-white')
+                            if provider['signup_url']:
+                                ui.link('🔗 Obtener key', provider['signup_url'], new_tab=True).classes('text-xs text-sky-400 hover:underline')
+                        with ui.row().classes('items-center gap-2'):
+                            ui.badge(
+                                'Configurada' if provider['has_key'] else 'No configurada',
+                                color='emerald-900' if provider['has_key'] else 'gray-800'
+                            ).classes('text-[11px] font-bold px-2 py-0.5 rounded')
+                            if provider['custom']:
+                                ui.button(
+                                    icon='delete',
+                                    on_click=lambda ev, ev_var=provider['env_var'], label=provider['label']: self._delete_custom_connection_action(ev_var, label)
+                                ).props('flat round dense size=sm color=red-400')
+
+                    if provider['help']:
+                        ui.label(provider['help']).classes('text-[11px] text-slate-500')
+
+                    with ui.row().classes('w-full items-center gap-2'):
+                        placeholder = f"{provider['masked_key']} (Configurada)" if provider['has_key'] else f"Ingresa tu API Key de {provider['label']}..."
+                        key_input = ui.input(placeholder=placeholder, password=True, password_toggle_button=True) \
+                            .props('outlined dense dark').classes('flex-1 font-mono text-xs')
+                        ui.button(
+                            icon='save',
+                            on_click=lambda ev, inp=key_input, ev_var=provider['env_var'], label=provider['label']: self._save_provider_key_action(inp, ev_var, label)
+                        ).props('dense outline color=sky-400').classes('text-xs')
+
+            # ── Alta de nueva conexión personalizada ──
+            with ui.card().classes('bg-[#0a0e17] border border-dashed border-[#334155] p-3.5 rounded-xl w-full gap-2'):
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('add_link', size='18px').classes('text-amber-400')
+                    ui.label('Crear nueva conexión').classes('text-sm font-bold text-amber-400')
+                ui.label(
+                    'Para un proveedor que aún no tiene un formulario dedicado arriba: dale un nombre y pega su API Key.'
+                ).classes('text-[11px] text-slate-500')
+                with ui.row().classes('w-full items-center gap-2 flex-wrap'):
+                    self.input_custom_name = ui.input(placeholder='Nombre del proveedor (ej. Nansen)') \
+                        .props('outlined dense dark').classes('flex-1 min-w-[160px] text-xs')
+                    self.input_custom_key = ui.input(placeholder='API Key', password=True, password_toggle_button=True) \
+                        .props('outlined dense dark').classes('flex-1 min-w-[160px] font-mono text-xs')
+                    ui.button(
+                        'Agregar conexión', icon='add',
+                        on_click=self._create_custom_connection_action
+                    ).props('dense color=amber-400').classes('text-xs font-bold text-black')
+
+    def _save_provider_key_action(self, key_input, env_var: str, label: str):
+        key = (key_input.value or "").strip()
+        if not key:
+            ui.notify(f"Ingresa una API Key para {label} antes de guardar.", type='warning')
+            return
+        ok, err = save_provider_key(env_var, key)
+        if ok:
+            ui.notify(f"💾 API Key de {label} guardada.", type='positive')
+            self._render_data_providers_panel.refresh()
+        else:
+            ui.notify(f"🚨 Error al guardar {label}: {err}", type='negative', duration=7000)
+
+    def _create_custom_connection_action(self):
+        name = (self.input_custom_name.value or "").strip()
+        key = (self.input_custom_key.value or "").strip()
+        if not name or not key:
+            ui.notify("Ingresa nombre y API Key para crear la conexión.", type='warning')
+            return
+        ok, err = create_custom_connection(name, key)
+        if ok:
+            ui.notify(f"🔗 Conexión '{name}' creada y guardada.", type='positive')
+            self._render_data_providers_panel.refresh()
+        else:
+            ui.notify(f"🚨 Error al crear la conexión: {err}", type='negative', duration=7000)
+
+    def _delete_custom_connection_action(self, env_var: str, label: str):
+        ok, err = delete_custom_connection(env_var)
+        if ok:
+            ui.notify(f"🗑️ Conexión '{label}' eliminada.", type='positive')
+            self._render_data_providers_panel.refresh()
+        else:
+            ui.notify(f"🚨 Error al eliminar '{label}': {err}", type='negative')
 
     async def _toggle_real_trading_safety_switch(self, e):
         """Maneja el encendido o apagado del candado de trading con dinero real con confirmación."""

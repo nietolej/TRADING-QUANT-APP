@@ -189,13 +189,12 @@ class LiveMonitorPage:
 
         bot = self._get_selected_bot()
         use_testnet = bot.use_testnet if bot else True
-        client = BinanceTestnetClient(use_testnet=use_testnet)
-        
+
         ui.notify(f"Enviando orden manual {side} {qty} {sym} [{o_type}] a Binance...", type='info')
         loop = asyncio.get_event_loop()
         order, err = await loop.run_in_executor(
             None,
-            lambda: client.place_futures_order(
+            lambda: BinanceTestnetClient(use_testnet=use_testnet).place_futures_order(
                 symbol=sym,
                 side="long" if side == "BUY" else "short",
                 quantity=qty,
@@ -233,13 +232,12 @@ class LiveMonitorPage:
         """Envía intencionalmente una orden inválida a Binance para comprobar el sistema de alertas críticas."""
         bot = self._get_selected_bot()
         use_testnet = bot.use_testnet if bot else True
-        client = BinanceTestnetClient(use_testnet=use_testnet)
 
         ui.notify("🧪 Iniciando prueba de rechazo deliberado con símbolo inválido...", type='info')
         loop = asyncio.get_event_loop()
         order, err = await loop.run_in_executor(
             None,
-            lambda: client.place_futures_order(
+            lambda: BinanceTestnetClient(use_testnet=use_testnet).place_futures_order(
                 symbol="INVALID_COIN/USDT",
                 side="long",
                 quantity=0.001,
@@ -302,9 +300,10 @@ class LiveMonitorPage:
         bot = self._get_selected_bot()
         sym = bot.symbol if bot else "BTC/USDT"
         use_t = bot.use_testnet if bot else True
-        client = BinanceTestnetClient(use_testnet=use_t)
         loop = asyncio.get_event_loop()
-        ok, err = await loop.run_in_executor(None, lambda: client.cancel_all_open_orders(sym))
+        ok, err = await loop.run_in_executor(
+            None, lambda: BinanceTestnetClient(use_testnet=use_t).cancel_all_open_orders(sym)
+        )
         if ok:
             ui.notify(f"🧹 Órdenes pendientes de {sym} canceladas en Binance con éxito.", type='positive')
             self._refresh_ui_elements(force_dom_rebuild=False)
@@ -323,9 +322,10 @@ class LiveMonitorPage:
                     ui.notify("API Key de Binance no configurada en .env", type='warning')
                 return
 
-            client = BinanceTestnetClient(use_testnet=True)
             loop = asyncio.get_event_loop()
-            open_positions = await loop.run_in_executor(None, client.get_open_positions)
+            open_positions = await loop.run_in_executor(
+                None, lambda: BinanceTestnetClient(use_testnet=True).get_open_positions()
+            )
 
             # Mapear posiciones abiertas por símbolo Binance (ej: 'BTCUSDT')
             open_by_symbol = {
@@ -848,11 +848,10 @@ class LiveMonitorPage:
         
         import asyncio
         loop = asyncio.get_event_loop()
-        client = BinanceTestnetClient(use_testnet=True)
-        
+
         def do_test():
-            return client.test_connection_and_orders(symbol="BTC/USDT")
-            
+            return BinanceTestnetClient(use_testnet=True).test_connection_and_orders(symbol="BTC/USDT")
+
         res = await loop.run_in_executor(None, do_test)
         
         results_container.clear()

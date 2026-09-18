@@ -37,3 +37,9 @@ mingit.zip
 scratch/
 *.bak
 
+# Claude Code local runtime state (launch.json is intentionally tracked)
+.claude/scheduled_tasks.lock
+
+# Generated codebase graph (graphify tool output, regenerable)
+graphify-out/
+

@@ -53,12 +53,28 @@ class BinancePublicOnChainProvider(BaseOnChainProvider):
         records = []
         try:
             if metric_name == "funding_rates":
-                for item in self.client.get_funding_rate_history(binance_symbol, start_ms, end_ms, limit=1000):
-                    ts = datetime.fromtimestamp(item['funding_time'] / 1000.0, tz=timezone.utc)
-                    records.append({
-                        'timestamp': ts, 'metric_name': metric_name, 'symbol': symbol,
-                        'value': item['funding_rate_pct'], 'source': 'binance_public'
-                    })
+                # get_funding_rate_history trata su `limit` como tope TOTAL de resultados
+                # (no como tamaño de página), así que una sola llamada con limit=1000 se
+                # detenía para siempre tras el primer bloque de ~333 días desde start_date,
+                # sin importar cuánta historia más quedara hasta end_date. Para cubrir todo
+                # el rango pedido hay que seguir llamando en bloques de 1000, avanzando
+                # cur_start tras cada bloque, hasta agotar los datos o llegar a end_ms.
+                cur_start = start_ms
+                while True:
+                    batch = self.client.get_funding_rate_history(binance_symbol, cur_start, end_ms, limit=1000)
+                    if not batch:
+                        break
+                    for item in batch:
+                        ts = datetime.fromtimestamp(item['funding_time'] / 1000.0, tz=timezone.utc)
+                        records.append({
+                            'timestamp': ts, 'metric_name': metric_name, 'symbol': symbol,
+                            'value': item['funding_rate_pct'], 'source': 'binance_public'
+                        })
+                    if len(batch) < 1000:
+                        break
+                    cur_start = batch[-1]['funding_time'] + 1
+                    if end_ms and cur_start >= end_ms:
+                        break
             elif metric_name == "open_interest":
                 for item in self.client.get_open_interest_history(
                     binance_symbol, period="1d", start_time_ms=start_ms, end_time_ms=end_ms, limit=500

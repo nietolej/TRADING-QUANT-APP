@@ -139,14 +139,19 @@ class BinanceDerivativesProvider:
                     break
 
                 for item in data:
-                    rate = float(item.get("fundingRate", 0.0))
+                    # Algunos registros históricos (sobre todo los más antiguos, cerca del
+                    # listado del contrato) traen "markPrice" como string vacío en vez de
+                    # ausente, y float("") revienta con ValueError, abortando TODA la
+                    # descarga de funding rate para el símbolo (no solo ese registro) al no
+                    # estar capturado por el try/except de la llamada HTTP.
+                    rate = float(item.get("fundingRate") or 0.0)
                     annualized_apr = rate * 3 * 365 * 100.0
                     all_results.append({
-                        "funding_time": int(item.get("fundingTime", 0)),
+                        "funding_time": int(item.get("fundingTime") or 0),
                         "funding_rate": rate,
                         "funding_rate_pct": rate * 100.0,
                         "annualized_apr": annualized_apr,
-                        "mark_price": float(item.get("markPrice", 0.0))
+                        "mark_price": float(item.get("markPrice") or 0.0)
                     })
 
                 if len(data) < fetch_limit:

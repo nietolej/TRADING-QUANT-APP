@@ -66,6 +66,13 @@ def format_binance_error(e: Exception) -> str:
             "no un error de la aplicación. Verifica si tu país/red tiene acceso a Binance "
             "Futures/Testnet, o prueba desde otra conexión."
         )
+    if "Invalid JSON error message" in raw or "<!DOCTYPE html>" in raw or "www.binance.com" in raw:
+        return (
+            "🌍 Binance respondió con su página web (HTML) en vez de datos de la API. "
+            "Normalmente pasa cuando la IP/red está bloqueada o redirigida por Binance "
+            "(geobloqueo, firewall, proxy/VPN) antes de llegar al endpoint real. "
+            "Verifica tu conexión/región o prueba desde otra red."
+        )
     if "-2015" in raw:
         return "🔑 Clave API inválida, restricción de IP o faltan permisos de Futuros (Error -2015)."
     if "-1021" in raw:
@@ -684,7 +691,8 @@ class BinanceTestnetClient:
                     tp_params["timeInForce"] = "GTC"
 
                 tp_res = self.client.futures_create_order(**tp_params)
-                if not tp_res.get("orderId"):
+                tp_ref_id = tp_res.get("orderId") or tp_res.get("algoId")
+                if not tp_ref_id:
                     # python-binance no lanza excepción si Binance responde 200 OK con cuerpo
                     # vacío (ver binance/client.py:_handle_response, `if response.text == "":
                     # return {}`) — algo que Testnet hace en cortes de red/timeouts parciales.
@@ -692,14 +700,19 @@ class BinanceTestnetClient:
                     # se creó" y registraba SENT_OK aunque Binance nunca haya creado la orden
                     # real, dejando la posición sin protección de Take Profit mientras el
                     # ledger mentía que sí se había enviado (ver auditoría 2026-09-18).
-                    raise RuntimeError(f"Binance devolvió una respuesta vacía/sin orderId para la orden TP: {tp_res!r}")
+                    # NOTA: las órdenes condicionales TP/SL en Futures se enrutan como "Algo
+                    # Orders" y devuelven `algoId` en vez de `orderId` (igual que el resto de
+                    # este cliente ya asume en cancel_all_open_orders/futures_get_open_algo_orders
+                    # más abajo) — por eso se comprueba también algoId antes de dar por fallida
+                    # una orden que Binance sí aceptó.
+                    raise RuntimeError(f"Binance devolvió una respuesta vacía/sin orderId ni algoId para la orden TP: {tp_res!r}")
                 results["tp_order"] = tp_res
                 logger.info("Orden TP (%s) enviada a Binance: %s", tp_type, tp_res)
                 _log_order_to_ledger(
                     symbol=binance_symbol, side=close_side, action="TAKE_PROFIT", order_type=tp_type,
                     requested_qty=qty, requested_price=tp_price, use_testnet=self.use_testnet,
-                    status="SENT_OK", binance_order_id=tp_res.get("orderId"), client_order_id=tp_client_order_id,
-                    exchange_status=str(tp_res.get("status", "")).upper(),
+                    status="SENT_OK", binance_order_id=tp_ref_id, client_order_id=tp_client_order_id,
+                    exchange_status=str(tp_res.get("status") or tp_res.get("algoStatus") or "").upper(),
                 )
             except Exception as e:
                 logger.warning("No se pudo colocar orden TP en Binance: %s", e)
@@ -729,18 +742,20 @@ class BinanceTestnetClient:
                     sl_params["timeInForce"] = "GTC"
 
                 sl_res = self.client.futures_create_order(**sl_params)
-                if not sl_res.get("orderId"):
+                sl_ref_id = sl_res.get("orderId") or sl_res.get("algoId")
+                if not sl_ref_id:
                     # Ver comentario equivalente en la rama de Take Profit arriba: Binance
                     # puede responder 200 OK con cuerpo vacío, y python-binance no lo trata
-                    # como error (auditoría 2026-09-18).
-                    raise RuntimeError(f"Binance devolvió una respuesta vacía/sin orderId para la orden SL: {sl_res!r}")
+                    # como error (auditoría 2026-09-18); también se acepta algoId, ya que las
+                    # órdenes condicionales se enrutan como Algo Orders (ver nota en la rama TP).
+                    raise RuntimeError(f"Binance devolvió una respuesta vacía/sin orderId ni algoId para la orden SL: {sl_res!r}")
                 results["sl_order"] = sl_res
                 logger.info("Orden SL (%s) enviada a Binance: %s", sl_type, sl_res)
                 _log_order_to_ledger(
                     symbol=binance_symbol, side=close_side, action="STOP_LOSS", order_type=sl_type,
                     requested_qty=qty, requested_price=sl_price, use_testnet=self.use_testnet,
-                    status="SENT_OK", binance_order_id=sl_res.get("orderId"), client_order_id=sl_client_order_id,
-                    exchange_status=str(sl_res.get("status", "")).upper(),
+                    status="SENT_OK", binance_order_id=sl_ref_id, client_order_id=sl_client_order_id,
+                    exchange_status=str(sl_res.get("status") or sl_res.get("algoStatus") or "").upper(),
                 )
             except Exception as e:
                 logger.warning("No se pudo colocar orden SL en Binance: %s", e)

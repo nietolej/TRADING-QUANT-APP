@@ -7,11 +7,13 @@ en Binance (con la etiqueta QTAPP_) que nunca quedaron registradas del lado de l
 """
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any, Dict, List
 
 from nicegui import ui
 
 from data_layer.storage import SessionLocal
+from execution_engine.daemon_client import daemon_client as bot_manager
 from reconciliation.models import AppOrderRecord, ReconciliationRecord
 from reconciliation.reconciler import OrderReconciler
 
@@ -56,6 +58,7 @@ class ReconciliationPage:
         self.use_testnet = True
         self.is_loading = False
         self.last_summary: Dict[str, Any] = {}
+        self._test2_timer = None
 
     def render(self):
         with ui.column().classes('w-full h-full p-2 md:p-4 gap-6 bg-[#0a0e17] text-white'):
@@ -86,6 +89,47 @@ class ReconciliationPage:
             with ui.row().classes('w-full gap-4 flex-wrap') as self.summary_row:
                 self._render_summary_cards({})
 
+            ui.label('🧪 Modo Test — Validación antes de dinero real').classes('text-lg font-bold text-white mt-2')
+            ui.label(
+                'Test 1 corre un ciclo completo de orden real en Testnet ahora mismo. Test 2 vigila '
+                'automáticamente un bot en vivo, conciliando cada cierto intervalo sin que tengas que '
+                'pulsar "Conciliar ahora" cada vez.'
+            ).classes('text-xs text-gray-400 -mt-1')
+
+            with ui.row().classes('w-full gap-4 flex-wrap items-stretch'):
+                # ── Test 1: ciclo completo inmediato ──
+                with ui.card().classes('bg-[#111827] border border-[#1e293b] rounded-xl p-4 flex-1 min-w-[340px] gap-2'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('bolt', color='cyan-400', size='20px')
+                        ui.label('Test 1 — Ciclo Completo Inmediato').classes('text-base font-bold text-white')
+                    ui.label(
+                        'Envía una orden real de prueba a Testnet (entrada + SL/TP condicional + cierre) usando '
+                        'el mismo código que usan los bots, y la concilia al instante. Solo corre en Testnet.'
+                    ).classes('text-xs text-gray-400')
+                    with ui.row().classes('gap-2 items-center flex-wrap'):
+                        self.test1_symbol_input = ui.input('Símbolo', value='BTC/USDT').classes('w-32')
+                        self.test1_qty_input = ui.number('Cantidad', value=0.001, step=0.001, format='%.3f').classes('w-28')
+                        self.test1_btn = ui.button('▶ Ejecutar Test 1', icon='science', on_click=self._run_test1_async) \
+                            .classes('bg-cyan-600 hover:bg-cyan-500 text-white font-bold px-3 py-2 rounded-lg')
+                    self.test1_results_col = ui.column().classes('w-full gap-1 mt-2')
+
+                # ── Test 2: monitoreo en vivo de un bot ──
+                with ui.card().classes('bg-[#111827] border border-[#1e293b] rounded-xl p-4 flex-1 min-w-[340px] gap-2'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('monitor_heart', color='emerald-400', size='20px')
+                        ui.label('Test 2 — Monitoreo en Vivo de un Bot').classes('text-base font-bold text-white')
+                    ui.label(
+                        'Selecciona un bot en Testnet ya corriendo: se concilia automáticamente cada '
+                        'cierto intervalo mientras opera en vivo, alertando discrepancias en tiempo real.'
+                    ).classes('text-xs text-gray-400')
+                    with ui.row().classes('gap-2 items-center flex-wrap'):
+                        self.test2_bot_select = ui.select({}, label='Bot (Testnet)').classes('w-56')
+                        self.test2_interval_input = ui.number('Intervalo (s)', value=30, min=10, max=300).classes('w-28')
+                        self.test2_toggle_btn = ui.button('▶ Iniciar Monitoreo', icon='play_arrow', on_click=self._toggle_test2) \
+                            .classes('bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-2 rounded-lg')
+                    self.test2_status_label = ui.label('Inactivo').classes('text-xs text-gray-400 font-mono')
+                    self.test2_log_col = ui.column().classes('w-full gap-1 mt-2 max-h-64 overflow-y-auto')
+
             ui.label('Resultados de la última conciliación').classes('text-lg font-bold text-white mt-2')
             self.results_table = ui.table(
                 columns=RESULT_COLUMNS, rows=[], row_key='binance_order_id', pagination={'rowsPerPage': 10}
@@ -109,6 +153,7 @@ class ReconciliationPage:
             ).classes('w-full')
 
         ui.timer(0.5, self._load_persisted_data_async, once=True)
+        ui.timer(0.5, self._refresh_test2_bot_options, once=True)
 
     # ── Helpers de UI ────────────────────────────────────────────────────
 
@@ -238,6 +283,142 @@ class ReconciliationPage:
             for r in ledger
         ]
         self.ledger_table.update()
+
+    # ── Modo Test 1: ciclo completo inmediato ───────────────────────────
+
+    async def _run_test1_async(self):
+        self.test1_btn.props('loading')
+        self.test1_results_col.clear()
+        try:
+            symbol = (self.test1_symbol_input.value or 'BTC/USDT').strip()
+            qty = float(self.test1_qty_input.value or 0.001)
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, lambda: OrderReconciler(use_testnet=True).run_full_cycle_test(symbol=symbol, quantity=qty)
+            )
+
+            with self.test1_results_col:
+                for s in result.get('steps', []):
+                    ok = bool(s.get('ok'))
+                    icon = 'check_circle' if ok else 'cancel'
+                    color = 'emerald-400' if ok else 'red-400'
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon(icon, color=color, size='16px')
+                        ui.label(f"{s.get('step')}: {s.get('detail')}").classes(f'text-xs text-{color}')
+                recon = result.get('reconciliation', [])
+                if recon:
+                    crit = sum(1 for r in recon if r.get('severity') == 'CRITICAL')
+                    ui.label(
+                        f"Reconciliación: {len(recon)} orden(es) verificadas, {crit} crítica(s)"
+                    ).classes('text-xs text-gray-400 mt-1')
+
+            if result.get('success'):
+                ui.notify('✅ Test 1 completado con éxito: ciclo completo validado en Testnet.', type='positive', duration=6000)
+            else:
+                ui.notify('⚠️ Test 1 encontró fallos — revisa el detalle en la tarjeta.', type='negative', duration=8000)
+
+            await self._load_persisted_data_async()
+        except Exception as e:
+            logger.error("Error ejecutando Test 1: %s", e)
+            ui.notify(f"Error ejecutando Test 1: {e}", type='negative', duration=8000)
+        finally:
+            self.test1_btn.props(remove='loading')
+
+    # ── Modo Test 2: monitoreo en vivo de un bot ────────────────────────
+
+    async def _refresh_test2_bot_options(self):
+        loop = asyncio.get_event_loop()
+        try:
+            bots = await loop.run_in_executor(None, bot_manager.get_all_bots)
+        except Exception as e:
+            logger.debug("No se pudo listar bots para Test 2: %s", e)
+            return
+        options = {
+            b.bot_id: f"{b.name} ({b.symbol}) {'🟡 Testnet' if b.use_testnet else '🌐 Real'}"
+            for b in bots if getattr(b, 'use_testnet', True)
+        }
+        self.test2_bot_select.options = options
+        self.test2_bot_select.update()
+
+    def _toggle_test2(self):
+        if self._test2_timer is not None:
+            self._test2_timer.deactivate()
+            self._test2_timer = None
+            self.test2_toggle_btn.set_text('▶ Iniciar Monitoreo')
+            self.test2_toggle_btn.classes(replace='bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-2 rounded-lg')
+            self.test2_status_label.set_text('Inactivo')
+            return
+
+        bot_id = self.test2_bot_select.value
+        if not bot_id:
+            ui.notify('Selecciona un bot de Testnet primero.', type='warning')
+            return
+
+        interval = max(10.0, float(self.test2_interval_input.value or 30))
+
+        async def _tick():
+            await self._run_test2_tick(bot_id)
+
+        self._test2_timer = ui.timer(interval, _tick)
+        self.test2_toggle_btn.set_text('⏹ Detener Monitoreo')
+        self.test2_toggle_btn.classes(replace='bg-red-600 hover:bg-red-500 text-white font-bold px-3 py-2 rounded-lg')
+        self.test2_status_label.set_text('Monitoreando... (primera pasada en curso)')
+        asyncio.create_task(_tick())
+
+    async def _run_test2_tick(self, bot_id: str):
+        loop = asyncio.get_event_loop()
+        try:
+            bots = await loop.run_in_executor(None, bot_manager.get_all_bots)
+        except Exception as e:
+            self._append_test2_log(f"⚠️ No se pudo listar bots: {e}", critical=True)
+            return
+
+        bot = next((b for b in bots if b.bot_id == bot_id), None)
+        if not bot:
+            self.test2_status_label.set_text('⚠️ El bot seleccionado ya no existe.')
+            self._toggle_test2()  # detiene el monitoreo automáticamente
+            return
+
+        if not bot.is_running:
+            self.test2_status_label.set_text(f"⏸ {bot.name} no está corriendo — esperando a que arranque...")
+            return
+
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: OrderReconciler(use_testnet=True).run(
+                    symbols=[bot.symbol.replace('/', '').upper()], lookback_hours=2.0
+                )
+            )
+        except Exception as e:
+            self._append_test2_log(f"⚠️ Error conciliando {bot.name}: {e}", critical=True)
+            return
+
+        critical = result.get('critical_count', 0)
+        checked = result.get('total_checked', 0)
+        if critical:
+            self.test2_status_label.set_text(f"🚨 {bot.name}: {critical} discrepancia(s) crítica(s) detectada(s)")
+            self._append_test2_log(f"🚨 {bot.name}: {critical} crítica(s) de {checked} revisadas", critical=True)
+        else:
+            self.test2_status_label.set_text(f"✅ {bot.name}: OK ({checked} orden(es) revisadas)")
+            self._append_test2_log(f"✅ {bot.name}: sin discrepancias ({checked} revisadas)", critical=False)
+
+        await self._load_persisted_data_async()
+
+    def _append_test2_log(self, text: str, critical: bool):
+        ts = datetime.now().strftime('%H:%M:%S')
+        entries = getattr(self, '_test2_log_entries', None)
+        if entries is None:
+            entries = self._test2_log_entries = []
+        entries.append((ts, text, critical))
+        # Limitar el log a las últimas 30 líneas para no crecer indefinidamente en sesiones largas
+        del entries[:-30]
+
+        self.test2_log_col.clear()
+        with self.test2_log_col:
+            for e_ts, e_text, e_critical in reversed(entries):
+                color = 'red-400' if e_critical else 'emerald-400'
+                ui.label(f"[{e_ts}] {e_text}").classes(f'text-xs font-mono text-{color}')
 
 
 def render_reconciliation_page():

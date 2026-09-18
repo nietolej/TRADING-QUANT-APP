@@ -284,10 +284,9 @@ class BinanceOperationsPage:
         try:
             import asyncio
             loop = asyncio.get_event_loop()
-            client = self._client()
 
             if self.selected_wallet == 'futures':
-                info = await loop.run_in_executor(None, lambda: client.get_full_account_info(use_testnet=(self.selected_network == 'testnet')))
+                info = await loop.run_in_executor(None, lambda: self._client().get_full_account_info(use_testnet=(self.selected_network == 'testnet')))
                 if info.get('success'):
                     self.fut_positions_grid.options['rowData'] = self._map_positions(info.get('positions', []))
                     self.fut_positions_grid.update()
@@ -305,7 +304,7 @@ class BinanceOperationsPage:
                 await self._refresh_futures_trade_history()
                 await self._refresh_futures_transactions()
             else:
-                info = await loop.run_in_executor(None, lambda: client.get_spot_account_info(use_testnet=(self.selected_network == 'testnet')))
+                info = await loop.run_in_executor(None, lambda: self._client().get_spot_account_info(use_testnet=(self.selected_network == 'testnet')))
                 if info.get('success'):
                     self.spot_open_orders_grid.options['rowData'] = info.get('open_orders', [])
                     self.spot_open_orders_grid.update()
@@ -350,8 +349,7 @@ class BinanceOperationsPage:
         import asyncio
         loop = asyncio.get_event_loop()
         sym = self.fut_oh_symbol.value or self.symbol_futures
-        client = self._client()
-        rows = await loop.run_in_executor(None, lambda: client.get_futures_order_history(symbol=sym))
+        rows = await loop.run_in_executor(None, lambda: self._client().get_futures_order_history(symbol=sym))
         self.fut_order_history_grid.options['rowData'] = rows
         self.fut_order_history_grid.update()
 
@@ -359,8 +357,7 @@ class BinanceOperationsPage:
         import asyncio
         loop = asyncio.get_event_loop()
         sym = self.fut_th_symbol.value or self.symbol_futures
-        client = self._client()
-        rows = await loop.run_in_executor(None, lambda: client.get_futures_trade_history(symbol=sym))
+        rows = await loop.run_in_executor(None, lambda: self._client().get_futures_trade_history(symbol=sym))
         self.fut_trade_history_grid.options['rowData'] = rows
         self.fut_trade_history_grid.update()
 
@@ -368,8 +365,7 @@ class BinanceOperationsPage:
         import asyncio
         loop = asyncio.get_event_loop()
         itype = self.fut_income_type.value
-        client = self._client()
-        rows = await loop.run_in_executor(None, lambda: client.get_futures_transaction_history(income_type=None if itype == 'Todos' else itype))
+        rows = await loop.run_in_executor(None, lambda: self._client().get_futures_transaction_history(income_type=None if itype == 'Todos' else itype))
         self.fut_transactions_grid.options['rowData'] = rows
         self.fut_transactions_grid.update()
 
@@ -377,8 +373,7 @@ class BinanceOperationsPage:
         import asyncio
         loop = asyncio.get_event_loop()
         sym = self.spot_oh_symbol.value or self.symbol_spot
-        client = self._client()
-        rows = await loop.run_in_executor(None, lambda: client.get_spot_order_history(symbol=sym))
+        rows = await loop.run_in_executor(None, lambda: self._client().get_spot_order_history(symbol=sym))
         self.spot_order_history_grid.options['rowData'] = rows
         self.spot_order_history_grid.update()
 
@@ -386,16 +381,14 @@ class BinanceOperationsPage:
         import asyncio
         loop = asyncio.get_event_loop()
         sym = self.spot_th_symbol.value or self.symbol_spot
-        client = self._client()
-        rows = await loop.run_in_executor(None, lambda: client.get_spot_trade_history(symbol=sym))
+        rows = await loop.run_in_executor(None, lambda: self._client().get_spot_trade_history(symbol=sym))
         self.spot_trade_history_grid.options['rowData'] = rows
         self.spot_trade_history_grid.update()
 
     async def _refresh_spot_transactions(self, *_):
         import asyncio
         loop = asyncio.get_event_loop()
-        client = self._client()
-        rows = await loop.run_in_executor(None, lambda: client.get_spot_transaction_history())
+        rows = await loop.run_in_executor(None, lambda: self._client().get_spot_transaction_history())
         self.spot_transactions_grid.options['rowData'] = rows
         self.spot_transactions_grid.update()
 

@@ -87,8 +87,9 @@ class BinanceP2PPage:
         self.status_badge.props('color=gray-800')
         try:
             loop = asyncio.get_event_loop()
-            client = BinanceTestnetClient(use_testnet=False)
-            rows, err = await loop.run_in_executor(None, lambda: client.get_p2p_trade_history(trade_type=self.trade_type))
+            rows, err = await loop.run_in_executor(
+                None, lambda: BinanceTestnetClient(use_testnet=False).get_p2p_trade_history(trade_type=self.trade_type)
+            )
             self.p2p_grid.options['rowData'] = rows
             self.p2p_grid.update()
             if err:

@@ -68,11 +68,31 @@ class BlockExplorerClient:
                 "sort": "desc",
                 "apikey": self.etherscan_key
             }
-            try:
-                res = requests.get(url, params=params, timeout=15)
-                data = res.json()
-            except Exception as e:
-                logger.error(f"Error de red consultando Etherscan: {e}")
+            # Reintentos con backoff ante fallos de red (Etherscan resetea la conexión con
+            # cierta frecuencia bajo uso intensivo). Antes, cualquier excepción de red -por
+            # transitoria que fuera- se trataba como "ventana no llena" y el llamador
+            # interpretaba eso como fin del histórico, truncando la descarga de forma
+            # silenciosa justo en el punto donde ocurrió el hiccup de red (ver auditoría
+            # 2026-09-18: Exchange_Inflow/Outflow de USDT/USDC quedaban incompletos sin
+            # ningún error visible más que un log suelto).
+            data = None
+            last_network_error = None
+            for attempt in range(3):
+                try:
+                    res = requests.get(url, params=params, timeout=15)
+                    data = res.json()
+                    last_network_error = None
+                    break
+                except Exception as e:
+                    last_network_error = e
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)  # 1s, 2s
+            if last_network_error is not None:
+                logger.error(
+                    f"Error de red consultando Etherscan tras 3 intentos (contrato={contract_address}, "
+                    f"dirección={target_address}, página={page}): {last_network_error}. "
+                    f"El histórico descargado en esta corrida puede quedar incompleto desde aquí hacia atrás."
+                )
                 return window_results, False
 
             status = data.get("status")

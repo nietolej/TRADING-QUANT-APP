@@ -553,7 +553,6 @@ class BinanceAccountPage:
 
         try:
             use_test = (self.selected_network == "testnet")
-            client = BinanceTestnetClient(use_testnet=use_test)
             loop = asyncio.get_event_loop()
 
             # 1. Actualizar credenciales y estado del candado en pantalla
@@ -563,7 +562,9 @@ class BinanceAccountPage:
 
             # 2. Según la cartera activa, consultar endpoint correspondiente
             if self.selected_wallet == "futures":
-                data = await loop.run_in_executor(None, lambda: client.get_full_account_info(use_testnet=use_test))
+                data = await loop.run_in_executor(
+                    None, lambda: BinanceTestnetClient(use_testnet=use_test).get_full_account_info(use_testnet=use_test)
+                )
                 self.account_data = data
                 if data.get("success"):
                     self.risk_analysis = PortfolioRiskAnalyzer.analyze_portfolio(data)
@@ -571,7 +572,9 @@ class BinanceAccountPage:
                     self.risk_analysis = {}
                 self._update_futures_ui(data, self.risk_analysis)
             else:
-                spot_data = await loop.run_in_executor(None, lambda: client.get_spot_account_info(use_testnet=use_test))
+                spot_data = await loop.run_in_executor(
+                    None, lambda: BinanceTestnetClient(use_testnet=use_test).get_spot_account_info(use_testnet=use_test)
+                )
                 self.spot_data = spot_data
                 self._update_spot_ui(spot_data)
         except Exception as e:
@@ -1040,13 +1043,16 @@ class BinanceAccountPage:
     async def _run_network_diagnostic(self):
         use_test = (self.selected_network == "testnet")
         ui.notify(f"Ejecutando prueba de diagnóstico en Binance ({'Testnet' if use_test else 'Mainnet'})...", type='info')
-        client = BinanceTestnetClient(use_testnet=use_test)
         loop = asyncio.get_event_loop()
-        
+
         if use_test:
-            res = await loop.run_in_executor(None, lambda: client.test_testnet_connection(symbol="BTC/USDT"))
+            res = await loop.run_in_executor(
+                None, lambda: BinanceTestnetClient(use_testnet=use_test).test_testnet_connection(symbol="BTC/USDT")
+            )
         else:
-            res = await loop.run_in_executor(None, client.test_mainnet_connection)
+            res = await loop.run_in_executor(
+                None, lambda: BinanceTestnetClient(use_testnet=use_test).test_mainnet_connection()
+            )
 
         if res.get("success"):
             lat = res.get('latency_ms', 0)
@@ -1063,13 +1069,14 @@ class BinanceAccountPage:
         self._action_in_progress = True
         try:
             use_test = (self.selected_network == "testnet")
-            client = BinanceTestnetClient(use_testnet=use_test)
             current_state = bool(self.account_data.get("multi_assets_margin", False)) if self.account_data else False
             new_target = not current_state
 
             ui.notify(f"Configurando Modo Multiactivos en Binance a {'ACTIVO' if new_target else 'INACTIVO'}...", type='info')
             loop = asyncio.get_event_loop()
-            ok, err = await loop.run_in_executor(None, lambda: client.set_multi_assets_margin(new_target))
+            ok, err = await loop.run_in_executor(
+                None, lambda: BinanceTestnetClient(use_testnet=use_test).set_multi_assets_margin(new_target)
+            )
 
             if ok:
                 ui.notify(f"✅ Modo Multiactivos {'ACTIVADO' if new_target else 'DESACTIVADO'} en Binance.", type='positive')
@@ -1086,9 +1093,11 @@ class BinanceAccountPage:
         self._action_in_progress = True
         try:
             use_test = (self.selected_network == "testnet")
-            client = BinanceTestnetClient(use_testnet=use_test)
             loop = asyncio.get_event_loop()
-            ok, err = await loop.run_in_executor(None, lambda: client.cancel_all_futures_orders(symbol="BTCUSDT", use_testnet=use_test))
+            ok, err = await loop.run_in_executor(
+                None,
+                lambda: BinanceTestnetClient(use_testnet=use_test).cancel_all_futures_orders(symbol="BTCUSDT", use_testnet=use_test)
+            )
             if ok:
                 ui.notify("🗑 Todas las órdenes abiertas de BTCUSDT han sido canceladas.", type='positive')
                 await self._refresh_account_data_async()
@@ -1149,8 +1158,9 @@ class BinanceAccountPage:
 
         loop = asyncio.get_event_loop()
         use_test = (self.selected_network == "testnet")
-        client = BinanceTestnetClient(use_testnet=use_test)
-        ok, err = await loop.run_in_executor(None, lambda: client.cancel_all_futures_orders_every_symbol(use_testnet=use_test))
+        ok, err = await loop.run_in_executor(
+            None, lambda: BinanceTestnetClient(use_testnet=use_test).cancel_all_futures_orders_every_symbol(use_testnet=use_test)
+        )
 
         ui.notify('🛡️ Candado de seguridad BLOQUEADO a MODO SOLO LECTURA.', type='positive', duration=8000)
         if ok:

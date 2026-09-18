@@ -272,6 +272,105 @@ class OrderReconciler:
         finally:
             db.close()
 
+    # ── Modo Test 1: ciclo completo inmediato (entrada + SL/TP + cierre + reconciliación) ──
+
+    def run_full_cycle_test(self, symbol: str = "BTC/USDT", quantity: float = 0.001) -> Dict[str, Any]:
+        """
+        Ejecuta un ciclo completo de orden real en Testnet usando EXACTAMENTE el mismo código
+        de producción que usan los bots (BinanceTestnetClient.place_futures_order /
+        place_futures_sl_tp / cancel_all_open_orders / close_futures_position), y luego concilia
+        esas mismas órdenes contra Binance. No es una simulación aparte: si este test pasa,
+        el pipeline real (incluida la corrección de algoId del 18/09) está probado de punta a
+        punta, no solo "compila".
+
+        Diseñado para "Modo Test 1" en la página de Conciliación: una prueba a demanda que no
+        requiere esperar a que un bot en vivo abra posición.
+        """
+        if not self.use_testnet:
+            return {
+                "success": False,
+                "error": "El Modo Test 1 solo puede correr contra Testnet (nunca Mainnet) por seguridad.",
+                "steps": [],
+            }
+
+        binance_symbol = symbol.replace("/", "").upper()
+        steps: List[Dict[str, Any]] = []
+
+        def _step(name: str, ok: bool, detail: str):
+            steps.append({"step": name, "ok": ok, "detail": detail})
+            return ok
+
+        # 1. Precio de referencia para calcular SL/TP a una distancia segura (2%)
+        price = self.client.get_symbol_price(binance_symbol)
+        if not price or price <= 0:
+            _step("Precio de referencia", False, "No se pudo obtener el precio actual del símbolo.")
+            return {"success": False, "steps": steps, "reconciliation": []}
+        _step("Precio de referencia", True, f"{price}")
+
+        # 2. Orden de entrada MARKET (idéntico a PaperTrader._open_position)
+        entry_order, entry_err = self.client.place_futures_order(
+            symbol=symbol, side="long", quantity=quantity, order_type="MARKET", verify_execution=True
+        )
+        if not _step("Entrada MARKET (BUY)", bool(entry_order) and not entry_err, entry_err or f"orderId={entry_order.get('orderId') if entry_order else None}"):
+            return {"success": False, "steps": steps, "reconciliation": []}
+
+        try:
+            # 3. SL/TP condicional (idéntico a PaperTrader._open_position) — aquí es donde vivía
+            # el bug de algoId del 18/09, así que este paso es el más importante del test.
+            sl_price = round(price * 0.98, 2)
+            tp_price = round(price * 1.02, 2)
+            sl_tp_res = self.client.place_futures_sl_tp(
+                symbol=symbol, side="long", quantity=quantity,
+                sl_price=sl_price, tp_price=tp_price,
+                sl_order_type="LIMIT", tp_order_type="LIMIT",
+            )
+            tp_ok = bool(sl_tp_res.get("tp_order"))
+            sl_ok = bool(sl_tp_res.get("sl_order"))
+            _step(
+                "Take Profit condicional",
+                tp_ok,
+                f"algoId/orderId={sl_tp_res['tp_order'].get('orderId') or sl_tp_res['tp_order'].get('algoId')}" if tp_ok
+                else "; ".join(e for e in sl_tp_res.get("errors", []) if e.startswith("TP")),
+            )
+            _step(
+                "Stop Loss condicional",
+                sl_ok,
+                f"algoId/orderId={sl_tp_res['sl_order'].get('orderId') or sl_tp_res['sl_order'].get('algoId')}" if sl_ok
+                else "; ".join(e for e in sl_tp_res.get("errors", []) if e.startswith("SL")),
+            )
+
+            # 4. Cancelar condicionales (idéntico al cleanup normal antes de un cierre)
+            cancel_ok, cancel_err = self.client.cancel_all_open_orders(symbol)
+            _step("Cancelar condicionales", cancel_ok, cancel_err or "OK")
+
+            # 5. Cerrar la posición de prueba (idéntico a PaperTrader._close_position)
+            close_order, close_err = self.client.close_futures_position(
+                symbol=symbol, side="long", quantity=quantity, order_type="MARKET", verify_execution=True
+            )
+            _step("Cierre MARKET (SELL reduceOnly)", bool(close_order) and not close_err, close_err or f"orderId={close_order.get('orderId') if close_order else None}")
+        except Exception as e:
+            _step("Excepción durante el ciclo", False, str(e))
+            # Intento de limpieza best-effort para no dejar la posición de prueba abierta
+            try:
+                self.client.cancel_all_open_orders(symbol)
+                self.client.close_futures_position(symbol=symbol, side="long", quantity=quantity, order_type="MARKET", verify_execution=False)
+            except Exception:
+                pass
+
+        # 6. Reconciliar de inmediato las órdenes que este mismo test acaba de generar,
+        # probando también el módulo de reconciliación como parte del ciclo.
+        recon_results = self.reconcile_pending(lookback_hours=0.05, limit=20)
+
+        overall_ok = all(s["ok"] for s in steps)
+        return {
+            "success": overall_ok,
+            "symbol": binance_symbol,
+            "steps": steps,
+            "reconciliation": recon_results,
+        }
+
+    # ── Orquestación ─────────────────────────────────────────────────────────
+
     def run(self, symbols: List[str], lookback_hours: float = 24.0) -> Dict[str, Any]:
         """Corre una reconciliación completa (pendientes + huérfanos por símbolo) y notifica discrepancias."""
         all_results = list(self.reconcile_pending(lookback_hours=lookback_hours))

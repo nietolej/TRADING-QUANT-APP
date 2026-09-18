@@ -266,14 +266,21 @@ class MarketDataManager:
         ts_map = {ensure_utc(rec['timestamp']).replace(tzinfo=None): rec for rec in records}
         ts_list = list(ts_map.keys())
         
-        # Single query to fetch all existing timestamps in this batch
-        existing_ts = set(
-            r[0] for r in self.db.query(OHLCV.timestamp).filter(
-                OHLCV.symbol == symbol,
-                OHLCV.timeframe == timeframe,
-                OHLCV.timestamp.in_(ts_list)
-            ).all()
-        )
+        # Single query (batched) to fetch all existing timestamps in this batch. Se trocea
+        # el IN(...) en lotes de 500: una descarga histórica grande puede traer más
+        # timestamps de los que SQLite admite en un solo IN() ("too many SQL variables"),
+        # ver mismo fix en onchain_data.py:update_historical_data.
+        existing_ts = set()
+        batch_size = 500
+        for i in range(0, len(ts_list), batch_size):
+            batch = ts_list[i:i + batch_size]
+            existing_ts.update(
+                r[0] for r in self.db.query(OHLCV.timestamp).filter(
+                    OHLCV.symbol == symbol,
+                    OHLCV.timeframe == timeframe,
+                    OHLCV.timestamp.in_(batch)
+                ).all()
+            )
         
         new_objects = []
         for ts_naive, rec in ts_map.items():

@@ -1,4 +1,6 @@
 import os
+import time
+import requests
 import pandas as pd
 import plotly.graph_objects as from_plotly
 from plotly.subplots import make_subplots
@@ -70,6 +72,123 @@ METRICS_BY_SYMBOL = {
     # USDT + USDC (ej. Total_Supply combinado = oferta total de ambos stablecoins).
     'USDT+USDC': list(STABLECOIN_METRICS),
 }
+
+
+_availability_cache = {}
+_AVAILABILITY_TTL_SECONDS = 3600  # revalidar cada hora, no en cada render del selector
+
+
+def _cryptoquant_indicator_access_ok() -> bool:
+    """CryptoQuant expone `market-data` (OHLCV) en cualquier plan, pero MVRV/SOPR/Puell
+    Multiple/exchange-flows/miner-flows/etc viven bajo endpoints 'market-indicator',
+    'network-indicator', 'exchange-flows' y 'miner-flows' que devuelven 403 Forbidden si
+    el plan de la cuenta no los incluye (confirmado en auditoría 2026-09-18: la misma key
+    responde 200 en market-data/price-ohlcv y 403 en TODOS los indicadores/flows). En vez
+    de asumir estáticamente que están disponibles, se hace una sola llamada barata
+    (limit=1) y se cachea el resultado para reflejar cambios de suscripción sin reiniciar
+    la app."""
+    cached = _availability_cache.get('cryptoquant_indicators')
+    if cached and (time.time() - cached[1]) < _AVAILABILITY_TTL_SECONDS:
+        return cached[0]
+
+    key = os.getenv("CRYPTOQUANT_API_KEY", "").strip()
+    ok = False
+    if key and key != "tu_clave_api_aqui":
+        try:
+            r = requests.get(
+                "https://api.cryptoquant.com/v1/btc/market-indicator/mvrv",
+                params={"window": "day", "limit": 1},
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=5,
+            )
+            ok = r.status_code == 200
+        except Exception:
+            ok = False
+
+    _availability_cache['cryptoquant_indicators'] = (ok, time.time())
+    return ok
+
+
+def _cryptoquant_market_data_access_ok() -> bool:
+    """funding_rates/open_interest/taker_buy_sell_ratio viven bajo 'market-data', que es un
+    tier DISTINTO de 'market-indicator'/'network-indicator'/'exchange-flows'/'miner-flows'
+    (ver _cryptoquant_indicator_access_ok): un plan sin acceso a indicadores puede sí tener
+    acceso a market-data (confirmado en auditoría 2026-09-18: el plan actual devuelve 200
+    en funding-rates/open-interest/taker-buy-sell-stats con el parámetro 'exchange', pero
+    403 en mvrv/sopr/exchange-flows/etc). Se prueba por separado para no ocultar estas 3
+    métricas solo porque las 14 "premium" no están disponibles."""
+    cached = _availability_cache.get('cryptoquant_market_data')
+    if cached and (time.time() - cached[1]) < _AVAILABILITY_TTL_SECONDS:
+        return cached[0]
+
+    key = os.getenv("CRYPTOQUANT_API_KEY", "").strip()
+    ok = False
+    if key and key != "tu_clave_api_aqui":
+        try:
+            r = requests.get(
+                "https://api.cryptoquant.com/v1/btc/market-data/funding-rates",
+                params={"window": "day", "exchange": "binance", "limit": 1},
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=5,
+            )
+            ok = r.status_code == 200
+        except Exception:
+            ok = False
+
+    _availability_cache['cryptoquant_market_data'] = (ok, time.time())
+    return ok
+
+
+def _binance_public_reachable() -> bool:
+    """Los endpoints públicos de Binance Futures (funding rate, open interest, taker
+    ratio) pueden estar geobloqueados (HTTP 451 'restricted location') según la IP/región
+    desde donde corre el servidor (confirmado en auditoría 2026-09-18). Se cachea el
+    resultado de una llamada mínima para no repetir la prueba en cada render del selector."""
+    cached = _availability_cache.get('binance_public')
+    if cached and (time.time() - cached[1]) < _AVAILABILITY_TTL_SECONDS:
+        return cached[0]
+
+    ok = False
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/fundingRate",
+            params={"symbol": "BTCUSDT", "limit": 1},
+            timeout=5,
+        )
+        ok = r.status_code == 200
+    except Exception:
+        ok = False
+
+    _availability_cache['binance_public'] = (ok, time.time())
+    return ok
+
+
+def _available_metrics_for(symbol: str) -> list:
+    """Filtra METRICS_BY_SYMBOL a solo las métricas que la app puede descargar AHORA MISMO
+    con la configuración/red actuales, para que el selector no ofrezca combinaciones que
+    siempre van a fallar (CryptoQuant sin acceso a indicadores, Binance Futures
+    geobloqueado, Glassnode sin key). Las de stablecoins (Etherscan/DefiLlama) no dependen
+    de ningún plan de pago, así que siempre están disponibles."""
+    all_metrics = METRICS_BY_SYMBOL.get(symbol, [])
+    if symbol not in ('BTC', 'ETH'):
+        return list(all_metrics)
+
+    cq_ok = _cryptoquant_indicator_access_ok()
+    cq_market_data_ok = _cryptoquant_market_data_access_ok()
+    glassnode_ok = _glassnode_key_configured()
+    binance_ok = _binance_public_reachable()
+
+    available = []
+    for m in all_metrics:
+        if m == 'Total_Supply' or (m == 'exchange_reserve' and symbol == 'BTC'):
+            # BTC vía blockchain.info: balance/oferta real, gratis y sin key, siempre disponible.
+            available.append(m)
+        elif m in FREE_BINANCE_METRICS:
+            if binance_ok or cq_market_data_ok:
+                available.append(m)
+        elif cq_ok or (m in GLASSNODE_METRICS and glassnode_ok):
+            available.append(m)
+    return available
 
 
 def _symbols_for(selection: str) -> list:
@@ -148,9 +267,14 @@ def fetch_data_async(symbol, days, metric=None):
                 # públicamente verificada (ver blockchain_info_provider.py). Preferida sobre
                 # Glassnode/CryptoQuant, que para esta métrica exigen suscripción de pago.
                 provider = 'blockchain_info'
-            elif mapped_metric in FREE_BINANCE_METRICS:
+            elif mapped_metric in FREE_BINANCE_METRICS and _binance_public_reachable():
                 # Sin costo ni API key: usa los endpoints públicos de Binance Futures en
-                # vez de CryptoQuant para las métricas que Binance sí publica gratis.
+                # vez de CryptoQuant para las métricas que Binance sí publica gratis. Si
+                # Binance Futures está geobloqueado (HTTP 451 según la IP/región del
+                # servidor, ver auditoría 2026-09-18) se cae a CryptoQuant más abajo en vez
+                # de fallar directo: funding_rates/open_interest/taker_buy_sell_ratio SÍ
+                # están disponibles ahí (endpoint 'market-data', un tier distinto al de los
+                # indicadores premium que si devuelven 403 con el plan actual).
                 provider = 'binance_public'
             elif mapped_metric in GLASSNODE_METRICS and _glassnode_key_configured():
                 # NOTA: Glassnode NO es gratis (se verificó el 2026-09-16 en su propia
@@ -236,29 +360,46 @@ def render_onchain_analyzer():
             ).classes('w-32')
 
             # Las opciones de métrica se filtran según el símbolo elegido (ver
-            # _on_symbol_change más abajo): antes el dropdown mezclaba métricas de
-            # stablecoins con métricas de CryptoQuant sin importar el símbolo, permitiendo
-            # combinaciones sin sentido (ej. BTC + Mint) que fallaban en silencio.
+            # _on_symbol_change más abajo) Y según qué proveedores están realmente
+            # disponibles ahora mismo (_available_metrics_for): antes el dropdown ofrecía
+            # métricas de CryptoQuant/Binance que siempre fallaban (403 por plan sin
+            # acceso a indicadores, o 451 por geobloqueo), dejando al usuario descubrirlo
+            # recién al sincronizar. Ver auditoría 2026-09-18.
+            initial_metrics = _available_metrics_for('BTC')
             metric_select = ui.select(
-                options=METRICS_BY_SYMBOL['BTC'],
-                value=METRICS_BY_SYMBOL['BTC'][0],
+                options=initial_metrics,
+                value=initial_metrics[0] if initial_metrics else None,
                 label='Métrica On-Chain'
             ).classes('w-64')
 
+            no_metrics_label = ui.label(
+                '⚠️ Sin métricas disponibles para este activo (revisa el plan de CryptoQuant, '
+                'la key de Glassnode o el bloqueo geográfico de Binance en "Conectar APIs").'
+            ).classes('text-xs text-amber-400')
+            no_metrics_label.set_visibility(False)
+
             def _on_symbol_change():
-                valid_metrics = METRICS_BY_SYMBOL.get(symbol_select.value, [])
+                valid_metrics = _available_metrics_for(symbol_select.value)
                 metric_select.options = valid_metrics
-                if valid_metrics and metric_select.value not in valid_metrics:
-                    metric_select.value = valid_metrics[0]
+                metric_select.value = valid_metrics[0] if valid_metrics else None
+                metric_select.set_visibility(bool(valid_metrics))
+                no_metrics_label.set_visibility(not valid_metrics)
+                fetch_btn.set_enabled(bool(valid_metrics))
+                plot_btn.set_enabled(bool(valid_metrics))
                 metric_select.update()
 
             symbol_select.on_value_change(lambda e: _on_symbol_change())
 
             fetch_btn = ui.button('Sincronizar APIs', icon='sync').classes('bg-amber-500 text-slate-900 font-bold')
             plot_btn = ui.button('Graficar Datos', icon='insights').classes('bg-slate-700 text-white font-bold')
-            
+
             loading_spinner = ui.spinner('dots', size='lg', color='amber').classes('ml-4')
             loading_spinner.set_visibility(False)
+
+            # Aplicar el estado inicial (BTC) ahora que fetch_btn/plot_btn ya existen.
+            no_metrics_label.set_visibility(not initial_metrics)
+            fetch_btn.set_enabled(bool(initial_metrics))
+            plot_btn.set_enabled(bool(initial_metrics))
 
         # Contenedor Medio: Gráfico
         chart_container = ui.column().classes('w-full bg-obsidian p-4 rounded-xl border border-slate-800 mb-6 min-h-[500px]')

@@ -646,11 +646,16 @@ class PaperTrader:
         # Restaurar posición abierta si existía
         pos_data = data.get("position")
         if pos_data:
+            raw_ts = pos_data.get("entry_timestamp")
+            # _save_state_to_disk serializa entry_timestamp con str(...); reparsearlo aquí
+            # evita que quede como string suelto y rompa _to_naive_utc/_save_trade_to_db
+            # más adelante cuando esta posición restaurada se cierre.
+            entry_ts = pd.to_datetime(raw_ts, utc=True) if raw_ts else datetime.now(timezone.utc)
             pos = Position(
                 side=pos_data.get("side", "long"),
                 entry_price=float(pos_data.get("entry_price", 0.0)),
                 quantity=float(pos_data.get("quantity", 0.0)),
-                timestamp=pos_data.get("entry_timestamp"),
+                timestamp=entry_ts,
             )
             pos.sl_price = float(pos_data.get("sl_price")) if pos_data.get("sl_price") is not None else None
             pos.tp_price = float(pos_data.get("tp_price")) if pos_data.get("tp_price") is not None else None
@@ -1039,9 +1044,11 @@ class PaperTrader:
                 sl_order_type=sl_type, tp_order_type=tp_type
             )
             if sl_tp_res.get("tp_order"):
-                self._notify(f"🎯 ORDEN TP ({tp_type}) COLOCADA @ {tp_price:.4f} | ID: {sl_tp_res['tp_order'].get('orderId')}")
+                tp_ref = sl_tp_res['tp_order'].get('orderId') or sl_tp_res['tp_order'].get('algoId')
+                self._notify(f"🎯 ORDEN TP ({tp_type}) COLOCADA @ {tp_price:.4f} | ID: {tp_ref}")
             if sl_tp_res.get("sl_order"):
-                self._notify(f"🛡️ ORDEN SL ({sl_type}) COLOCADA @ {sl_price:.4f} | ID: {sl_tp_res['sl_order'].get('orderId')}")
+                sl_ref = sl_tp_res['sl_order'].get('orderId') or sl_tp_res['sl_order'].get('algoId')
+                self._notify(f"🛡️ ORDEN SL ({sl_type}) COLOCADA @ {sl_price:.4f} | ID: {sl_ref}")
             if sl_tp_res.get("errors"):
                 # Esto no es informativo: si la orden condicional de SL o TP no quedo colocada
                 # en el exchange, la posicion real queda "desnuda" (sin proteccion del lado del
@@ -1352,6 +1359,26 @@ class PaperTrader:
     # Persistencia
     # ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _to_naive_utc(ts):
+        """Normaliza entry_time/exit_time a un datetime naive UTC antes de guardarlos.
+
+        PaperTrade.entry_time/exit_time son columnas `DateTime` de SQLAlchemy sobre
+        SQLite, que no acepta datetimes con tzinfo y lanza
+        `TypeError: SQLite DateTime type only accepts Python datetime and date objects
+        as input` al hacer commit. Dos orígenes distintos llegan aquí:
+        - `pd.to_datetime(..., utc=True)` en caliente (tz-aware) durante una sesión viva.
+        - Un string tz-aware (ej. "2026-09-17 20:04:00+00:00") cuando la posición se
+          restauró desde el estado persistido en disco, ya que `_save_state_to_disk`
+          serializa `entry_timestamp` con `str(...)` y `restore_from_dict` lo recarga
+          tal cual, sin volver a parsearlo a datetime.
+        Se usa pd.to_datetime para cubrir ambos casos con una sola conversión.
+        """
+        if ts is None:
+            return None
+        parsed = pd.to_datetime(ts, utc=True)
+        return parsed.to_pydatetime().astimezone(timezone.utc).replace(tzinfo=None)
+
     def _save_trade_to_db(self, trade: dict):
         db = SessionLocal()
         try:
@@ -1360,8 +1387,8 @@ class PaperTrader:
                 symbol=self.symbol,
                 strategy_name=self.strategy.config.get("strategy_name", "Unknown"),
                 side=trade["side"],
-                entry_time=trade["entry_time"],
-                exit_time=trade["exit_time"],
+                entry_time=self._to_naive_utc(trade["entry_time"]),
+                exit_time=self._to_naive_utc(trade["exit_time"]),
                 entry_price=trade["entry_price"],
                 exit_price=trade["exit_price"],
                 pnl=trade["pnl"],
