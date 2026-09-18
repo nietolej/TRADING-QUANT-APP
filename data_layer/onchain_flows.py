@@ -148,30 +148,45 @@ class BlockExplorerClient:
 
         return all_results
 
-    def _get_last_synced_timestamp(self, metric_names: list, symbol: str):
+    def _get_synced_range(self, metric_names: list, symbol: str):
         """
-        Último timestamp ya guardado para estas métricas/símbolo, considerando también
-        las variantes con prefijo de símbolo de versiones anteriores del código (ver
-        onchain_analyzer_page.py:metric_name_candidates). None si nunca se sincronizó.
+        (mín, máx) de los timestamps ya guardados para estas métricas/símbolo,
+        considerando también las variantes con prefijo de símbolo de versiones
+        anteriores del código (ver onchain_analyzer_page.py:metric_name_candidates).
+        (None, None) si nunca se sincronizó.
         """
         all_names = list(metric_names) + [f"{symbol}_{name}" for name in metric_names]
-        last_ts = self.db.query(func.max(OnChainMetric.timestamp)).filter(
+        min_ts, max_ts = self.db.query(
+            func.min(OnChainMetric.timestamp), func.max(OnChainMetric.timestamp)
+        ).filter(
             OnChainMetric.metric_name.in_(all_names),
             OnChainMetric.symbol == symbol
-        ).scalar()
-        return last_ts.replace(tzinfo=timezone.utc) if last_ts else None
+        ).first()
+        return (
+            min_ts.replace(tzinfo=timezone.utc) if min_ts else None,
+            max_ts.replace(tzinfo=timezone.utc) if max_ts else None,
+        )
 
     def _effective_start(self, requested_start: datetime, metric_names: list, symbol: str) -> datetime:
         """
-        Sincronización incremental: si ya hay datos guardados más recientes que
-        `requested_start`, se continúa desde ahí en vez de repaginar todo el rango
-        pedido en Etherscan en cada click de "Sincronizar APIs" (antes: cada sync
-        volvía a descargar desde `requested_start` sin importar lo ya guardado).
+        Sincronización incremental con relleno de huecos hacia atrás (igual patrón que
+        MarketDataManager.update_historical_data): si lo ya guardado no cubre
+        `requested_start` (ej. una sync anterior arrancó desde una fecha más reciente
+        y dejó sin descargar todo el histórico previo), se vuelve a pedir desde
+        `requested_start` para rellenar ese hueco — Etherscan pagina de más reciente a
+        más antiguo, así que este rango vuelve a traer también lo ya guardado, pero
+        `_save_records` lo deduplica contra la BD sin generar filas repetidas.
+        Solo cuando lo guardado ya cubre `requested_start` se continúa desde el último
+        registro, para no repaginar todo el rango en cada sync (antes: SIEMPRE se
+        continuaba desde el último registro, así que una sync previa que arrancó tarde
+        dejaba ese hueco histórico sin descargar para siempre).
         """
         requested_start = requested_start.replace(tzinfo=timezone.utc)
-        last_ts = self._get_last_synced_timestamp(metric_names, symbol)
-        if last_ts and last_ts > requested_start:
-            return last_ts
+        min_ts, max_ts = self._get_synced_range(metric_names, symbol)
+        if min_ts is None or min_ts > requested_start:
+            return requested_start
+        if max_ts and max_ts > requested_start:
+            return max_ts
         return requested_start
 
     def fetch_stablecoin_supply(self, symbol: str, start_date: datetime):

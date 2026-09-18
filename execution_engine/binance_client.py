@@ -517,6 +517,12 @@ class BinanceTestnetClient:
                 params["timeInForce"] = "GTC"
 
             order = self.client.futures_create_order(**params)
+            if not order.get("orderId"):
+                # Ver auditoría 2026-09-18: python-binance no lanza excepción si Binance
+                # responde 200 OK con cuerpo vacío (binance/client.py:_handle_response),
+                # así que sin esta validación la app registraría SENT_OK para una orden
+                # que Binance nunca llegó a crear.
+                raise RuntimeError(f"Binance devolvió una respuesta vacía/sin orderId para la orden {o_type}: {order!r}")
             order_id = order.get("orderId")
             initial_status = str(order.get("status", "")).upper()
             logger.info("Orden %s (%s) creada en Binance Futures. ID: %s, Estado inicial: %s", o_type, binance_side, order_id, initial_status)
@@ -600,6 +606,9 @@ class BinanceTestnetClient:
                 return None, "Cliente de Binance no disponible"
 
             order = self.client.futures_create_order(**params)
+            if not order.get("orderId"):
+                # Ver auditoría 2026-09-18 (misma causa que en place_futures_order).
+                raise RuntimeError(f"Binance devolvió una respuesta vacía/sin orderId para el cierre {params['type']}: {order!r}")
             order_id = order.get("orderId")
             initial_status = str(order.get("status", "")).upper()
             logger.info("Cierre de posición %s (%s) enviado a Binance Futures. ID: %s, Estado inicial: %s", o_type, close_side, order_id, initial_status)
@@ -675,6 +684,15 @@ class BinanceTestnetClient:
                     tp_params["timeInForce"] = "GTC"
 
                 tp_res = self.client.futures_create_order(**tp_params)
+                if not tp_res.get("orderId"):
+                    # python-binance no lanza excepción si Binance responde 200 OK con cuerpo
+                    # vacío (ver binance/client.py:_handle_response, `if response.text == "":
+                    # return {}`) — algo que Testnet hace en cortes de red/timeouts parciales.
+                    # Sin esta validación, la app confiaba en "no hubo excepción" = "la orden
+                    # se creó" y registraba SENT_OK aunque Binance nunca haya creado la orden
+                    # real, dejando la posición sin protección de Take Profit mientras el
+                    # ledger mentía que sí se había enviado (ver auditoría 2026-09-18).
+                    raise RuntimeError(f"Binance devolvió una respuesta vacía/sin orderId para la orden TP: {tp_res!r}")
                 results["tp_order"] = tp_res
                 logger.info("Orden TP (%s) enviada a Binance: %s", tp_type, tp_res)
                 _log_order_to_ledger(
@@ -711,6 +729,11 @@ class BinanceTestnetClient:
                     sl_params["timeInForce"] = "GTC"
 
                 sl_res = self.client.futures_create_order(**sl_params)
+                if not sl_res.get("orderId"):
+                    # Ver comentario equivalente en la rama de Take Profit arriba: Binance
+                    # puede responder 200 OK con cuerpo vacío, y python-binance no lo trata
+                    # como error (auditoría 2026-09-18).
+                    raise RuntimeError(f"Binance devolvió una respuesta vacía/sin orderId para la orden SL: {sl_res!r}")
                 results["sl_order"] = sl_res
                 logger.info("Orden SL (%s) enviada a Binance: %s", sl_type, sl_res)
                 _log_order_to_ledger(

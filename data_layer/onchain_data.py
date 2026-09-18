@@ -39,12 +39,32 @@ class OnChainDataManager:
         if start_date.tzinfo is None:
             start_date = start_date.replace(tzinfo=timezone.utc)
 
+        # Chequear min Y max: si lo ya guardado no cubre start_date (ej. una sync
+        # anterior arrancó desde una fecha más reciente), hay que rellenar ese hueco
+        # histórico en vez de continuar solo hacia adelante desde el último registro
+        # (mismo patrón que MarketDataManager.update_historical_data). Antes esto solo
+        # miraba el último registro, así que una primera sync que arrancó tarde dejaba
+        # todo el histórico previo sin descargar para siempre.
+        first_record = self.db.query(OnChainMetric).filter(
+            OnChainMetric.metric_name == metric_name,
+            OnChainMetric.symbol == symbol
+        ).order_by(OnChainMetric.timestamp.asc()).first()
+
         last_record = self.db.query(OnChainMetric).filter(
             OnChainMetric.metric_name == metric_name,
             OnChainMetric.symbol == symbol
         ).order_by(OnChainMetric.timestamp.desc()).first()
 
-        if last_record:
+        if first_record:
+            first_ts = first_record.timestamp
+            if first_ts.tzinfo is None:
+                first_ts = first_ts.replace(tzinfo=timezone.utc)
+        else:
+            first_ts = None
+
+        if first_ts is None or first_ts > start_date:
+            since_dt = start_date
+        elif last_record:
             since_dt = last_record.timestamp
             if since_dt.tzinfo is None:
                 since_dt = since_dt.replace(tzinfo=timezone.utc)
