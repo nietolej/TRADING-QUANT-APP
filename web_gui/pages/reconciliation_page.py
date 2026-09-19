@@ -52,6 +52,23 @@ LEDGER_COLUMNS = [
     {"name": "reconciliation_status", "label": "Conciliación", "field": "reconciliation_status", "align": "left"},
 ]
 
+REPORT_COLUMNS = [
+    {"name": "run_at", "label": "Fecha", "field": "run_at", "align": "left"},
+    {"name": "symbol", "label": "Símbolo", "field": "symbol", "align": "left"},
+    {"name": "position_side", "label": "Long/Short", "field": "position_side", "align": "left"},
+    {"name": "action", "label": "Acción", "field": "action", "align": "left"},
+    {"name": "order_type", "label": "Tipo", "field": "order_type", "align": "left"},
+    {"name": "requested_qty", "label": "Cant. Solicitada", "field": "requested_qty", "align": "right"},
+    {"name": "executed_qty", "label": "Cant. Ejecutada", "field": "executed_qty", "align": "right"},
+    {"name": "reference_price", "label": "Precio Referencia", "field": "reference_price", "align": "right"},
+    {"name": "avg_price", "label": "Precio Ejecutado", "field": "avg_price", "align": "right"},
+    {"name": "slippage_pct", "label": "Deslizamiento %", "field": "slippage_pct", "align": "right"},
+    {"name": "match_status", "label": "Estado", "field": "match_status", "align": "left"},
+    {"name": "severity", "label": "Severidad", "field": "severity", "align": "left"},
+    {"name": "binance_order_id", "label": "Orden Binance", "field": "binance_order_id", "align": "left"},
+    {"name": "details", "label": "Detalle", "field": "details", "align": "left"},
+]
+
 
 class ReconciliationPage:
     def __init__(self):
@@ -59,6 +76,7 @@ class ReconciliationPage:
         self.is_loading = False
         self.last_summary: Dict[str, Any] = {}
         self._test2_timer = None
+        self.last_report: Dict[str, Any] = {}
 
     def render(self):
         with ui.column().classes('w-full h-full p-2 md:p-4 gap-6 bg-[#0a0e17] text-white'):
@@ -93,7 +111,8 @@ class ReconciliationPage:
             ui.label(
                 'Test 1 corre un ciclo completo de orden real en Testnet ahora mismo. Test 2 vigila '
                 'automáticamente un bot en vivo, conciliando cada cierto intervalo sin que tengas que '
-                'pulsar "Conciliar ahora" cada vez.'
+                'pulsar "Conciliar ahora" cada vez. Test 3 verifica, orden por orden, que se haya creado '
+                'en la app, enviado y ejecutado realmente en Binance, midiendo el deslizamiento de precio.'
             ).classes('text-xs text-gray-400 -mt-1')
 
             with ui.row().classes('w-full gap-4 flex-wrap items-stretch'):
@@ -130,6 +149,24 @@ class ReconciliationPage:
                     self.test2_status_label = ui.label('Inactivo').classes('text-xs text-gray-400 font-mono')
                     self.test2_log_col = ui.column().classes('w-full gap-1 mt-2 max-h-64 overflow-y-auto')
 
+                # ── Test 3: verificación creación → envío → ejecución ──
+                with ui.card().classes('bg-[#111827] border border-[#1e293b] rounded-xl p-4 flex-1 min-w-[340px] gap-2'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('verified', color='violet-400', size='20px')
+                        ui.label('Test 3 — Verificación Creación → Envío → Ejecución').classes('text-base font-bold text-white')
+                    ui.label(
+                        'Envía una orden real a Testnet y confirma, paso a paso, que quedó creada en el ledger '
+                        'de la app, que se envió a Binance y que Binance la ejecutó de verdad — midiendo además '
+                        'el deslizamiento de precio contra la referencia tomada al enviarla. Cierra la posición al final.'
+                    ).classes('text-xs text-gray-400')
+                    with ui.row().classes('gap-2 items-center flex-wrap'):
+                        self.test3_symbol_input = ui.input('Símbolo', value='BTC/USDT').classes('w-32')
+                        self.test3_qty_input = ui.number('Cantidad', value=0.001, step=0.001, format='%.3f').classes('w-28')
+                        self.test3_side_select = ui.select({'long': 'Long', 'short': 'Short'}, value='long').classes('w-24')
+                        self.test3_btn = ui.button('▶ Ejecutar Test 3', icon='fact_check', on_click=self._run_test3_async) \
+                            .classes('bg-violet-600 hover:bg-violet-500 text-white font-bold px-3 py-2 rounded-lg')
+                    self.test3_results_col = ui.column().classes('w-full gap-1 mt-2')
+
             ui.label('Resultados de la última conciliación').classes('text-lg font-bold text-white mt-2')
             self.results_table = ui.table(
                 columns=RESULT_COLUMNS, rows=[], row_key='binance_order_id', pagination={'rowsPerPage': 10}
@@ -152,6 +189,40 @@ class ReconciliationPage:
                 columns=LEDGER_COLUMNS, rows=[], row_key='id', pagination={'rowsPerPage': 15}
             ).classes('w-full')
 
+            # ── Reporte de Tests ─────────────────────────────────────────
+            with ui.row().classes('w-full justify-between items-center mt-6 flex-wrap gap-2'):
+                with ui.column().classes('gap-0.5'):
+                    ui.label('📊 Reporte de Tests').classes('text-lg font-bold text-white')
+                    ui.label(
+                        'Resultado a nivel de conciliación de cada orden generada por Test 1/2/3: precio, '
+                        'cantidad, long/short, cuántas fueron efectivas y cuántas fallaron por deslizamiento.'
+                    ).classes('text-xs text-gray-400')
+                with ui.row().classes('gap-2 items-center'):
+                    self.report_hours_input = ui.number('Horas atrás', value=24, min=1, max=720).classes('w-24')
+                    self.report_btn = ui.button('Ver Reporte de Tests', icon='summarize', on_click=self._load_test_report_async) \
+                        .classes('bg-indigo-600 hover:bg-indigo-500 text-white font-bold px-4 py-2 rounded-xl')
+
+            with ui.row().classes('w-full gap-4 flex-wrap') as self.report_summary_row:
+                self._render_report_summary_cards({})
+
+            self.report_table = ui.table(
+                columns=REPORT_COLUMNS, rows=[], row_key='binance_order_id', pagination={'rowsPerPage': 15}
+            ).classes('w-full')
+            self.report_table.add_slot('body-cell-severity', '''
+                <q-td :props="props">
+                    <q-badge :color="props.value === 'CRITICAL' ? 'red' : (props.value === 'WARNING' ? 'amber' : 'green')">
+                        {{ props.value }}
+                    </q-badge>
+                </q-td>
+            ''')
+            self.report_table.add_slot('body-cell-position_side', '''
+                <q-td :props="props">
+                    <q-badge :color="props.value === 'LONG' ? 'emerald' : (props.value === 'SHORT' ? 'red' : 'grey')">
+                        {{ props.value || '-' }}
+                    </q-badge>
+                </q-td>
+            ''')
+
         ui.timer(0.5, self._load_persisted_data_async, once=True)
         ui.timer(0.5, self._refresh_test2_bot_options, once=True)
 
@@ -169,6 +240,22 @@ class ReconciliationPage:
             ]
             for label, value, icon, color in cards:
                 with ui.column().classes('bg-[#111827] border border-[#1e293b] rounded-xl px-4 py-3 min-w-[160px] gap-1'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon(icon, size='18px', color=color)
+                        ui.label(label).classes('text-xs text-gray-400 font-semibold uppercase tracking-wide')
+                    ui.label(str(value)).classes(f'text-2xl font-extrabold text-{color} font-mono')
+
+    def _render_report_summary_cards(self, report: Dict[str, Any]):
+        self.report_summary_row.clear()
+        with self.report_summary_row:
+            cards = [
+                ("Órdenes revisadas", report.get("total_checked", "-"), "checklist", "cyan-400"),
+                ("Efectivas", report.get("effective_count", "-"), "check_circle", "emerald-400"),
+                ("Fallidas", report.get("failed_count", "-"), "cancel", "red-400"),
+                ("Fallos por deslizamiento", report.get("slippage_failed_count", "-"), "trending_down", "amber-400"),
+            ]
+            for label, value, icon, color in cards:
+                with ui.column().classes('bg-[#111827] border border-[#1e293b] rounded-xl px-4 py-3 min-w-[180px] gap-1'):
                     with ui.row().classes('items-center gap-2'):
                         ui.icon(icon, size='18px', color=color)
                         ui.label(label).classes('text-xs text-gray-400 font-semibold uppercase tracking-wide')
@@ -324,6 +411,51 @@ class ReconciliationPage:
         finally:
             self.test1_btn.props(remove='loading')
 
+    # ── Modo Test 3: verificación creación → envío → ejecución ──────────
+
+    async def _run_test3_async(self):
+        self.test3_btn.props('loading')
+        self.test3_results_col.clear()
+        try:
+            symbol = (self.test3_symbol_input.value or 'BTC/USDT').strip()
+            qty = float(self.test3_qty_input.value or 0.001)
+            side = self.test3_side_select.value or 'long'
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: OrderReconciler(use_testnet=True).run_execution_verification_test(
+                    symbol=symbol, quantity=qty, side=side
+                )
+            )
+
+            with self.test3_results_col:
+                for s in result.get('steps', []):
+                    ok = bool(s.get('ok'))
+                    icon = 'check_circle' if ok else 'cancel'
+                    color = 'emerald-400' if ok else 'red-400'
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon(icon, color=color, size='16px')
+                        ui.label(f"{s.get('step')}: {s.get('detail')}").classes(f'text-xs text-{color}')
+                for o in result.get('orders', []):
+                    slip = o.get('slippage_pct')
+                    slip_txt = f", deslizamiento {slip:.3f}%" if slip is not None else ""
+                    ui.label(
+                        f"{o.get('symbol')} {o.get('position_side') or ''} {o.get('order_type') or ''} — "
+                        f"{o.get('match_status')}: cant. {o.get('executed_qty')} @ {o.get('avg_price')}{slip_txt}"
+                    ).classes('text-xs text-gray-400 mt-1')
+
+            if result.get('success'):
+                ui.notify('✅ Test 3 completado: orden creada, enviada y ejecutada en Binance sin discrepancias.', type='positive', duration=6000)
+            else:
+                ui.notify('⚠️ Test 3 encontró fallos — revisa el detalle en la tarjeta.', type='negative', duration=8000)
+
+            await self._load_persisted_data_async()
+        except Exception as e:
+            logger.error("Error ejecutando Test 3: %s", e)
+            ui.notify(f"Error ejecutando Test 3: {e}", type='negative', duration=8000)
+        finally:
+            self.test3_btn.props(remove='loading')
+
     # ── Modo Test 2: monitoreo en vivo de un bot ────────────────────────
 
     async def _refresh_test2_bot_options(self):
@@ -419,6 +551,35 @@ class ReconciliationPage:
             for e_ts, e_text, e_critical in reversed(entries):
                 color = 'red-400' if e_critical else 'emerald-400'
                 ui.label(f"[{e_ts}] {e_text}").classes(f'text-xs font-mono text-{color}')
+
+    # ── Reporte de Tests ─────────────────────────────────────────────────
+
+    async def _load_test_report_async(self):
+        self.report_btn.props('loading')
+        try:
+            hours = float(self.report_hours_input.value or 24)
+            use_testnet = self.use_testnet
+            loop = asyncio.get_event_loop()
+            report = await loop.run_in_executor(
+                None, lambda: OrderReconciler(use_testnet=use_testnet, notify=False).build_test_report(lookback_hours=hours)
+            )
+            self.last_report = report
+            self._render_report_summary_cards(report)
+
+            self.report_table.rows = report.get('orders', [])
+            self.report_table.update()
+
+            ui.notify(
+                f"Reporte de Tests: {report.get('total_checked', 0)} orden(es) — "
+                f"{report.get('effective_count', 0)} efectiva(s), {report.get('failed_count', 0)} fallida(s) "
+                f"({report.get('slippage_failed_count', 0)} por deslizamiento).",
+                type='positive' if not report.get('failed_count') else 'warning', duration=7000
+            )
+        except Exception as e:
+            logger.error("Error generando el Reporte de Tests: %s", e)
+            ui.notify(f"Error generando el Reporte de Tests: {e}", type='negative', duration=8000)
+        finally:
+            self.report_btn.props(remove='loading')
 
 
 def render_reconciliation_page():

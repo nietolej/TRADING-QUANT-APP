@@ -3,15 +3,44 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy import Float
+
 from data_layer.storage import Base, SessionLocal, engine
-from reconciliation.models import AppOrderRecord
+from reconciliation.models import AppOrderRecord, ReconciliationRecord
 
 logger = logging.getLogger("OrderLedger")
 
 # Las tablas del ledger viven en el mismo archivo SQLite que el resto de la app (via el
 # engine compartido de data_layer.storage), pero se crean desde este módulo separado para
 # no acoplar data_layer/storage.py al dominio de reconciliación.
-Base.metadata.create_all(bind=engine, tables=[AppOrderRecord.__table__])
+Base.metadata.create_all(bind=engine, tables=[AppOrderRecord.__table__, ReconciliationRecord.__table__])
+
+
+def _ensure_columns() -> None:
+    """
+    Migración aditiva mínima para SQLite: agrega columnas nuevas del modelo (ej. las de
+    detalle/slippage añadidas para el Reporte de Tests) a tablas que ya existían de una
+    versión anterior de la app, donde `create_all` no las crea porque la tabla ya está
+    presente. No-op para cualquier otro motor de base de datos.
+    """
+    if engine.dialect.name != "sqlite":
+        return
+    try:
+        with engine.connect() as conn:
+            for table in (AppOrderRecord.__table__, ReconciliationRecord.__table__):
+                existing = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table.name})").fetchall()}
+                for column in table.columns:
+                    if column.name in existing:
+                        continue
+                    col_type = "FLOAT" if isinstance(column.type, Float) else "TEXT"
+                    conn.exec_driver_sql(f"ALTER TABLE {table.name} ADD COLUMN {column.name} {col_type}")
+                    logger.info("Columna '%s' agregada a '%s' (migración aditiva).", column.name, table.name)
+            conn.commit()
+    except Exception as e:
+        logger.warning("No se pudieron verificar/agregar columnas nuevas del ledger de reconciliación: %s", e)
+
+
+_ensure_columns()
 
 
 def log_app_order(
@@ -28,6 +57,7 @@ def log_app_order(
     exchange_status: Optional[str] = None,
     executed_qty: Optional[float] = None,
     avg_price: Optional[float] = None,
+    reference_price: Optional[float] = None,
     error: Optional[str] = None,
 ) -> Optional[str]:
     """
@@ -48,6 +78,7 @@ def log_app_order(
             order_type=order_type.upper(),
             requested_qty=float(requested_qty) if requested_qty is not None else None,
             requested_price=float(requested_price) if requested_price else None,
+            reference_price=float(reference_price) if reference_price else None,
             use_testnet=bool(use_testnet),
             status=status,
             binance_order_id=str(binance_order_id) if binance_order_id is not None else None,

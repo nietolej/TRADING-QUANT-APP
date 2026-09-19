@@ -8,6 +8,13 @@ ausentes) y con salida de red restringida por el proxy del entorno.
 **Base de datos:** SQLite nueva (`data/trading_quant.db`), creada en este mismo entorno para
 la prueba — sin historial previo de órdenes ni conciliaciones.
 
+> **Nota de actualización (misma fecha):** a partir de la sección "Actualización — Test 3
+> rediseñado + Reporte de Tests" (al final de este documento), Test 3 dejó de ser el botón
+> genérico "Conciliar ahora" y pasó a ser una prueba propia
+> (`OrderReconciler.run_execution_verification_test`) que crea, envía y verifica la ejecución
+> real de una orden en Binance, con un Reporte de Tests dedicado en la UI. El resto de este
+> informe (Test 1 y Test 2) sigue vigente sin cambios.
+
 Este informe documenta la ejecución real de los tres flujos de prueba que expone el módulo de
 conciliación: **Test 1** (ciclo completo inmediato), **Test 2** (monitoreo en vivo de un bot) y
 **Test 3** (conciliación general / botón "Conciliar ahora", que incluye la detección de huérfanos).
@@ -188,3 +195,89 @@ no hay red" de "sin precio porque el símbolo es inválido".
 `BINANCE_TESTNET_API_KEY`/`BINANCE_TESTNET_SECRET_KEY` configuradas y, para Test 2, con al menos
 un bot corriendo en Testnet) para obtener un veredicto funcional completo del pipeline de
 órdenes y del monitoreo automático.
+
+---
+
+## Actualización — Test 3 rediseñado + Reporte de Tests
+
+**Fecha:** 2026-09-19 (UTC), misma sesión.
+
+### Qué se probó
+A pedido, Test 3 dejó de ser el botón genérico "Conciliar ahora" y pasó a validar
+explícitamente, orden por orden, las tres condiciones pedidas:
+1. que la orden haya quedado **creada en el ledger de la app** (`app_order_ledger`),
+2. que se haya **enviado** a Binance (status `SENT_OK` + `binance_order_id`), y
+3. que Binance confirme que **se ejecutó realmente** (estado `FILLED` al reconciliar).
+
+Además se agregó un **Reporte de Tests** (`OrderReconciler.build_test_report`, con acceso
+propio "📊 Reporte de Tests" en la página de Conciliación) que muestra, para cada orden
+generada por Test 1/2/3: símbolo, LONG/SHORT, acción, tipo, cantidad solicitada/ejecutada,
+precio de referencia/ejecutado, **% de deslizamiento**, estado de conciliación, severidad y
+detalle — con contadores agregados de órdenes efectivas, fallidas y fallidas específicamente
+por deslizamiento de precio.
+
+### Cómo se probó
+1. **Nueva función `run_execution_verification_test`** (`reconciliation/reconciler.py`): abre
+   una orden MARKET real en Testnet, reconcilia de inmediato (confirma creación+envío+ejecución
+   y calcula el deslizamiento) y cierra la posición de prueba. Se invocó directamente contra
+   este entorno (`OrderReconciler(use_testnet=True).run_execution_verification_test(...)`).
+2. **Cálculo de deslizamiento**: se añadió `reference_price` (precio de mercado tomado justo
+   antes de enviar la orden, también para órdenes MARKET) al ledger (`AppOrderRecord`) y a cada
+   fila del historial de conciliación (`ReconciliationRecord`), junto con `slippage_pct` y un
+   nuevo estado `SLIPPAGE_EXCEEDED` (severidad `WARNING`/`CRITICAL` según la magnitud) cuando el
+   deslizamiento supera la tolerancia configurada (0.5% por defecto).
+3. **Migración de esquema**: como `app_order_ledger`/`reconciliation_log` ya podían existir de
+   una versión anterior, se agregó una migración aditiva (`reconciliation/order_ledger.py:
+   _ensure_columns`) que agrega las columnas nuevas vía `ALTER TABLE` si faltan. Se validó
+   recreando manualmente el esquema "viejo" (sin las columnas nuevas) y confirmando que, al
+   importar el módulo, las columnas aparecen correctamente en `PRAGMA table_info`.
+4. **Validación del cálculo de slippage y del reporte**: dado que este entorno no tiene
+   credenciales de Binance (mismo hallazgo que en la sección anterior de este informe), se
+   simuló la respuesta de Binance (`futures_get_order`) para dos órdenes ya "enviadas" por la
+   app — sin tocar la lógica de negocio real, solo la llamada de red — y se corrió la
+   reconciliación y el reporte de punta a punta.
+
+### Resultado obtenido
+- **`run_execution_verification_test` en este entorno:** se detiene en el paso 1
+  ("API Key o Secret no configuradas en .env"), consistente con el hallazgo ya documentado
+  arriba: este sandbox no tiene credenciales de Binance. El código en sí corrió sin errores.
+- **Validación simulada de slippage y reporte** (2 órdenes: una LONG BTCUSDT con 0.083% de
+  deslizamiento, una SHORT ETHUSDT con 3.333% de deslizamiento):
+```json
+{
+  "lookback_hours": 1.0,
+  "total_checked": 2,
+  "effective_count": 1,
+  "failed_count": 1,
+  "slippage_failed_count": 1,
+  "orders": [
+    {
+      "symbol": "BTCUSDT", "position_side": "LONG", "action": "OPEN", "order_type": "MARKET",
+      "requested_qty": 0.001, "executed_qty": 0.001,
+      "reference_price": 60000.0, "avg_price": 60050.0, "slippage_pct": 0.0833,
+      "match_status": "MATCHED", "severity": "INFO", "effective": true
+    },
+    {
+      "symbol": "ETHUSDT", "position_side": "SHORT", "action": "OPEN", "order_type": "MARKET",
+      "requested_qty": 0.01, "executed_qty": 0.01,
+      "reference_price": 3000.0, "avg_price": 3100.0, "slippage_pct": 3.3333,
+      "match_status": "SLIPPAGE_EXCEEDED", "severity": "CRITICAL", "effective": false
+    }
+  ]
+}
+```
+
+### Qué significa el resultado
+- La detección LONG/SHORT, el registro de precio/cantidad solicitados vs. ejecutados, el
+  cálculo de `slippage_pct` y los contadores de efectivas/fallidas/fallidas-por-deslizamiento
+  funcionan correctamente extremo a extremo (ledger → reconciliación → persistencia → reporte).
+- La migración aditiva permite desplegar este cambio sobre una base de datos ya existente sin
+  perder el historial previo de conciliaciones.
+- `run_execution_verification_test` (Test 3) no pudo validarse con una orden real en este
+  entorno por la misma razón que Test 1: faltan credenciales de Binance Testnet y, para el
+  primer paso, conectividad de red hacia `testnet.binancefuture.com`.
+
+**Conclusión:** la lógica de negocio (checks de creación/envío/ejecución, slippage, reporte)
+quedó validada con datos simulados controlados. Para ver el Reporte de Tests con datos 100%
+reales hace falta ejecutar Test 1 y/o Test 3 en la instancia desplegada con
+`BINANCE_TESTNET_API_KEY`/`BINANCE_TESTNET_SECRET_KEY` configuradas.
