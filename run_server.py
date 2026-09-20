@@ -124,7 +124,7 @@ def main():
     # Activar reload solo en modo desarrollo
     if dev_mode:
         reload_dirs = ["api", "web_gui", "backtest_engine", "strategy_engine",
-                       "data_layer", "ml_engine", "execution_engine", "notifications"]
+                       "data_layer", "ml_engine", "execution_engine", "notifications", "reconciliation"]
         cmd.append("--reload")
         cmd += ["--reload-exclude", "*.pyc", "--reload-exclude", "*.nbi", "--reload-exclude", "*__pycache__*"]
         for rd in reload_dirs:
