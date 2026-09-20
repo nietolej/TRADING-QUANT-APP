@@ -81,6 +81,8 @@ class PaperTrader:
             "exit": exec_cfg.get("exit_order_type", "MARKET").upper(),
             "stop_loss": exec_cfg.get("stop_loss_order_type", "LIMIT").upper(),
             "take_profit": exec_cfg.get("take_profit_order_type", "LIMIT").upper(),
+            # Cuándo se evalúan las señales de la estrategia: "intrabar" (en vivo) o "close" (al cierre de vela).
+            "signal_mode": str(exec_cfg.get("signal_mode", "intrabar")).lower(),
         }
 
         self.initial_balance = initial_balance
@@ -113,6 +115,7 @@ class PaperTrader:
         self.binance_position_info: Optional[dict] = None
         self._last_open_ts: float = 0.0
         self._zero_pos_reads: int = 0
+        self._last_signal_candle = None   # última vela cerrada ya evaluada (modo 'close')
 
         self._client: Optional[BinanceTestnetClient] = None
         # RLock (no Lock simple) porque _save_state()/to_dict() puede invocarse desde
@@ -261,6 +264,7 @@ class PaperTrader:
             self.is_running = False
             return
 
+        self._last_signal_candle = None   # tras (re)iniciar, la última vela cerrada no se trata como señal nueva
         # Recuperar la posición propia (si el bot cayó con una abierta y no llegó a guardarla)
         try:
             self._recover_position_from_ledger()
@@ -288,6 +292,7 @@ class PaperTrader:
     REST_POLL_S = 2.0             # cadencia del respaldo REST cuando el WebSocket no está disponible
     WS_WARMUP_S = 3.0             # margen inicial para que el WebSocket conecte antes de usar REST
     EXCHANGE_SYNC_S = 4.0
+    RATE_LIMIT_BACKOFF_S = 30.0   # espera tras un error de límite de peticiones (-1003/-1015)
     PROTECTION_CHECK_S = 30.0
 
     def _alive(self, generation: int) -> bool:
@@ -388,7 +393,12 @@ class PaperTrader:
                     self._ensure_exchange_sl_tp()
             except Exception:
                 logger.exception("[%s] Error en la sincronización con el exchange", self.name)
-            self._sleep_while_alive(self.EXCHANGE_SYNC_S, generation)
+            wait = self.EXCHANGE_SYNC_S
+            backoff = getattr(self, "_sync_backoff_until", 0.0) - time.monotonic()
+            if backoff > wait:
+                logger.warning("[%s] Límite de peticiones de Binance: sincronización en pausa %.0f s", self.name, backoff)
+                wait = backoff
+            self._sleep_while_alive(wait, generation)
 
     def update_configuration(
         self,
@@ -712,31 +722,64 @@ class PaperTrader:
     # Lógica de mercado
     # ──────────────────────────────────────────────────────────────
 
+    SIGNAL_MODES = ("intrabar", "close")
+
+    @property
+    def signal_mode(self) -> str:
+        """'intrabar' (señales sobre la vela en curso, en vivo) o 'close' (solo al cierre de cada vela)."""
+        mode = str(self.order_types.get("signal_mode", "intrabar")).lower()
+        return mode if mode in self.SIGNAL_MODES else "intrabar"
+
+    def _take_new_closed_candle(self):
+        """
+        Modo 'close': devuelve el DataFrame de velas CERRADAS si acaba de cerrarse una vela que aún no se
+        evaluó (una sola vez por vela); en cualquier otro caso None. La vela en curso (última fila) queda
+        fuera. Al arrancar se marca la última vela cerrada como ya vista: una señal que ocurrió antes de
+        iniciar el bot no debe disparar una operación.
+        """
+        if len(self.klines_df) < 3:
+            return None
+        closed = self.klines_df.iloc[:-1]
+        closed_ts = closed.index[-1]
+        if self._last_signal_candle is None:
+            self._last_signal_candle = closed_ts
+            return None
+        if closed_ts == self._last_signal_candle:
+            return None
+        self._last_signal_candle = closed_ts
+        return closed
+
     def _evaluate_market(self):
         if self.klines_df.empty or len(self.klines_df) < 2:
             return
 
         current_price = float(self.klines_df["close"].iloc[-1])
         current_ts = self.klines_df.index[-1]
+        # En modo 'close' las señales de la estrategia se evalúan solo con velas cerradas: un dip o un pico
+        # momentáneo dentro de la vela ya no dispara una entrada/salida que la vela luego desmiente (en un
+        # 60 % de las señales intravela, el cierre no las confirmaba). El SL/TP sigue vigilándose en vivo.
+        close_mode = self.signal_mode == "close"
+        signal_frame = self._take_new_closed_candle() if close_mode else self.klines_df
 
         if self.position:
-            # ── Chequeo de SL / TP ──────────────────────────────
+            # ── Chequeo de SL / TP (siempre en vivo) ────────────
             action = self._check_sl_tp(current_price)
             if action:
                 self._close_position(current_price, current_ts, action)
                 return
 
             # ── Condición de salida (señal) ──────────────────────
-            try:
-                exit_signal = ConditionEvaluator.evaluate_conditions(
-                    self.klines_df,
-                    self.strategy.config.get("exit_conditions", {}),
-                )
-                if not exit_signal.empty and bool(exit_signal.iloc[-1]):
-                    self._close_position(current_price, current_ts, "EXIT_SIGNAL")
-                    return
-            except Exception as exc:
-                logger.warning("Error evaluando exit_conditions: %s", exc)
+            if signal_frame is not None:
+                try:
+                    exit_signal = ConditionEvaluator.evaluate_conditions(
+                        signal_frame,
+                        self.strategy.config.get("exit_conditions", {}),
+                    )
+                    if not exit_signal.empty and bool(exit_signal.iloc[-1]):
+                        self._close_position(current_price, current_ts, "EXIT_SIGNAL")
+                        return
+                except Exception as exc:
+                    logger.warning("Error evaluando exit_conditions: %s", exc)
 
             # ── Salida por estado (vela cerrada) ─────────────────
             # La regla de salida de la estrategia es un CRUCE (evento de un instante): si el
@@ -750,11 +793,11 @@ class PaperTrader:
             except Exception as exc:
                 logger.warning("Error evaluando la salida por estado: %s", exc)
 
-        else:
+        elif signal_frame is not None:
             # ── Condición de entrada ─────────────────────────────
             try:
                 entry_signal = ConditionEvaluator.evaluate_conditions(
-                    self.klines_df,
+                    signal_frame,
                     self.strategy.config.get("entry_conditions", {}),
                 )
                 if not entry_signal.empty and bool(entry_signal.iloc[-1]):
@@ -1248,6 +1291,10 @@ class PaperTrader:
                     self.binance_position_info = info
             self._sync_own_position(net_amt, mark_p)
         except Exception as e_pos:
+            # Límite de peticiones de Binance (-1003/-1015, por IP: en Testnet la IP puede ser compartida):
+            # insistir solo lo empeora; se espera antes del siguiente ciclo.
+            if getattr(e_pos, "code", None) in (-1003, -1015):
+                self._sync_backoff_until = time.monotonic() + self.RATE_LIMIT_BACKOFF_S
             # Un fallo aquí deja al bot sin saber el estado real de su posición: se cuenta y se avisa.
             self._sync_failure_count = getattr(self, "_sync_failure_count", 0) + 1
             logger.warning(
