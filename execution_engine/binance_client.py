@@ -535,7 +535,7 @@ class BinanceTestnetClient:
             logger.info("Orden %s (%s) creada en Binance Futures. ID: %s, Estado inicial: %s", o_type, binance_side, order_id, initial_status)
             _log_order_to_ledger(
                 symbol=binance_symbol, side=binance_side, action="OPEN", order_type=o_type,
-                requested_qty=qty, requested_price=price, use_testnet=self.use_testnet,
+                requested_qty=qty, requested_price=price, reference_price=ref_price, use_testnet=self.use_testnet,
                 status="SENT_OK", binance_order_id=order_id, client_order_id=client_order_id,
                 exchange_status=initial_status, executed_qty=order.get("executedQty"),
                 avg_price=order.get("avgPrice"),
@@ -559,7 +559,7 @@ class BinanceTestnetClient:
             logger.error("Error enviando orden %s a Binance Futures: %s", o_type, e)
             _log_order_to_ledger(
                 symbol=binance_symbol, side=binance_side, action="OPEN", order_type=o_type,
-                requested_qty=qty, requested_price=price, use_testnet=self.use_testnet,
+                requested_qty=qty, requested_price=price, reference_price=ref_price, use_testnet=self.use_testnet,
                 status="SEND_FAILED", client_order_id=client_order_id, error=str(e),
             )
             return None, format_binance_error(e)
@@ -590,6 +590,10 @@ class BinanceTestnetClient:
 
         qty = self.format_quantity(binance_symbol, quantity)
         close_side = "SELL" if side.lower() == "long" else "BUY"
+        # Precio de referencia para medir slippage en la reconciliación (idéntico criterio
+        # que place_futures_order: usa el precio LIMIT pedido si existe, si no consulta el
+        # último precio de mercado justo antes de enviar el cierre).
+        ref_price = price if (price and price > 0) else self.get_symbol_price(binance_symbol)
 
         o_type = order_type.upper()
         client_order_id = _new_client_order_id()
@@ -621,7 +625,7 @@ class BinanceTestnetClient:
             logger.info("Cierre de posición %s (%s) enviado a Binance Futures. ID: %s, Estado inicial: %s", o_type, close_side, order_id, initial_status)
             _log_order_to_ledger(
                 symbol=binance_symbol, side=close_side, action="CLOSE", order_type=params["type"],
-                requested_qty=qty, requested_price=price, use_testnet=self.use_testnet,
+                requested_qty=qty, requested_price=price, reference_price=ref_price, use_testnet=self.use_testnet,
                 status="SENT_OK", binance_order_id=order_id, client_order_id=client_order_id,
                 exchange_status=initial_status, executed_qty=order.get("executedQty"),
                 avg_price=order.get("avgPrice"),
@@ -644,7 +648,7 @@ class BinanceTestnetClient:
             logger.error("Error cerrando posición en Binance Futures: %s", e)
             _log_order_to_ledger(
                 symbol=binance_symbol, side=close_side, action="CLOSE", order_type=o_type,
-                requested_qty=qty, requested_price=price, use_testnet=self.use_testnet,
+                requested_qty=qty, requested_price=price, reference_price=ref_price, use_testnet=self.use_testnet,
                 status="SEND_FAILED", client_order_id=client_order_id, error=str(e),
             )
             return None, format_binance_error(e)
