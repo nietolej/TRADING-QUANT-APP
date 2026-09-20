@@ -13,9 +13,10 @@ logger = logging.getLogger("OrderReconciler")
 FILLED_STATUSES = {"FILLED", "PARTIALLY_FILLED"}
 FAILED_STATUSES = {"REJECTED", "CANCELED", "EXPIRED"}
 
-# Estados que cuentan como "orden efectiva" (ejecutada correctamente, sin discrepancias) en
-# el Reporte de Tests. Todo lo demás cuenta como fallida.
-EFFECTIVE_STATUSES = {"MATCHED"}
+# Estados que cuentan como "orden efectiva" (ejecutada correctamente, sin discrepancias, o
+# cancelada de forma esperada por ser la contraparte de un TP/SL que sí se disparó) en el
+# Informe de Confiabilidad. Todo lo demás cuenta como fallida.
+EFFECTIVE_STATUSES = {"MATCHED", "CANCELED_AS_EXPECTED"}
 
 
 def _position_side(action: Optional[str], side: Optional[str]) -> Optional[str]:
@@ -133,6 +134,25 @@ class OrderReconciler:
         avg_price = float(exchange_order.get("avgPrice", 0.0) or 0.0)
         detail["executed_qty"] = exec_qty or detail["executed_qty"]
         detail["avg_price"] = avg_price or detail["avg_price"]
+
+        # Un Take Profit/Stop Loss CANCELED no es una falla: Binance solo permite que UNA de
+        # las dos órdenes condicionales de un mismo par se ejecute (cuando una se dispara, la
+        # otra se cancela automáticamente), y además el propio ciclo de cierre de la app
+        # (`cancel_all_open_orders`, ver run_full_cycle_test/run_execution_verification_test y
+        # el cierre normal de posiciones) cancela explícitamente ambas antes de cerrar con una
+        # orden MARKET. Sin este caso especial, TODO TP/SL quedaba marcado STATUS_MISMATCH
+        # CRITICAL de forma sistemática, aunque el bot esté operando exactamente como se espera.
+        if status == "CANCELED" and record.action in ("TAKE_PROFIT", "STOP_LOSS"):
+            return {
+                **detail,
+                "match_status": "CANCELED_AS_EXPECTED",
+                "severity": "INFO",
+                "details": (
+                    f"Orden {record.action} {record.binance_order_id} ({record.symbol}) cancelada en Binance — "
+                    f"comportamiento esperado: se dispara como máximo una de las dos condicionales (TP/SL) del par, "
+                    f"o ambas se cancelan al cerrar la posición manualmente."
+                ),
+            }
 
         if status in FAILED_STATUSES:
             return {
