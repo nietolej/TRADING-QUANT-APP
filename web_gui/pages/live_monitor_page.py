@@ -46,6 +46,12 @@ def _format_compact_time(ts) -> str:
         return s[5:19] if len(s) >= 19 else s
 
 
+# Máximo de trades recientes considerados al dibujar el gráfico (además del filtro por ventana visible).
+MAX_CHART_TRADES = 40
+# Cada cuántos segundos se redibuja el gráfico de un bot en marcha (velas nuevas lo redibujan al instante).
+CHART_REFRESH_S = 3.0
+
+
 class LiveMonitorPage:
     def __init__(self):
         self.strategies_dir = "config/strategies"
@@ -441,6 +447,12 @@ class LiveMonitorPage:
                         {'LIMIT': '🎯 Take Profit: LIMIT (Predet.)', 'MARKET': '⚡ Take Profit: MARKET'},
                         value='LIMIT', label='Orden de Take Profit'
                     ).classes('w-full text-xs')
+                    # Cuándo se evalúan las señales: al cierre de cada vela (evita entradas/salidas por un dip o
+                    # pico momentáneo que la vela luego desmiente) o en vivo sobre la vela en curso.
+                    new_signal_mode = ui.select(
+                        {'close': '🕯️ Al cierre de vela (recomendado)', 'intrabar': '⚡ Intravela (en vivo)'},
+                        value='close', label='Evaluación de señales'
+                    ).classes('w-full text-xs col-span-2')
 
             # Contenedor de parámetros de estrategia
             ui.label('Parámetros de la Estrategia:').classes('text-sm font-semibold text-gray-300 mt-1 mb-1')
@@ -515,7 +527,8 @@ class LiveMonitorPage:
                         'entry': new_entry_type.value,
                         'exit': new_exit_type.value,
                         'stop_loss': new_sl_type.value,
-                        'take_profit': new_tp_type.value
+                        'take_profit': new_tp_type.value,
+                        'signal_mode': new_signal_mode.value,
                     })
 
                     self.selected_bot_id = new_bot.bot_id
@@ -634,6 +647,10 @@ class LiveMonitorPage:
                         {'LIMIT': '🎯 Take Profit: LIMIT (Predet.)', 'MARKET': '⚡ Take Profit: MARKET'},
                         value=bot_ord_types.get('take_profit', 'LIMIT'), label='Orden de Take Profit'
                     ).classes('w-full text-xs')
+                    edit_signal_mode = ui.select(
+                        {'close': '🕯️ Al cierre de vela (recomendado)', 'intrabar': '⚡ Intravela (en vivo)'},
+                        value=bot_ord_types.get('signal_mode', 'intrabar'), label='Evaluación de señales'
+                    ).classes('w-full text-xs col-span-2')
 
             ui.label('Parámetros de la Estrategia:').classes('text-sm font-semibold text-gray-300 mt-1 mb-1')
             edit_params_container = ui.column().classes('w-full gap-2 p-3 bg-gray-900 rounded-lg border border-gray-700 mb-4')
@@ -687,7 +704,8 @@ class LiveMonitorPage:
                         'entry': edit_entry_type.value,
                         'exit': edit_exit_type.value,
                         'stop_loss': edit_sl_type.value,
-                        'take_profit': edit_tp_type.value
+                        'take_profit': edit_tp_type.value,
+                        'signal_mode': edit_signal_mode.value,
                     }
                 )
 
@@ -813,6 +831,56 @@ class LiveMonitorPage:
         )
         return fig
 
+    async def _rebuild_chart_async(self, bot, highlighted_trade, kline_len: int) -> None:
+        try:
+            fig = await run.io_bound(self._build_chart, bot, highlighted_trade)
+            self.chart.update_figure(fig)
+            self._last_chart_kline_len = kline_len
+            self._last_chart_bot_id = bot.bot_id
+        except Exception:
+            logger.exception("No se pudo actualizar el gráfico del Live Monitor")
+        finally:
+            self._chart_building = False
+
+    _REASON_LABELS = {
+        'EXIT_SIGNAL': 'señal', 'SL': 'stop loss', 'TP': 'take profit',
+        'BINANCE_EXCHANGE_CLOSED': 'cierre del exchange', 'MANUAL_BINANCE_CLOSE': 'manual',
+    }
+
+    @classmethod
+    def _reason_label(cls, reason) -> str:
+        return cls._REASON_LABELS.get(str(reason or ''), str(reason or '-'))
+
+    @classmethod
+    def _trade_hover(cls, trade: dict, kind: str, price: float, df) -> str:
+        """Texto del hover de un marcador: fill, razón, PnL y cierre de la vela de ese instante."""
+        is_long = trade.get('side') == 'long'
+        buying = (kind == 'entry') == is_long
+        lines = [f"<b>{'▲ COMPRA' if buying else '▼ VENTA'} @ {price:,.2f}</b> ({'entrada' if kind == 'entry' else 'salida'} {'LONG' if is_long else 'SHORT'})"]
+        if kind == 'exit':
+            lines.append(f"Razón: {cls._reason_label(trade.get('reason'))}")
+            try:
+                lines.append(f"PnL: {float(trade.get('pnl', 0.0)):+.4f}")
+            except (TypeError, ValueError):
+                pass
+        try:
+            when = pd.to_datetime(trade.get(f'{kind}_time'), utc=True)
+            pos = df.index.searchsorted(when, side='right') - 1
+            if pos >= 0:
+                candle_open = df.index[pos]
+                candle_close = float(df['close'].iloc[pos])
+                is_last = pos == len(df) - 1
+                lines.append(f"Vela {candle_open.strftime('%H:%M')}: " + (
+                    f"en curso, va en {candle_close:,.2f}" if is_last else f"cerró en {candle_close:,.2f}"))
+                # Salida por señal en la que la vela cerró del lado favorable al de la posición: ruido intravela.
+                if kind == 'exit' and str(trade.get('reason')) == 'EXIT_SIGNAL' and not is_last:
+                    contradicted = candle_close > price if is_long else candle_close < price
+                    if contradicted:
+                        lines.append("⚠️ Salida intravela: la vela cerró contradiciendo la señal")
+        except Exception:
+            pass
+        return "<br>".join(lines)
+
     def _build_chart(self, bot: PaperTrader, highlighted_trade: Optional[dict] = None):
         try:
             df = bot.klines_df
@@ -900,23 +968,48 @@ class LiveMonitorPage:
             except Exception:
                 pass
 
-            # Marcadores generales de Trades
-            for t in trades:
-                entry_time_str = str(t.get('entry_time', ''))
-                exit_time_str = str(t['exit_time']) if t.get('exit_time') else None
-                entry_p = float(t.get('entry_price', 0))
-                exit_p = float(t.get('exit_price', 0)) if t.get('exit_price') else 0.0
-
-                if t.get('side') == 'long':
-                    if entry_time_str and entry_p > 0:
-                        fig.add_annotation(x=entry_time_str, y=entry_p, text="▲ BUY", showarrow=True, arrowhead=1, arrowcolor="#10b981", font=dict(color="#10b981", size=10, weight="bold"))
-                    if exit_time_str and exit_p > 0:
-                        fig.add_annotation(x=exit_time_str, y=exit_p, text="▼ SELL", showarrow=True, arrowhead=1, arrowcolor="#ef4444", font=dict(color="#ef4444", size=10, weight="bold"))
-                else:
-                    if entry_time_str and entry_p > 0:
-                        fig.add_annotation(x=entry_time_str, y=entry_p, text="▼ SELL", showarrow=True, arrowhead=1, arrowcolor="#ef4444", font=dict(color="#ef4444", size=10, weight="bold"))
-                    if exit_time_str and exit_p > 0:
-                        fig.add_annotation(x=exit_time_str, y=exit_p, text="▲ BUY", showarrow=True, arrowhead=1, arrowcolor="#10b981", font=dict(color="#10b981", size=10, weight="bold"))
+            # Marcadores de Trades: flecha con el precio del fill y, al pasar el ratón, la razón, el PnL y dónde
+            # CERRÓ la vela de ese instante (una salida por señal cuya vela cierra al otro lado del precio de
+            # salida fue una salida por ruido intravela).
+            #
+            # RENDIMIENTO: solo se dibujan los trades que caen dentro de las velas visibles y las anotaciones se
+            # fijan de una vez con update_layout. Antes se llamaba a fig.add_annotation por cada entrada y salida
+            # de TODO el historial: plotly revalida el conjunto completo en cada llamada (O(n²)), así que con ~200
+            # trades el gráfico tardaba ~26 s por reconstrucción y congelaba todo el servidor (se reconstruía
+            # cada 1.5 s).
+            window_start = df_clean.index[0]
+            annotations, marker_x, marker_y, marker_text, marker_color = [], [], [], [], []
+            for t in trades[-MAX_CHART_TRADES:]:
+                is_long = t.get('side') == 'long'
+                for kind in ('entry', 'exit'):
+                    when = t.get(f'{kind}_time')
+                    price = float(t.get(f'{kind}_price') or 0)
+                    if not when or price <= 0:
+                        continue
+                    try:
+                        if pd.to_datetime(when, utc=True) < window_start:
+                            continue  # fuera de las velas que se muestran
+                    except Exception:
+                        continue
+                    buying = (kind == 'entry') == is_long
+                    color = "#10b981" if buying else "#ef4444"
+                    label = ("▲ BUY" if buying else "▼ SELL") + f" {price:,.1f}"
+                    if kind == 'exit':
+                        label += f" · {self._reason_label(t.get('reason'))}"
+                    annotations.append(dict(x=str(when), y=price, text=label, showarrow=True, arrowhead=1,
+                                            arrowcolor=color, font=dict(color=color, size=10, weight="bold")))
+                    marker_x.append(str(when))
+                    marker_y.append(price)
+                    marker_text.append(self._trade_hover(t, kind, price, df_clean))
+                    marker_color.append(color)
+            if annotations:
+                fig.update_layout(annotations=annotations)
+            if marker_x:
+                fig.add_trace(go.Scatter(
+                    x=marker_x, y=marker_y, mode='markers', name='Operaciones', showlegend=False,
+                    marker=dict(size=9, color=marker_color, line=dict(color='#0a0e17', width=1)),
+                    hovertext=marker_text, hoverinfo='text',
+                ))
 
             # Posición Abierta
             if position:
@@ -1618,14 +1711,16 @@ class LiveMonitorPage:
         # 4. Gráfico en Vivo (solo actualizar si la página está activa y hay cambios)
         if hasattr(self, 'chart') and getattr(self, 'is_active_page', False):
             current_kline_len = len(bot.klines_df) if (bot.klines_df is not None and not bot.klines_df.empty) else 0
-            if current_kline_len != self._last_chart_kline_len or self._last_chart_bot_id != bot.bot_id or bot.is_running:
-                try:
-                    fig = self._build_chart(bot, highlighted_trade=self.highlighted_trade)
-                    self.chart.update_figure(fig)
-                    self._last_chart_kline_len = current_kline_len
-                    self._last_chart_bot_id = bot.bot_id
-                except Exception:
-                    pass
+            now = time.monotonic()
+            changed = current_kline_len != self._last_chart_kline_len or self._last_chart_bot_id != bot.bot_id
+            # Con el bot corriendo la vela en curso cambia sin parar: se refresca cada CHART_REFRESH_S, no en
+            # cada ciclo de 1.5 s (reconstruir el gráfico es lo más caro de toda la página).
+            due = bot.is_running and (now - getattr(self, '_last_chart_build', 0.0)) >= CHART_REFRESH_S
+            if (changed or due) and not getattr(self, '_chart_building', False):
+                self._chart_building = True
+                self._last_chart_build = now
+                # La figura se construye en un hilo: es cómputo puro y así no bloquea el event loop.
+                spawn(self._rebuild_chart_async(bot, self.highlighted_trade, current_kline_len))
 
         # 5. Posiciones Abiertas en Binance Futures (Exchange Live Sync)
         if hasattr(self, 'binance_pos_grid'):
