@@ -529,6 +529,7 @@ class BinanceTestnetClient:
         # asume 1x): un leverage=1 fijo hacia el guardarrail de "apalancamiento maximo" lo
         # dejaba inerte para siempre, sin importar el limite que el usuario configurara.
         ref_price = price if (price and price > 0) else self.get_symbol_price(binance_symbol)
+        slippage_ref = self.get_reference_price(binance_symbol, binance_side, price, order_type)
         real_leverage = self.get_symbol_leverage(binance_symbol)
         avail_balance = self.get_available_balance("USDT")
         allowed, guardrail_err = validate_order_guardrails(
@@ -578,7 +579,7 @@ class BinanceTestnetClient:
             _log_order_to_ledger(
                 bot_id=self.bot_id,
                 symbol=binance_symbol, side=binance_side, action="OPEN", order_type=o_type,
-                requested_qty=qty, requested_price=price, reference_price=ref_price, use_testnet=self.use_testnet,
+                requested_qty=qty, requested_price=price, reference_price=slippage_ref, use_testnet=self.use_testnet,
                 status="SENT_OK", binance_order_id=order_id, client_order_id=client_order_id,
                 exchange_status=initial_status, executed_qty=order.get("executedQty"),
                 avg_price=order.get("avgPrice"),
@@ -603,7 +604,7 @@ class BinanceTestnetClient:
             _log_order_to_ledger(
                 bot_id=self.bot_id,
                 symbol=binance_symbol, side=binance_side, action="OPEN", order_type=o_type,
-                requested_qty=qty, requested_price=price, reference_price=ref_price, use_testnet=self.use_testnet,
+                requested_qty=qty, requested_price=price, reference_price=slippage_ref, use_testnet=self.use_testnet,
                 status="SEND_FAILED", client_order_id=client_order_id, error=str(e),
             )
             return None, format_binance_error(e)
@@ -615,11 +616,17 @@ class BinanceTestnetClient:
         quantity: float,
         order_type: str = "MARKET",
         price: Optional[float] = None,
-        verify_execution: bool = True
+        verify_execution: bool = True,
+        reduce_only: bool = True,
     ) -> Tuple[Optional[dict], Optional[str]]:
         """
         Cierra una posición en Binance Futures con orden contraria y verifica su ejecución en el exchange.
         Aplica el Candado de Seguridad de cuenta real.
+
+        reduce_only=False: la orden se envía tal cual, por la cantidad EXACTA indicada. Los bots lo usan
+        porque Binance (modo one-way) solo tiene una posición NETA por símbolo: con dos bots operando el
+        mismo símbolo, un `reduceOnly` se recorta (o se rechaza con -2022) contra la posición neta y no
+        contra la del bot, y su cierre no se ejecuta por la cantidad que le corresponde.
         """
         binance_symbol = symbol.replace("/", "").upper()
         # ── CANDADO DE SEGURIDAD OPERATIVA (Primera línea de defensa) ──
@@ -637,7 +644,7 @@ class BinanceTestnetClient:
         # Precio de referencia para medir slippage en la reconciliación (idéntico criterio
         # que place_futures_order: usa el precio LIMIT pedido si existe, si no consulta el
         # último precio de mercado justo antes de enviar el cierre).
-        ref_price = price if (price and price > 0) else self.get_symbol_price(binance_symbol)
+        close_ref = self.get_reference_price(binance_symbol, close_side, price, order_type)
 
         o_type = order_type.upper()
         client_order_id = _new_client_order_id()
@@ -647,9 +654,10 @@ class BinanceTestnetClient:
                 "side": close_side,
                 "type": o_type,
                 "quantity": qty,
-                "reduceOnly": True,
                 "newClientOrderId": client_order_id
             }
+            if reduce_only:
+                params["reduceOnly"] = True
             if o_type == "LIMIT":
                 if price is not None and price > 0:
                     params["price"] = self.format_price(binance_symbol, price)
@@ -670,7 +678,7 @@ class BinanceTestnetClient:
             _log_order_to_ledger(
                 bot_id=self.bot_id,
                 symbol=binance_symbol, side=close_side, action="CLOSE", order_type=params["type"],
-                requested_qty=qty, requested_price=price, reference_price=ref_price, use_testnet=self.use_testnet,
+                requested_qty=qty, requested_price=price, reference_price=close_ref, use_testnet=self.use_testnet,
                 status="SENT_OK", binance_order_id=order_id, client_order_id=client_order_id,
                 exchange_status=initial_status, executed_qty=order.get("executedQty"),
                 avg_price=order.get("avgPrice"),
@@ -694,7 +702,7 @@ class BinanceTestnetClient:
             _log_order_to_ledger(
                 bot_id=self.bot_id,
                 symbol=binance_symbol, side=close_side, action="CLOSE", order_type=o_type,
-                requested_qty=qty, requested_price=price, reference_price=ref_price, use_testnet=self.use_testnet,
+                requested_qty=qty, requested_price=price, reference_price=close_ref, use_testnet=self.use_testnet,
                 status="SEND_FAILED", client_order_id=client_order_id, error=str(e),
             )
             return None, format_binance_error(e)
@@ -707,9 +715,14 @@ class BinanceTestnetClient:
         sl_price: Optional[float] = None,
         tp_price: Optional[float] = None,
         sl_order_type: str = "LIMIT",
-        tp_order_type: str = "LIMIT"
+        tp_order_type: str = "LIMIT",
+        reduce_only: bool = True,
     ) -> Dict[str, Any]:
-        """Coloca órdenes condicionales de Stop Loss y Take Profit en Binance Futures protegidas por el Candado de Seguridad."""
+        """Coloca órdenes condicionales de Stop Loss y Take Profit en Binance Futures protegidas por el Candado de Seguridad.
+
+        reduce_only=False: ver close_futures_position. Sin reduceOnly, el SL/TP de un bot actúa por SU cantidad
+        aunque la posición neta de la cuenta sea de signo contrario (otro bot en el mismo símbolo); a cambio
+        Binance ya no cancela solo la pata sobrante, así que quien llama debe cancelarla (y verificarlo)."""
         if not self.api_key or not self.api_secret:
             return {"sl_order": None, "tp_order": None, "error": "Credenciales no configuradas"}
 
@@ -733,9 +746,10 @@ class BinanceTestnetClient:
                     "type": tp_type,
                     "stopPrice": self.format_price(binance_symbol, tp_price),
                     "quantity": qty,
-                    "reduceOnly": True,
                     "newClientOrderId": tp_client_order_id
                 }
+                if reduce_only:
+                    tp_params["reduceOnly"] = True
                 if tp_type == "TAKE_PROFIT":
                     tp_params["price"] = self.format_price(binance_symbol, tp_price)
                     tp_params["timeInForce"] = "GTC"
@@ -786,9 +800,10 @@ class BinanceTestnetClient:
                     "type": sl_type,
                     "stopPrice": self.format_price(binance_symbol, sl_price),
                     "quantity": qty,
-                    "reduceOnly": True,
                     "newClientOrderId": sl_client_order_id
                 }
+                if reduce_only:
+                    sl_params["reduceOnly"] = True
                 if sl_type == "STOP":
                     sl_params["price"] = self.format_price(binance_symbol, sl_price)
                     sl_params["timeInForce"] = "GTC"
@@ -1146,6 +1161,28 @@ class BinanceTestnetClient:
         except Exception as e:
             logger.debug("Error obteniendo precio de %s: %s", symbol, e)
             return 0.0
+
+    def get_reference_price(self, symbol: str, side: str, limit_price: Optional[float] = None,
+                            order_type: str = "MARKET") -> float:
+        """
+        Precio contra el que el reconciliador mide el deslizamiento de una orden: el LIMIT pedido si lo hay; para
+        MARKET, el mejor precio del lado que la orden cruza (ask al comprar, bid al vender) tomado justo antes de
+        enviarla. Antes se usaba el precio de la vela/señal (`price`), que mezclaba el spread y la latencia con el
+        deslizamiento real y castigaba siempre al lado vendedor. Sin libro disponible cae al último precio.
+        """
+        if order_type.upper() == "LIMIT" and limit_price and limit_price > 0:
+            return float(limit_price)
+        binance_symbol = symbol.replace("/", "").upper()
+        try:
+            if self.client:
+                book = self.client.futures_orderbook_ticker(symbol=binance_symbol)
+                book = book[0] if isinstance(book, list) and book else book
+                px = float(book.get("askPrice" if side.upper() == "BUY" else "bidPrice") or 0.0)
+                if px > 0:
+                    return px
+        except Exception as e:
+            logger.debug("No se pudo leer el libro de %s para la referencia de deslizamiento: %s", binance_symbol, e)
+        return self.get_symbol_price(binance_symbol) or (float(limit_price) if limit_price else 0.0)
 
     # ──────────────────────────────────────────────────────────────
     # Métodos de Diagnóstico y Pruebas de Conexión

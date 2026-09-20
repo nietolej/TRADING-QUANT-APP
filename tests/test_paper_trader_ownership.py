@@ -55,6 +55,7 @@ class FakeClient:
 
     def cancel_order_refs(self, symbol, refs):
         self.calls.append(("cancel", tuple((r["kind"], r["id"]) for r in refs)))
+        self.open -= {(r["kind"], r["id"]) for r in refs}   # como Binance: lo cancelado deja de estar abierto
         return True, []
 
     def cancel_all_open_orders(self, symbol):  # no debe usarse jamás desde un bot
@@ -70,6 +71,7 @@ class FakeClient:
         }
 
     def close_futures_position(self, *a, **k):
+        self.close_kwargs = k
         self.calls.append(("close_order",))
         return {"orderId": 1, "avgPrice": "80000", "status": "FILLED"}, None
 
@@ -332,3 +334,79 @@ def test_position_without_refs_and_live_account_is_not_closed_and_never_gets_for
     assert bot.position is not None
     # Repone su propia protección (la cuenta tiene posición que la respalda)
     assert client.calls == [("place", bot.position.sl_price, bot.position.tp_price)]
+
+
+# ── Salida propia sobre una posición neta compartida ───────────────────────────
+
+def _alerts(bot):
+    bot.alerts = []
+    bot._trigger_critical_order_alert = lambda title, details=None: bot.alerts.append(title)
+
+
+def test_exit_order_is_sent_without_reduce_only_and_cancels_only_own_protection():
+    """Con otro bot en el símbolo, reduceOnly se recorta contra la posición NETA: la salida va por la cantidad exacta."""
+    client = FakeClient(net=0.0003)
+    client.open = {("algo", SL_ID), ("algo", TP_ID)}
+    client.states[("algo", SL_ID)] = client.states[("algo", TP_ID)] = {"state": "OPEN"}
+    bot = make_bot(client)
+    bot._close_position(80600.0, datetime.now(timezone.utc), reason="EXIT_SIGNAL")
+    assert bot.position is None
+    assert client.close_kwargs["reduce_only"] is False
+    assert client.calls == [("close_order",), ("cancel", (("algo", SL_ID), ("algo", TP_ID)))]
+
+
+def test_exit_signal_does_not_send_a_close_when_own_take_profit_already_filled():
+    """Sin reduceOnly una salida sobre una posición ya cerrada abriría una contraria: se consulta antes su TP/SL."""
+    client = FakeClient(net=0.0)
+    client.open = {("algo", SL_ID)}
+    client.states[("algo", TP_ID)] = {"state": "FILLED", "avg_price": 81300.0, "executed_qty": 0.0009}
+    client.states[("algo", SL_ID)] = {"state": "OPEN"}
+    bot = make_bot(client)
+    bot._close_position(80600.0, datetime.now(timezone.utc), reason="EXIT_SIGNAL")
+    assert bot.position is None
+    assert ("close_order",) not in client.calls
+    assert bot.trade_history[-1]["reason"] == "TP" and bot.trade_history[-1]["exit_price"] == 81300.0
+    assert ("algo", SL_ID) not in client.open, "la pata sobrante (SL) se cancela"
+
+
+def test_exit_is_postponed_while_own_protection_state_is_unknown():
+    client = FakeClient(net=0.0009)          # sin estados conocidos -> UNKNOWN
+    bot = make_bot(client)
+    bot._close_position(80600.0, datetime.now(timezone.utc), reason="EXIT_SIGNAL")
+    assert bot.position is not None and ("close_order",) not in client.calls
+
+
+def test_zero_net_position_does_not_close_this_bot_when_another_bot_shares_the_symbol():
+    client = FakeClient(net=0.0)             # p. ej. largo de A (0.0009) y corto de B (0.0009): neta 0
+    client.open = {("algo", SL_ID), ("algo", TP_ID)}
+    client.states[("algo", SL_ID)] = client.states[("algo", TP_ID)] = {"state": "OPEN"}
+    a = make_bot(client, "bot_a")
+    other = make_bot(FakeClient(), "bot_b", side="short")
+    a.is_running = other.is_running = True
+    pt.PaperTrader._ACTIVE_BOTS.update({"bot_a": a, "bot_b": other})
+    try:
+        for _ in range(4):
+            a._sync_own_position(net_amt=0.0, mark_p=80000.0)
+        assert a.position is not None, "la posición neta 0 no prueba que la de ESTE bot no exista si otro comparte el símbolo"
+    finally:
+        pt.PaperTrader._ACTIVE_BOTS.pop("bot_a", None)
+        pt.PaperTrader._ACTIVE_BOTS.pop("bot_b", None)
+
+
+def test_orphan_protection_left_alive_after_exit_raises_a_critical_alert():
+    client = FakeClient(net=0.0009)
+    client.open = {("algo", SL_ID), ("algo", TP_ID)}
+    client.cancel_order_refs = lambda symbol, refs: (True, [])      # Binance "cancela" pero la orden sigue viva
+    bot = make_bot(client)
+    _alerts(bot)
+    bot._cancel_own_protection()
+    assert any("HUÉRFANO" in a for a in bot.alerts)
+
+
+def test_no_alert_when_own_protection_is_gone_after_exit():
+    client = FakeClient(net=0.0009)
+    client.open = {("algo", SL_ID), ("algo", TP_ID)}
+    bot = make_bot(client)
+    _alerts(bot)
+    bot._cancel_own_protection()
+    assert bot.alerts == []

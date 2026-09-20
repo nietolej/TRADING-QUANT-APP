@@ -19,6 +19,16 @@ FAILED_STATUSES = {"REJECTED", "CANCELED", "EXPIRED"}
 # Informe de Confiabilidad. Todo lo demás cuenta como fallida.
 EFFECTIVE_STATUSES = {"MATCHED", "CANCELED_AS_EXPECTED"}
 
+# Estados en los que una orden de entrada/salida cuenta como ejecutada tal como la pidió el bot. El deslizamiento
+# (SLIPPAGE_EXCEEDED) es un dato informativo del costo de ejecución: no invalida por sí solo la orden.
+EXECUTED_OK_STATUSES = {"MATCHED", "SLIPPAGE_EXCEEDED"}
+# Estados de una orden condicional (SL/TP) que Binance reconoce y no dejó mal colocada.
+PROTECTION_OK_STATUSES = {"MATCHED", "CANCELED_AS_EXPECTED"}
+# Estados en los que una orden condicional sigue VIVA en Binance (puede dispararse todavía).
+LIVE_EXCHANGE_STATUSES = {"NEW", "WORKING", "PARTIALLY_FILLED"}
+# "Exactamente": cantidad ejecutada igual a la del bot salvo redondeo de precisión (0.01%).
+EXACT_QTY_TOLERANCE_PCT = 0.01
+
 # Estados de una orden en Binance a partir de los cuales ya no cambia.
 TERMINAL_EXCHANGE_STATUSES = {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}
 
@@ -106,6 +116,10 @@ class OrderReconciler:
             "requested_price": record.requested_price,
             "avg_price": record.avg_price,
             "reference_price": record.reference_price,
+            # Lo que Binance dice de la orden (lado, cantidad, precio de activación): permite comparar app vs Binance.
+            "binance_side": None,
+            "binance_orig_qty": None,
+            "binance_trigger_price": None,
             # Costo de deslizamiento firmado en % (positivo = en contra, negativo = a favor).
             "slippage_pct": None,
             "checks": {
@@ -186,6 +200,12 @@ class OrderReconciler:
                     f"Binance no la reconoce en ningún endpoint ({'; '.join(lookup_errors)})."
                 ),
             )
+
+        detail["binance_side"] = str(exchange_order.get("side") or "").upper() or None
+        detail["binance_orig_qty"] = float(exchange_order.get("origQty") or exchange_order.get("quantity") or 0.0) or None
+        detail["binance_trigger_price"] = float(
+            exchange_order.get("triggerPrice") or exchange_order.get("stopPrice") or 0.0
+        ) or None
 
         if is_algo_response:
             # La respuesta de "Query Algo Order" no usa los mismos nombres de campo que una
@@ -880,6 +900,162 @@ class OrderReconciler:
             "orders": orders,
         }
 
+    # ── Conciliación por CICLO de un bot (entrada → SL/TP → salida) ─────────────
+
+    @staticmethod
+    def _qty_exact(expected: Optional[float], actual: Optional[float]) -> bool:
+        if expected is None or actual is None or expected <= 0:
+            return False
+        return abs(actual - expected) / expected * 100.0 <= EXACT_QTY_TOLERANCE_PCT
+
+    def _evaluate_cycles(self, orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Agrupa las órdenes de UN bot (en orden cronológico) en ciclos y decide, contra lo que Binance dice, cuáles
+        son efectivas. Cada bot se evalúa por separado; en un símbolo compartido la salida de uno es la entrada
+        del otro, así que lo único que cuenta son las órdenes de ESTE bot (por bot_id) y sus propios SL/TP.
+
+        Un ciclo es efectivo cuando, igual en la app y en Binance:
+          1. la ENTRADA se ejecutó (FILLED) por la cantidad que pidió el bot;
+          2. se colocaron SU Stop Loss y SU Take Profit (lado contrario, misma cantidad que la entrada);
+          3. la SALIDA (orden de cierre, o el SL/TP ejecutado) fue por esa misma cantidad;
+          4. al salir NO quedó ningún SL/TP vivo en Binance (huérfano).
+        Modifica cada orden con `effective`, `cycle` y, si falla, `cycle_issue`; devuelve los ciclos.
+        """
+        cycles: List[Dict[str, Any]] = []
+        cur: Optional[Dict[str, Any]] = None
+        for o in orders:
+            action = o.get("action")
+            if action == "OPEN" or cur is None:
+                cur = {"id": len(cycles) + 1, "open": None, "sls": [], "tps": [], "closes": [], "orders": [],
+                       "partial": action != "OPEN"}
+                cycles.append(cur)
+            o["cycle"] = cur["id"]
+            cur["orders"].append(o)
+            if action == "OPEN" and cur["open"] is None:
+                cur["open"] = o
+            elif action == "STOP_LOSS":
+                cur["sls"].append(o)
+            elif action == "TAKE_PROFIT":
+                cur["tps"].append(o)
+            elif action == "CLOSE":
+                cur["closes"].append(o)
+
+        for idx, c in enumerate(cycles):
+            self._evaluate_cycle(c, is_last=idx == len(cycles) - 1)
+        return [
+            {k: c.get(k) for k in ("id", "status", "effective", "issues", "position_side", "entry_qty", "opened_at")}
+            for c in cycles
+        ]
+
+    def _evaluate_cycle(self, c: Dict[str, Any], is_last: bool) -> None:
+        issues: List[str] = []
+        ok_statuses = EXECUTED_OK_STATUSES | PROTECTION_OK_STATUSES
+
+        def fail(order: Optional[Dict[str, Any]], text: str, status: Optional[str] = None, severity: str = "CRITICAL"):
+            issues.append(text)
+            if order is not None:
+                order["effective"] = False
+                order["cycle_issue"] = text
+                if status:
+                    order["match_status"], order["severity"] = status, severity
+                    order["details"] = text
+
+        def sent(o: Dict[str, Any]) -> bool:
+            return bool(o["sent_to_binance"]) and o["match_status"] != "SEND_FAILED"
+
+        entry, sls, tps, closes = c["open"], c["sls"], c["tps"], c["closes"]
+        protections = sls + tps
+        exit_fill = next((o for o in protections if o.get("binance_status") == "FILLED"), None)
+        sent_closes = [o for o in closes if sent(o)]
+        exit_order = exit_fill or (sent_closes[-1] if sent_closes else None)
+        first = entry or c["orders"][0]
+        c["position_side"] = first.get("position_side")
+        c["opened_at"] = first.get("created_at")
+        c["entry_qty"] = entry.get("executed_qty") if entry else None
+
+        # Cada orden parte de su papel resuelto por su propio estado; los chequeos de abajo la invalidan si falla.
+        for o in c["orders"]:
+            o["effective"] = o["match_status"] in ok_statuses
+
+        if c["partial"]:
+            # La sesión empezó con la posición ya abierta: sin la entrada no hay ciclo que evaluar.
+            c["status"], c["effective"], c["issues"] = "PARCIAL", False, ["La sesión empezó con la posición abierta."]
+            return
+
+        # 1. Entrada ejecutada exactamente como la pidió el bot.
+        entry_qty = None
+        if not sent(entry):
+            fail(entry, "La entrada nunca llegó a Binance.", "SEND_FAILED")
+        elif entry["match_status"] not in EXECUTED_OK_STATUSES:
+            fail(entry, f"La entrada no se ejecutó como la pidió el bot ({entry['match_status']}).")
+        elif not self._qty_exact(entry["requested_qty"], entry["executed_qty"]):
+            fail(entry, f"Entrada: cantidad pedida {entry['requested_qty']} ≠ ejecutada {entry['executed_qty']}.",
+                 "QTY_MISMATCH", "WARNING")
+        else:
+            entry_qty = entry["executed_qty"]
+        c["entry_qty"] = entry_qty or c["entry_qty"]
+        protect_side = {"BUY": "SELL", "SELL": "BUY"}.get((entry.get("side") or "").upper())
+
+        # 2. SL y TP colocados, e iguales en la app y en Binance.
+        for label, legs in (("Stop Loss", sls), ("Take Profit", tps)):
+            good = [o for o in legs if sent(o) and o["match_status"] in PROTECTION_OK_STATUSES]
+            if not good:
+                fail(legs[-1] if legs else None, f"No hay {label} colocado y reconocido por Binance en este ciclo.",
+                     "MISSING_PROTECTION" if legs else None)
+                continue
+            for o in good:
+                b_side, b_qty = o.get("binance_side"), o.get("binance_orig_qty")
+                if protect_side and (o["side"] != protect_side or (b_side and b_side != protect_side)):
+                    fail(o, f"{label}: lado {o['side']} (Binance: {b_side}), se esperaba {protect_side}.",
+                         "PROTECTION_MISMATCH")
+                elif entry_qty and not (self._qty_exact(entry_qty, o["requested_qty"])
+                                        and (b_qty is None or self._qty_exact(o["requested_qty"], b_qty))):
+                    fail(o, f"{label}: cantidad {o['requested_qty']} (Binance: {b_qty}) ≠ entrada {entry_qty}.",
+                         "PROTECTION_MISMATCH")
+
+        # 3. Salida por la misma cantidad que la entrada.
+        closed = exit_order is not None
+        if closed and exit_order in closes:
+            if exit_order["match_status"] == "QTY_MISMATCH" or (
+                exit_order["match_status"] in EXECUTED_OK_STATUSES and entry_qty
+                and not self._qty_exact(entry_qty, exit_order["executed_qty"])
+            ):
+                fail(exit_order, f"Salida: Binance ejecutó {exit_order['executed_qty']} de los {entry_qty} de la "
+                                 f"posición del bot.", "QTY_MISMATCH", "WARNING")
+            elif exit_order["match_status"] not in EXECUTED_OK_STATUSES:
+                fail(exit_order, f"La salida no se ejecutó ({exit_order['match_status']}).")
+            elif protect_side and exit_order["side"] != protect_side:
+                fail(exit_order, f"Salida por el lado {exit_order['side']}, se esperaba {protect_side}.",
+                     "PROTECTION_MISMATCH")
+        elif closed and entry_qty and not self._qty_exact(entry_qty, exit_order["executed_qty"]):
+            fail(exit_order, f"El {exit_order['action']} ejecutó {exit_order['executed_qty']} de {entry_qty}.",
+                 "QTY_MISMATCH", "WARNING")
+        # Intentos de salida que no llegaron a Binance: quedan como fallidos aunque luego se reintente.
+        for o in closes:
+            if o is not exit_order and not sent(o):
+                o["effective"] = False
+        if not closed and not is_last:
+            rejected = [o for o in closes if not sent(o)]
+            why = f" La orden de salida fue rechazada: {rejected[-1]['details']}" if rejected else ""
+            fail(None, "El ciclo terminó sin ninguna salida ejecutada (ni orden de cierre ni SL/TP)." + why)
+
+        # 4. Sin SL/TP huérfanos al salir; con la posición abierta, la protección debe seguir viva.
+        for o in protections:
+            status = o.get("binance_status")
+            if not sent(o) or status is None:
+                continue
+            if closed and status in LIVE_EXCHANGE_STATUSES:
+                fail(o, f"SL/TP HUÉRFANO: la posición ya salió pero {o['action']} sigue vivo en Binance ({status}).",
+                     "ORPHAN_PROTECTION")
+            elif not closed and is_last and status in ("CANCELED", "EXPIRED", "REJECTED"):
+                fail(o, f"{o['action']} {status} en Binance con la posición todavía abierta: sin protección.",
+                     "PROTECTION_MISMATCH")
+
+        c["issues"] = issues
+        # Un ciclo sin salida solo cuenta como terminado si no es el último (la posición sigue abierta).
+        c["status"] = "COMPLETO" if closed else ("EN CURSO" if is_last else "SIN SALIDA")
+        c["effective"] = closed and not issues
+
     # ── Test 2: informe de conciliación de una sesión de monitoreo de un bot ─────
 
     def build_session_report(
@@ -961,8 +1137,14 @@ class OrderReconciler:
                 "created_in_app": outcome["checks"]["created_in_app"],
                 "sent_to_binance": outcome["checks"]["sent_to_binance"],
                 "executed_in_binance": outcome["checks"]["executed_in_binance"],
-                "effective": outcome["match_status"] in EFFECTIVE_STATUSES,
+                "binance_side": outcome.get("binance_side"),
+                "binance_orig_qty": outcome.get("binance_orig_qty"),
+                "effective": False,   # lo decide _evaluate_cycles según el papel de la orden en su ciclo
             })
+
+        cycles = self._evaluate_cycles(orders)
+        completed = [c for c in cycles if c["status"] in ("COMPLETO", "SIN SALIDA")]
+        cycles_effective = sum(1 for c in completed if c["effective"])
 
         total = len(orders)
         effective = sum(1 for o in orders if o["effective"])
@@ -974,7 +1156,9 @@ class OrderReconciler:
         else:
             slippage_avg = slippage_max = slippage_p95 = None
 
-        reliability_pct = round(effective / total * 100.0, 2) if total else None
+        # Confiabilidad del bot = % de CICLOS completos (entrada → SL/TP → salida) que cumplieron todo, no de
+        # órdenes sueltas: cada orden de un ciclo solo tiene sentido dentro de él.
+        reliability_pct = round(cycles_effective / len(completed) * 100.0, 2) if completed else None
         return {
             "session_id": session_id,
             "bot_id": bot_id,
@@ -997,5 +1181,11 @@ class OrderReconciler:
             "slippage_tolerance_pct": self.slippage_tolerance_pct,
             "reliability_pct": reliability_pct,
             "reliability_label": _reliability_label(reliability_pct),
+            "cycles_total": len(cycles),
+            "cycles_completed": len(completed),
+            "cycles_effective": cycles_effective,
+            "cycles_failed": len(completed) - cycles_effective,
+            "cycles_in_progress": sum(1 for c in cycles if c["status"] == "EN CURSO"),
+            "cycles": cycles,
             "orders": orders,
         }

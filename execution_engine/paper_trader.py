@@ -191,6 +191,7 @@ class PaperTrader:
         self.status = "STARTING"
         self.status_message = "Iniciando..."
         self.is_running = True
+        PaperTrader._ACTIVE_BOTS[self.bot_id] = self
         if reset_started_at or not self.started_at:
             self.started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
@@ -464,6 +465,8 @@ class PaperTrader:
     def stop(self):
         """Detiene el bot, cancela órdenes pendientes en Binance y cierra las conexiones."""
         self.is_running = False
+        if PaperTrader._ACTIVE_BOTS.get(self.bot_id) is self:
+            PaperTrader._ACTIVE_BOTS.pop(self.bot_id, None)
         self.status = "STOPPED"
         self.status_message = "Detenido"
         if self._client:
@@ -1104,7 +1107,8 @@ class PaperTrader:
             sl_tp_res = self._client.place_futures_sl_tp(
                 self.symbol, side, quantity,
                 sl_price=sl_price, tp_price=tp_price,
-                sl_order_type=sl_type, tp_order_type=tp_type
+                sl_order_type=sl_type, tp_order_type=tp_type,
+                reduce_only=False,  # protege SU cantidad aunque la posición neta sea de otro bot
             )
             own_sl_ref = self._client.order_ref(sl_tp_res.get("sl_order"))
             own_tp_ref = self._client.order_ref(sl_tp_res.get("tp_order"))
@@ -1152,6 +1156,19 @@ class PaperTrader:
     # adoptaba la de otro bot, la cerraba "por sincronización" y cancelaba en masa el SL/TP de los
     # demás. Ahora cada bot es dueño de SU posición: la deduce de SUS órdenes (entrada, SL y TP,
     # registradas con su bot_id) y solo cancela/repone las referencias de esas órdenes.
+
+    # Bots en ejecución, por bot_id (compartido por todas las instancias del proceso). Permite saber si OTRO
+    # bot opera el mismo símbolo en la misma red: en ese caso la posición NETA de Binance mezcla a ambos.
+    _ACTIVE_BOTS: "dict[str, PaperTrader]" = {}
+
+    def _shares_symbol(self) -> bool:
+        """True si otro bot en ejecución opera el mismo símbolo y la misma red (posición neta compartida)."""
+        me = self.symbol.replace("/", "").upper()
+        return any(
+            other is not self and other.is_running and other.use_testnet == self.use_testnet
+            and other.symbol.replace("/", "").upper() == me
+            for other in list(PaperTrader._ACTIVE_BOTS.values())
+        )
 
     OPEN_SYNC_GRACE_S = 30.0          # tras abrir no se repone protección (las órdenes recién colocadas)
     OWN_SYNC_MIN_AGE_S = 5.0          # ni se resuelve el estado de las patas SL/TP
@@ -1242,6 +1259,29 @@ class PaperTrader:
         ok, errors = self._client.cancel_order_refs(self.symbol, refs)
         if not ok:
             logger.warning("[%s] No se pudo cancelar el SL/TP propio: %s", self.name, "; ".join(errors))
+        self._verify_no_orphan_protection(refs)
+
+    def _verify_no_orphan_protection(self, refs: list) -> bool:
+        """
+        Comprueba en Binance que NINGUNA de las órdenes SL/TP propias sigue viva tras cerrar la posición: sin
+        `reduceOnly`, Binance no cancela solo la pata sobrante y una huérfana abriría una posición nueva al
+        dispararse. Reintenta la cancelación una vez y, si persiste, alerta como crítico.
+        """
+        mine = {(r["kind"], r["id"]) for r in refs if r}
+        for attempt in range(2):
+            open_refs = self._client.get_open_order_refs(self.symbol)
+            if open_refs is None:
+                return False  # no se pudo consultar: no se afirma nada
+            leftover = mine & set(open_refs)
+            if not leftover:
+                return True
+            if attempt == 0:
+                self._client.cancel_order_refs(self.symbol, [{"kind": k, "id": i} for k, i in leftover])
+        self._trigger_critical_order_alert(
+            "SL/TP HUÉRFANO en Binance: siguen vivas órdenes de protección de una posición ya cerrada",
+            {"Símbolo": self.symbol, "Órdenes": ", ".join(f"{k}:{i}" for k, i in sorted(leftover))},
+        )
+        return False
 
     def _resolve_own_exchange_close(self, pos: "Position"):
         """
@@ -1259,6 +1299,29 @@ class PaperTrader:
         if all(st["state"] in ("CANCELED", "EXPIRED", "REJECTED") for st in states):
             return "NONE", None
         return "UNKNOWN", None
+
+    def _own_exit_state(self, pos: "Position"):
+        """
+        Estado de las patas SL/TP de ESTE bot antes de cerrar con una orden propia. Devuelve
+        ("FILLED", pata, precio_medio) si una ya se ejecutó, ("TRIGGERED"|"UNKNOWN", None, None) si no se puede
+        afirmar que la posición siga abierta, y ("OPEN", None, None) si ninguna se ejecutó (o no hay referencias
+        que consultar, caso en el que se procede como siempre).
+        """
+        if pos.sl_ref is None and pos.tp_ref is None:
+            self._attach_refs_from_ledger(pos)
+        legs = [(leg, getattr(pos, f"{leg}_ref")) for leg in ("sl", "tp") if getattr(pos, f"{leg}_ref")]
+        if not legs:
+            return "OPEN", None, None
+        unknown = triggered = False
+        for leg, ref in legs:
+            state = self._client.get_order_ref_state(self.symbol, ref)
+            if state["state"] == "FILLED" and state.get("avg_price"):
+                return "FILLED", leg, float(state["avg_price"])
+            triggered = triggered or state["state"] == "TRIGGERED"
+            unknown = unknown or state["state"] == "UNKNOWN"
+        if triggered:
+            return "TRIGGERED", None, None
+        return ("UNKNOWN", None, None) if unknown else ("OPEN", None, None)
 
     def _sync_with_exchange(self, binance_symbol: str) -> None:
         """Sincronización periódica (~4 s) con Binance: posición neta (informativa) + posición propia."""
@@ -1350,7 +1413,7 @@ class PaperTrader:
         # el símbolo. Se exigen 2 lecturas seguidas (Testnet a veces devuelve lecturas viejas justo tras
         # operar). Cubre el cierre manual en Binance y las posiciones "fantasma" heredadas de un estado
         # anterior (sin referencias SL/TP), que de otro modo nadie resolvería.
-        if abs(net_amt) < 1e-9:
+        if abs(net_amt) < 1e-9 and not self._shares_symbol():
             self._zero_pos_reads += 1
             if self._zero_pos_reads >= self.ZERO_READS_TO_CONFIRM:
                 exit_p = mark_p if mark_p > 0 else pos.entry_price
@@ -1408,10 +1471,13 @@ class PaperTrader:
 
     def _place_missing_protection(self, pos: "Position", missing: list) -> None:
         """Coloca las patas SL/TP indicadas si la cuenta tiene una posición que las respalde. Con el lock del bot."""
-        net = self._net_position_amount()
-        direction = 1.0 if pos.side == "long" else -1.0
-        if net is None or net * direction < pos.quantity - 1e-9:
-            return  # la cuenta no tiene (todavía/ya) una posición que respalde la de este bot
+        if not self._shares_symbol():
+            # Con el símbolo para él solo, la posición neta ES la de este bot y debe respaldarla. Si otro bot lo
+            # comparte, la neta mezcla a ambos (puede ser 0 con dos posiciones abiertas): no dice nada de esta.
+            net = self._net_position_amount()
+            direction = 1.0 if pos.side == "long" else -1.0
+            if net is None or net * direction < pos.quantity - 1e-9:
+                return  # la cuenta no tiene (todavía/ya) una posición que respalde la de este bot
 
         sl_type = self.order_types.get("stop_loss", "LIMIT").upper()
         tp_type = self.order_types.get("take_profit", "LIMIT").upper()
@@ -1424,6 +1490,7 @@ class PaperTrader:
             sl_price=pos.sl_price if "sl" in missing else None,
             tp_price=pos.tp_price if "tp" in missing else None,
             sl_order_type=sl_type, tp_order_type=tp_type,
+            reduce_only=False,
         )
         if res.get("sl_order"):
             pos.sl_ref = self._client.order_ref(res["sl_order"])
@@ -1482,10 +1549,13 @@ class PaperTrader:
                 return  # el exchange ya cerró esta posición con su SL/TP
 
         side = "long" if str(open_side).upper() == "BUY" else "short"
-        net = self._net_position_amount()
-        direction = 1.0 if side == "long" else -1.0
-        if net is None or net * direction < qty - 1e-9 or qty <= 0:
-            return  # la cuenta no tiene una posición que respalde la que el ledger dice abierta
+        if qty <= 0:
+            return
+        if not self._shares_symbol():
+            net = self._net_position_amount()
+            direction = 1.0 if side == "long" else -1.0
+            if net is None or net * direction < qty - 1e-9:
+                return  # la cuenta no tiene una posición que respalde la que el ledger dice abierta
 
         try:
             order = self._client.client.futures_get_order(
@@ -1632,8 +1702,28 @@ class PaperTrader:
                 # (red, rate limit, etc.) la posición quedaba desprotegida en el exchange sin que el
                 # bot lo supiera. Ahora solo se cancelan una vez confirmado que la posición ya no existe.
                 if reason != "BINANCE_EXCHANGE_CLOSED" and not already_closed_on_exchange:
+                    # La orden de salida ya NO lleva reduceOnly (ver close_futures_position): si el SL/TP de este bot
+                    # ya cerró la posición, enviarla abriría una posición contraria. Por eso se consulta antes el
+                    # estado de SUS órdenes de protección.
+                    exit_state, exit_leg, exit_px = self._own_exit_state(pos)
+                    if exit_state == "FILLED":
+                        self._notify(
+                            f"ℹ️ El {exit_leg.upper()} de este bot ya cerró la posición en Binance a {exit_px:.2f}: "
+                            f"no se envía otra orden de salida."
+                        )
+                        already_closed_on_exchange, price, reason = True, exit_px, exit_leg.upper()
+                    elif exit_state in ("TRIGGERED", "UNKNOWN"):
+                        # Disparada sin ejecutar aún, o estado no consultable: se reintenta en el siguiente ciclo
+                        # (la posición sigue protegida). Tras 3 intentos inciertos se cierra igualmente.
+                        self._close_uncertain_count = getattr(self, "_close_uncertain_count", 0) + 1
+                        if self._close_uncertain_count < 3:
+                            return
+                    self._close_uncertain_count = 0
+
+                if reason != "BINANCE_EXCHANGE_CLOSED" and not already_closed_on_exchange:
                     close_order, err = self._client.close_futures_position(
-                        self.symbol, pos.side, pos.quantity, order_type=exit_type, price=price, verify_execution=True
+                        self.symbol, pos.side, pos.quantity, order_type=exit_type, price=price, verify_execution=True,
+                        reduce_only=False,
                     )
 
                     # Un rechazo "ReduceOnly Order is rejected" (-2022) significa que Binance ya NO
@@ -1669,6 +1759,12 @@ class PaperTrader:
                             f"⚡ CIERRE ({exit_type}) EJECUTADO en Binance | "
                             f"Precio Fill: {price:.2f} | ID: {close_order.get('orderId')} | Status: {close_order.get('status')}"
                         )
+                        closed_qty = float(close_order.get('executedQty', 0.0) or 0.0)
+                        if closed_qty > 0 and abs(closed_qty - pos.quantity) > pos.quantity * 0.01:
+                            self._trigger_critical_order_alert(
+                                "El cierre ejecutó una cantidad distinta a la de la posición del bot",
+                                {"Cantidad de la posición": f"{pos.quantity:.6f}", "Cantidad ejecutada": f"{closed_qty:.6f}"},
+                            )
                         self._cancel_own_protection(pos)
                     elif reduce_only_rejected:
                         # Antes se cerraba internamente al precio de la señal SIN verificar que la

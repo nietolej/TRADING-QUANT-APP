@@ -57,7 +57,7 @@ def test_terminal_orders_are_queried_once_and_open_ones_every_cycle(monkeypatch)
     second = build(r, since, cache)
     assert r.calls == ["b"], "solo la orden aún abierta (SL/TP vivo) se vuelve a consultar"
     assert first["total_orders"] == second["total_orders"] == 3
-    assert second["effective_count"] == 3
+    assert second["cycles_total"] == 3   # la efectividad ya se mide por ciclo (ver test_cycle_reconciliation)
 
 
 def test_without_cache_everything_is_queried_every_time(monkeypatch):

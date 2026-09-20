@@ -126,5 +126,13 @@ class ReconciliationReport(Base):
     reliability_pct = Column(Float, nullable=True)
     reliability_label = Column(String, nullable=True)
 
+    # Ciclos (entrada → SL/TP → salida) del bot en la sesión: la confiabilidad se mide sobre ellos.
+    cycles_total = Column(Integer, default=0)
+    cycles_completed = Column(Integer, default=0)
+    cycles_effective = Column(Integer, default=0)
+    cycles_failed = Column(Integer, default=0)
+    cycles_in_progress = Column(Integer, default=0)
+    cycles_json = Column(Text, nullable=True)
+
     # Detalle por orden de la sesión (lista de dicts serializada a JSON).
     orders_json = Column(Text, nullable=True)

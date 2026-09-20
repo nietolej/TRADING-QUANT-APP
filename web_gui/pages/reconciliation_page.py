@@ -74,6 +74,7 @@ LEDGER_COLUMNS = [
 # Detalle por orden de una sesión (Test 2, en vivo o consultada desde el historial) y de Test 1.
 ORDER_COLUMNS = [
     {"name": "created_at", "label": "Hora", "field": "created_at", "align": "left"},
+    {"name": "cycle", "label": "Ciclo", "field": "cycle", "align": "right"},
     {"name": "role", "label": "Rol", "field": "role", "align": "left"},
     {"name": "position_side", "label": "Long/Short", "field": "position_side", "align": "left"},
     {"name": "order_type", "label": "Tipo", "field": "order_type", "align": "left"},
@@ -124,6 +125,8 @@ def _order_rows(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for o in orders:
         row = {k: ('-' if v is None else v) for k, v in o.items()}
         row['role'] = ROLE_BY_ACTION.get(o.get('action'), o.get('action') or '-')
+        if o.get('cycle_issue'):
+            row['details'] = o['cycle_issue']
         slip = o.get('slippage_pct')
         row['slippage_pct'] = _fmt_pct(slip, 4) if slip is not None else '-'
         rows.append(row)
@@ -325,6 +328,9 @@ class ReconciliationPage:
             slip_max_color = 'red-400' if (slip_max is not None and tolerance is not None and slip_max > tolerance) else 'emerald-400'
             long_short = f"{report.get('long_count', 0)} / {report.get('short_count', 0)}" if report else "-"
 
+            ReconciliationPage._stat_card("Ciclos completos", report.get("cycles_completed", "-"), "autorenew", "cyan-400", 170)
+            ReconciliationPage._stat_card("Ciclos efectivos", report.get("cycles_effective", "-"), "task_alt", "emerald-400", 170)
+            ReconciliationPage._stat_card("Ciclos fallidos", report.get("cycles_failed", "-"), "error", "red-400", 170)
             ReconciliationPage._stat_card("Órdenes", report.get("total_orders", "-"), "receipt_long", "cyan-400")
             ReconciliationPage._stat_card("Creadas en la app", report.get("created_count", "-"), "note_add", "cyan-400", 170)
             ReconciliationPage._stat_card("Enviadas a Binance", report.get("sent_count", "-"), "send", "sky-400", 170)

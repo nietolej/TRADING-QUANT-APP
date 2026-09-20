@@ -25,6 +25,7 @@ _SCALAR_FIELDS = (
     "failed_count", "slippage_failed_count", "long_count", "short_count",
     "slippage_avg_pct", "slippage_max_pct", "slippage_p95_pct", "slippage_tolerance_pct",
     "reliability_pct", "reliability_label",
+    "cycles_total", "cycles_completed", "cycles_effective", "cycles_failed", "cycles_in_progress",
 )
 
 
@@ -51,6 +52,7 @@ def save_session_report(report: Dict[str, Any], finished: bool = False) -> bool:
         for field in _SCALAR_FIELDS:
             setattr(row, field, report.get(field))
         row.orders_json = json.dumps(report.get("orders", []), default=str)
+        row.cycles_json = json.dumps(report.get("cycles", []), default=str)
         row.updated_at = now
         row.status = "FINISHED" if finished else "RUNNING"
         if finished:
@@ -90,6 +92,10 @@ def _row_to_dict(row: ReconciliationReport, include_orders: bool) -> Dict[str, A
             data["orders"] = json.loads(row.orders_json) if row.orders_json else []
         except ValueError:
             data["orders"] = []
+        try:
+            data["cycles"] = json.loads(row.cycles_json) if row.cycles_json else []
+        except ValueError:
+            data["cycles"] = []
     return data
 
 
