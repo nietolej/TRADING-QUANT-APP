@@ -75,3 +75,10 @@ class ReconciliationRecord(Base):
     avg_price = Column(Float, nullable=True)
     reference_price = Column(Float, nullable=True)
     slippage_pct = Column(Float, nullable=True)
+
+    # Las tres condiciones que el Informe de Confiabilidad reporta para cada orden: que haya
+    # quedado creada en el ledger de la app, que se haya enviado a Binance y que Binance
+    # confirme que se ejecutó realmente (ver OrderReconciler._order_detail).
+    created_in_app = Column(Boolean, nullable=True)
+    sent_to_binance = Column(Boolean, nullable=True)
+    executed_in_binance = Column(Boolean, nullable=True)

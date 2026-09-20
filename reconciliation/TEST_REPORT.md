@@ -281,3 +281,72 @@ por deslizamiento de precio.
 quedó validada con datos simulados controlados. Para ver el Reporte de Tests con datos 100%
 reales hace falta ejecutar Test 1 y/o Test 3 en la instancia desplegada con
 `BINANCE_TESTNET_API_KEY`/`BINANCE_TESTNET_SECRET_KEY` configuradas.
+
+---
+
+## Actualización 2 — Informe de Confiabilidad del Bot (umbral de deslizamiento 0.05%)
+
+**Fecha:** 2026-09-20 (UTC), misma sesión.
+
+### Qué se probó
+Se endureció y renombró el reporte anterior a "🛡️ Informe de Confiabilidad del Bot", con dos
+cambios pedidos explícitamente:
+1. El umbral de deslizamiento que separa una orden "confiable" de una "fallida por
+   deslizamiento" bajó de 0.5% a **0.05%** (`OrderReconciler.slippage_tolerance_pct`).
+2. El informe ahora muestra el embudo completo por conteo: **órdenes creadas en la app →
+   enviadas a Binance → ejecutadas en Binance → confiables** (conciliadas en cantidad, precio
+   y con deslizamiento por debajo del umbral), además de un puntaje único de **confiabilidad
+   del bot** (`reliability_pct` + etiqueta Alta/Media/Baja) y el desglose Long/Short.
+
+### Cómo se probó
+- Se agregaron 3 columnas persistidas (`created_in_app`, `sent_to_binance`,
+  `executed_in_binance`) a `reconciliation_log`, con su migración aditiva correspondiente
+  (`reconciliation/order_ledger.py::_ensure_columns`, ahora también soporta columnas `BOOLEAN`).
+- Se corrigió una inconsistencia real encontrada durante la prueba: las órdenes creadas en la
+  app que **fallan al enviarse** (`SEND_FAILED`) nunca llegan a `reconciliation_log` (se marcan
+  `APP_SIDE_ONLY` y no se concilian contra Binance), así que contar "creadas en la app" solo
+  desde `reconciliation_log` las habría dejado fuera del conteo, subestimando cuántas órdenes
+  se generan realmente. Se corrigió consultando `app_order_ledger` directamente para los dos
+  primeros pasos del embudo (creadas, enviadas), y `reconciliation_log` para ejecución,
+  deslizamiento y confiabilidad (que solo existen para órdenes efectivamente enviadas).
+- Se validó con 3 órdenes simuladas (mismo método que en la Actualización 1: se mockea la
+  respuesta de `futures_get_order`, no la lógica de negocio): una LONG BTCUSDT creada, enviada
+  y ejecutada con 0.02% de deslizamiento (dentro del umbral), una SHORT ETHUSDT creada, enviada
+  y ejecutada con 0.08% de deslizamiento (fuera del umbral) y una LONG SOLUSDT que falló al
+  enviarse (`SEND_FAILED`, nunca llega a Binance).
+
+### Resultado obtenido
+```json
+{
+  "slippage_tolerance_pct": 0.05,
+  "total_checked": 2,
+  "created_in_app_count": 3,
+  "sent_to_binance_count": 2,
+  "executed_in_binance_count": 2,
+  "effective_count": 1,
+  "failed_count": 1,
+  "slippage_failed_count": 1,
+  "long_count": 1,
+  "short_count": 1,
+  "reliability_pct": 50.0,
+  "reliability_label": "Baja"
+}
+```
+La orden BTCUSDT (0.02% de deslizamiento) quedó `MATCHED`/confiable; la orden ETHUSDT (0.08%)
+quedó `SLIPPAGE_EXCEEDED`; la orden SOLUSDT que falló al enviarse se contó en
+`created_in_app_count` (3) pero no en `sent_to_binance_count` ni en `total_checked` (2), tal
+como se espera del embudo.
+
+### Qué significa el resultado
+El embudo creación → envío → ejecución → confiabilidad, con el umbral de deslizamiento en
+0.05%, funciona correctamente de punta a punta y ya distingue tres situaciones distintas que
+antes se mezclaban: una orden que nunca se envió, una que se envió y ejecutó con precio limpio,
+y una que se envió y ejecutó pero con deslizamiento fuera de tolerancia. El puntaje de
+confiabilidad (`reliability_pct`) resume estas tres situaciones en un solo número/etiqueta
+pensado para responder directamente "qué tan segura es la ejecución del bot".
+
+**Conclusión:** la lógica del Informe de Confiabilidad quedó validada con datos simulados
+controlados, igual que en la Actualización 1. Para un veredicto real sobre la confiabilidad del
+bot hace falta correr Test 1 y/o Test 3 repetidas veces en la instancia desplegada con
+credenciales de Binance Testnet configuradas, y luego abrir "Ver Informe de Confiabilidad" en
+la página de Conciliación.

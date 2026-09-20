@@ -189,17 +189,20 @@ class ReconciliationPage:
                 columns=LEDGER_COLUMNS, rows=[], row_key='id', pagination={'rowsPerPage': 15}
             ).classes('w-full')
 
-            # ── Reporte de Tests ─────────────────────────────────────────
+            # ── Informe de Confiabilidad del Bot (Reporte de Tests 1/2/3) ─
             with ui.row().classes('w-full justify-between items-center mt-6 flex-wrap gap-2'):
                 with ui.column().classes('gap-0.5'):
-                    ui.label('📊 Reporte de Tests').classes('text-lg font-bold text-white')
+                    ui.label('🛡️ Informe de Confiabilidad del Bot').classes('text-lg font-bold text-white')
                     ui.label(
-                        'Resultado a nivel de conciliación de cada orden generada por Test 1/2/3: precio, '
-                        'cantidad, long/short, cuántas fueron efectivas y cuántas fallaron por deslizamiento.'
+                        'Resultado de Test 1/2/3: cuántas órdenes se crearon en la app, se enviaron y se '
+                        'ejecutaron realmente en Binance, y cuántas quedaron conciliadas en cantidad y precio '
+                        'con deslizamiento menor al umbral — con el detalle completo por orden (activo, '
+                        'long/short, cantidad, precio, % de deslizamiento) para evaluar qué tan segura es la '
+                        'ejecución del bot.'
                     ).classes('text-xs text-gray-400')
                 with ui.row().classes('gap-2 items-center'):
                     self.report_hours_input = ui.number('Horas atrás', value=24, min=1, max=720).classes('w-24')
-                    self.report_btn = ui.button('Ver Reporte de Tests', icon='summarize', on_click=self._load_test_report_async) \
+                    self.report_btn = ui.button('Ver Informe de Confiabilidad', icon='summarize', on_click=self._load_test_report_async) \
                         .classes('bg-indigo-600 hover:bg-indigo-500 text-white font-bold px-4 py-2 rounded-xl')
 
             with ui.row().classes('w-full gap-4 flex-wrap') as self.report_summary_row:
@@ -248,18 +251,50 @@ class ReconciliationPage:
     def _render_report_summary_cards(self, report: Dict[str, Any]):
         self.report_summary_row.clear()
         with self.report_summary_row:
-            cards = [
-                ("Órdenes revisadas", report.get("total_checked", "-"), "checklist", "cyan-400"),
-                ("Efectivas", report.get("effective_count", "-"), "check_circle", "emerald-400"),
-                ("Fallidas", report.get("failed_count", "-"), "cancel", "red-400"),
-                ("Fallos por deslizamiento", report.get("slippage_failed_count", "-"), "trending_down", "amber-400"),
+            reliability_pct = report.get("reliability_pct")
+            reliability_label = report.get("reliability_label", "Sin datos")
+            reliability_color = {
+                "Alta": "emerald-400", "Media": "amber-400", "Baja": "red-400", "Sin datos": "gray-400",
+            }.get(reliability_label, "gray-400")
+            reliability_value = f"{reliability_pct:.1f}% ({reliability_label})" if reliability_pct is not None else "-"
+
+            # Embudo: creada en la app → enviada a Binance → ejecutada en Binance → confiable.
+            funnel_cards = [
+                ("Órdenes creadas en la app", report.get("created_in_app_count", "-"), "note_add", "cyan-400"),
+                ("Enviadas a Binance", report.get("sent_to_binance_count", "-"), "send", "sky-400"),
+                ("Ejecutadas en Binance", report.get("executed_in_binance_count", "-"), "bolt", "violet-400"),
+                (
+                    f"Confiables (deslizamiento < {report.get('slippage_tolerance_pct', 0.05)}%)",
+                    report.get("effective_count", "-"), "verified", "emerald-400",
+                ),
             ]
-            for label, value, icon, color in cards:
-                with ui.column().classes('bg-[#111827] border border-[#1e293b] rounded-xl px-4 py-3 min-w-[180px] gap-1'):
+            for label, value, icon, color in funnel_cards:
+                with ui.column().classes('bg-[#111827] border border-[#1e293b] rounded-xl px-4 py-3 min-w-[190px] gap-1'):
                     with ui.row().classes('items-center gap-2'):
                         ui.icon(icon, size='18px', color=color)
                         ui.label(label).classes('text-xs text-gray-400 font-semibold uppercase tracking-wide')
                     ui.label(str(value)).classes(f'text-2xl font-extrabold text-{color} font-mono')
+
+            other_cards = [
+                ("Fallidas", report.get("failed_count", "-"), "cancel", "red-400"),
+                ("Fallos por deslizamiento", report.get("slippage_failed_count", "-"), "trending_down", "amber-400"),
+                ("Long", report.get("long_count", "-"), "trending_up", "emerald-400"),
+                ("Short", report.get("short_count", "-"), "trending_down", "red-400"),
+            ]
+            for label, value, icon, color in other_cards:
+                with ui.column().classes('bg-[#111827] border border-[#1e293b] rounded-xl px-4 py-3 min-w-[150px] gap-1'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon(icon, size='18px', color=color)
+                        ui.label(label).classes('text-xs text-gray-400 font-semibold uppercase tracking-wide')
+                    ui.label(str(value)).classes(f'text-2xl font-extrabold text-{color} font-mono')
+
+            with ui.column().classes(
+                f'bg-[#111827] border-2 border-{reliability_color} rounded-xl px-4 py-3 min-w-[220px] gap-1'
+            ):
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('shield', size='18px', color=reliability_color)
+                    ui.label('Confiabilidad del bot').classes('text-xs text-gray-400 font-semibold uppercase tracking-wide')
+                ui.label(reliability_value).classes(f'text-2xl font-extrabold text-{reliability_color} font-mono')
 
     def _switch_network(self, use_testnet: bool):
         self.use_testnet = use_testnet
@@ -569,11 +604,14 @@ class ReconciliationPage:
             self.report_table.rows = report.get('orders', [])
             self.report_table.update()
 
+            rel_pct = report.get('reliability_pct')
+            rel_txt = f"{rel_pct:.1f}% ({report.get('reliability_label')})" if rel_pct is not None else "sin datos"
             ui.notify(
-                f"Reporte de Tests: {report.get('total_checked', 0)} orden(es) — "
-                f"{report.get('effective_count', 0)} efectiva(s), {report.get('failed_count', 0)} fallida(s) "
-                f"({report.get('slippage_failed_count', 0)} por deslizamiento).",
-                type='positive' if not report.get('failed_count') else 'warning', duration=7000
+                f"Confiabilidad del bot: {rel_txt} — {report.get('created_in_app_count', 0)} creada(s) en la app, "
+                f"{report.get('sent_to_binance_count', 0)} enviada(s), {report.get('executed_in_binance_count', 0)} "
+                f"ejecutada(s) en Binance, {report.get('effective_count', 0)} confiable(s) de "
+                f"{report.get('total_checked', 0)} ({report.get('slippage_failed_count', 0)} por deslizamiento).",
+                type='positive' if not report.get('failed_count') else 'warning', duration=8000
             )
         except Exception as e:
             logger.error("Error generando el Reporte de Tests: %s", e)

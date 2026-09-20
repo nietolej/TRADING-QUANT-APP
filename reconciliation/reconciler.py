@@ -54,15 +54,16 @@ class OrderReconciler:
         use_testnet: bool = True,
         price_tolerance_pct: float = 0.5,
         qty_tolerance_pct: float = 1.0,
-        slippage_tolerance_pct: float = 0.5,
+        slippage_tolerance_pct: float = 0.05,
         notify: bool = True,
     ):
         self.use_testnet = use_testnet
         self.price_tolerance_pct = price_tolerance_pct
         self.qty_tolerance_pct = qty_tolerance_pct
         # Deslizamiento máximo tolerado entre el precio de referencia (tomado justo antes de
-        # enviar la orden) y el precio realmente ejecutado en Binance, antes de marcar la
-        # orden como fallo de slippage en el Reporte de Tests.
+        # enviar la orden) y el precio realmente ejecutado en Binance. Por encima de este
+        # umbral la orden se marca SLIPPAGE_EXCEEDED y deja de contar como "confiable" en el
+        # Informe de Confiabilidad (criterio pedido: deslizamiento menor a 0.05%).
         self.slippage_tolerance_pct = slippage_tolerance_pct
         self.client = BinanceTestnetClient(use_testnet=use_testnet)
         self.notifier = TelegramNotifier() if notify else None
@@ -366,6 +367,9 @@ class OrderReconciler:
                         avg_price=r.get("avg_price"),
                         reference_price=r.get("reference_price"),
                         slippage_pct=r.get("slippage_pct"),
+                        created_in_app=r.get("checks", {}).get("created_in_app"),
+                        sent_to_binance=r.get("checks", {}).get("sent_to_binance"),
+                        executed_in_binance=r.get("checks", {}).get("executed_in_binance"),
                     )
                 )
             db.commit()
@@ -584,18 +588,37 @@ class OrderReconciler:
             "orders": orders,
         }
 
-    # ── Reporte de Tests (histórico persistido) ────────────────────────────────
+    # ── Reporte de Tests / Confiabilidad del Bot (histórico persistido) ────────
 
     def build_test_report(self, lookback_hours: float = 24.0, limit: int = 300) -> Dict[str, Any]:
         """
-        Arma el "Reporte de Tests" a partir del historial persistido en `reconciliation_log`:
-        el detalle completo de cada orden evaluada (símbolo, long/short, cantidad y precio
-        solicitados vs. ejecutados, deslizamiento) más los conteos de cuántas fueron
-        efectivas, cuántas fallaron y cuántas fallaron específicamente por deslizamiento.
+        Arma el "Informe de Confiabilidad" a partir del historial persistido en
+        `reconciliation_log` (generado por Test 1, Test 2 y Test 3, y por "Conciliar ahora"):
+
+        - El embudo creación → envío → ejecución: cuántas órdenes quedaron creadas en el
+          ledger de la app, cuántas se enviaron a Binance y cuántas Binance confirmó
+          ejecutadas de verdad.
+        - Cuántas de esas órdenes están "conciliadas" de forma confiable: mismo estado FILLED,
+          cantidad dentro de tolerancia y deslizamiento de precio por debajo del umbral
+          (`slippage_tolerance_pct`, 0.05% por defecto) — es decir, `match_status == MATCHED`.
+        - El detalle completo por orden (activo, long/short, cantidad y precio solicitados vs.
+          ejecutados, % de deslizamiento) y un puntaje global de confiabilidad del bot.
+
+        Creación y envío se cuentan directamente sobre `app_order_ledger` (fuente de verdad,
+        incluye también las órdenes que fallaron al enviarse y por eso nunca llegan a
+        conciliarse contra Binance); ejecución, deslizamiento y confiabilidad salen de
+        `reconciliation_log`, que solo existe para las órdenes efectivamente enviadas.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
         db = SessionLocal()
         try:
+            ledger_query = db.query(AppOrderRecord).filter(
+                AppOrderRecord.use_testnet == self.use_testnet,
+                AppOrderRecord.created_at >= cutoff,
+            )
+            created_in_app_count = ledger_query.count()
+            sent_to_binance_count = ledger_query.filter(AppOrderRecord.status == "SENT_OK").count()
+
             records = (
                 db.query(ReconciliationRecord)
                 .filter(ReconciliationRecord.run_at >= cutoff)
@@ -610,6 +633,9 @@ class OrderReconciler:
         effective_count = 0
         slippage_failed_count = 0
         failed_count = 0
+        executed_in_binance_count = 0
+        long_count = 0
+        short_count = 0
         for r in records:
             is_effective = r.match_status in EFFECTIVE_STATUSES
             is_slippage_failure = r.match_status == "SLIPPAGE_EXCEEDED"
@@ -619,6 +645,12 @@ class OrderReconciler:
                 failed_count += 1
             if is_slippage_failure:
                 slippage_failed_count += 1
+            if r.executed_in_binance:
+                executed_in_binance_count += 1
+            if r.position_side == "LONG":
+                long_count += 1
+            elif r.position_side == "SHORT":
+                short_count += 1
 
             orders.append({
                 "run_at": r.run_at.isoformat() if r.run_at else None,
@@ -638,14 +670,36 @@ class OrderReconciler:
                 "details": r.details,
                 "binance_order_id": r.binance_order_id,
                 "app_order_ref": r.app_order_ref,
+                "created_in_app": r.created_in_app,
+                "sent_to_binance": r.sent_to_binance,
+                "executed_in_binance": r.executed_in_binance,
                 "effective": is_effective,
             })
 
+        total_checked = len(orders)
+        reliability_pct = round((effective_count / total_checked) * 100.0, 2) if total_checked else None
+        if reliability_pct is None:
+            reliability_label = "Sin datos"
+        elif reliability_pct >= 95:
+            reliability_label = "Alta"
+        elif reliability_pct >= 80:
+            reliability_label = "Media"
+        else:
+            reliability_label = "Baja"
+
         return {
             "lookback_hours": lookback_hours,
-            "total_checked": len(orders),
+            "slippage_tolerance_pct": self.slippage_tolerance_pct,
+            "total_checked": total_checked,
+            "created_in_app_count": created_in_app_count,
+            "sent_to_binance_count": sent_to_binance_count,
+            "executed_in_binance_count": executed_in_binance_count,
             "effective_count": effective_count,
             "failed_count": failed_count,
             "slippage_failed_count": slippage_failed_count,
+            "long_count": long_count,
+            "short_count": short_count,
+            "reliability_pct": reliability_pct,
+            "reliability_label": reliability_label,
             "orders": orders,
         }

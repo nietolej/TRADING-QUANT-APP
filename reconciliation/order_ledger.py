@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Float
+from sqlalchemy import Boolean, Float
 
 from data_layer.storage import Base, SessionLocal, engine
 from reconciliation.models import AppOrderRecord, ReconciliationRecord
@@ -32,7 +32,12 @@ def _ensure_columns() -> None:
                 for column in table.columns:
                     if column.name in existing:
                         continue
-                    col_type = "FLOAT" if isinstance(column.type, Float) else "TEXT"
+                    if isinstance(column.type, Float):
+                        col_type = "FLOAT"
+                    elif isinstance(column.type, Boolean):
+                        col_type = "BOOLEAN"
+                    else:
+                        col_type = "TEXT"
                     conn.exec_driver_sql(f"ALTER TABLE {table.name} ADD COLUMN {column.name} {col_type}")
                     logger.info("Columna '%s' agregada a '%s' (migración aditiva).", column.name, table.name)
             conn.commit()
