@@ -64,6 +64,27 @@ class OnChainMetric(Base):
         UniqueConstraint('metric_name', 'symbol', 'timestamp', name='_metric_sym_ts_uc'),
     )
 
+class OnChainUnifiedDaily(Base):
+    """Base de datos unificada diaria: consolida TODAS las métricas on-chain (todos los
+    símbolos ya sincronizados en OnChainMetric) más precio de mercado y labels de
+    dirección futura del precio, en formato largo (una fila por date+symbol+metric_name)
+    en vez de una tabla ancha con una columna fija por métrica — evita tener que hacer
+    ALTER TABLE cada vez que se agrega una métrica nueva. Pensada como fuente única para
+    detección de patrones / modelos de predicción de dirección de precio. Se reconstruye
+    con data_layer.unified_dataset.build_unified_daily(); se pivotea a formato ancho
+    (una columna por SYMBOL_metric_name) con get_unified_wide_df()."""
+    __tablename__ = "onchain_unified_daily"
+
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(DateTime, index=True)  # medianoche UTC naive, granularidad diaria
+    symbol = Column(String, index=True)
+    metric_name = Column(String, index=True)
+    value = Column(Float)
+
+    __table_args__ = (
+        UniqueConstraint('date', 'symbol', 'metric_name', name='_unified_date_sym_metric_uc'),
+    )
+
 class BacktestRun(Base):
     __tablename__ = "backtest_runs"
     

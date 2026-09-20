@@ -10,6 +10,7 @@ from data_layer.storage import SessionLocal, OnChainMetric
 from data_layer.onchain_flows import BlockExplorerClient
 from data_layer.onchain_data import OnChainDataManager
 from data_layer.market_data import MarketDataManager
+from data_layer.unified_dataset import build_unified_daily, get_unified_wide_df
 import asyncio
 import concurrent.futures
 
@@ -333,7 +334,13 @@ def fetch_data_async(symbol, days, metric=None):
 
     market_mgr = MarketDataManager()
     market_mgr.update_historical_data(market_symbol, '1d', start_date)
-    
+
+    # 3. Reconstruir la base de datos unificada diaria (todas las métricas, todos los
+    # símbolos, precio y labels de dirección futura) con lo recién descargado. Se hace
+    # aquí (ya corriendo en threadpool) para que la "Tabla Diaria Completa" del módulo
+    # siempre refleje la última sincronización sin un paso manual aparte.
+    build_unified_daily()
+
     return records_saved
 
 def render_onchain_analyzer():
@@ -392,6 +399,11 @@ def render_onchain_analyzer():
 
             fetch_btn = ui.button('Sincronizar APIs', icon='sync').classes('bg-amber-500 text-slate-900 font-bold')
             plot_btn = ui.button('Graficar Datos', icon='insights').classes('bg-slate-700 text-white font-bold')
+            # Reconstruye la "Tabla Diaria Completa" (data_layer/unified_dataset.py) desde
+            # lo que YA está en la BD, sin volver a llamar a ninguna API — útil la primera
+            # vez que se usa esta tabla, ya que "Sincronizar APIs" la reconstruye
+            # automáticamente pero solo cubre el símbolo/métrica elegidos en el momento.
+            rebuild_btn = ui.button('Reconstruir Base Unificada', icon='dataset').classes('bg-slate-700 text-white font-bold')
 
             loading_spinner = ui.spinner('dots', size='lg', color='amber').classes('ml-4')
             loading_spinner.set_visibility(False)
@@ -434,6 +446,22 @@ def render_onchain_analyzer():
                 ui.notify(f"Error en la sincronización: {e}", type='negative')
             finally:
                 fetch_btn.enable()
+                loading_spinner.set_visibility(False)
+
+        async def on_rebuild_click():
+            rebuild_btn.disable()
+            loading_spinner.set_visibility(True)
+            ui.notify("Reconstruyendo base de datos unificada diaria...", type='info')
+            try:
+                loop = asyncio.get_running_loop()
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    rows = await loop.run_in_executor(pool, build_unified_daily)
+                ui.notify(f"Base unificada reconstruida: {rows} filas (fecha x símbolo x métrica).", type='positive')
+                await on_plot_click()
+            except Exception as e:
+                ui.notify(f"Error reconstruyendo la base unificada: {e}", type='negative')
+            finally:
+                rebuild_btn.enable()
                 loading_spinner.set_visibility(False)
 
         async def on_plot_click():
@@ -674,6 +702,41 @@ def render_onchain_analyzer():
                             source_text = 'Desconocida'
                         ui.label(source_text)
                 
+            # Renderizar Tabla Diaria Completa desde la base de datos unificada
+            # (data_layer/unified_dataset.py): una fila por día, una columna por cada
+            # combinación símbolo+métrica ya consolidada (todas las monedas sincronizadas,
+            # más precio de mercado y labels de dirección futura) — a diferencia de la
+            # tabla de abajo, que muestra solo los registros crudos de la métrica
+            # seleccionada en el dropdown. Se lee de la tabla ya construida en vez de
+            # recalcular el pivot en cada render: "Sincronizar APIs" y "Reconstruir Base
+            # Unificada" son quienes la actualizan.
+            df_unified_wide = get_unified_wide_df(start_date=start_date)
+
+            with table_container:
+                if not df_unified_wide.empty:
+                    ui.label('Tabla Diaria Completa (Base Unificada: Todos los Símbolos, Métricas, Precio y Labels)').classes('text-lg font-bold text-slate-300 mb-2 mt-4')
+                    df_daily_full = df_unified_wide.sort_index(ascending=False).round(6)
+                    df_daily_full = df_daily_full.reset_index().rename(columns={'date': 'Fecha'})
+                    df_daily_full['Fecha'] = pd.to_datetime(df_daily_full['Fecha']).dt.strftime('%d/%m/%Y')
+
+                    full_columns = [{'name': 'Fecha', 'label': 'Fecha', 'field': 'Fecha', 'align': 'left', 'sortable': True}]
+                    for col in df_daily_full.columns:
+                        if col == 'Fecha':
+                            continue
+                        full_columns.append({'name': col, 'label': col, 'field': col, 'align': 'right', 'sortable': True})
+
+                    ui.table(
+                        columns=full_columns,
+                        rows=df_daily_full.to_dict('records'),
+                        row_key='Fecha',
+                        pagination=20
+                    ).classes('w-full mb-6 overflow-x-auto')
+                else:
+                    ui.label(
+                        'La base de datos unificada aún no tiene datos para este rango. '
+                        'Presiona "Reconstruir Base Unificada" (o "Sincronizar APIs").'
+                    ).classes('text-sm text-amber-400 mb-4')
+
             # Renderizar Tabla de los últimos 100 registros crudos
             df_table = df_onchain.reset_index().sort_values('timestamp', ascending=False).head(100)
             df_table['timestamp'] = df_table['timestamp'].dt.strftime('%d/%m/%y %H:%M:%S')
@@ -699,6 +762,7 @@ def render_onchain_analyzer():
 
         fetch_btn.on_click(on_fetch_click)
         plot_btn.on_click(on_plot_click)
+        rebuild_btn.on_click(on_rebuild_click)
         
         # Carga inicial vacía
         with chart_container:
