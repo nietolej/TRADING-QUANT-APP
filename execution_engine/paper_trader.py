@@ -184,7 +184,7 @@ class PaperTrader:
         self._warn_if_dynamic_sl_unsupported_live()
 
         try:
-            self._client = BinanceTestnetClient(use_testnet=self.use_testnet)
+            self._client = BinanceTestnetClient(use_testnet=self.use_testnet, bot_id=self.bot_id)
         except Exception as e:
             friendly_msg = format_binance_error(e)
             self._notify(f"❌ Error conectando a Binance: {friendly_msg}")

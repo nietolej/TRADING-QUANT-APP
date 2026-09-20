@@ -1,4 +1,5 @@
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,17 @@ FAILED_STATUSES = {"REJECTED", "CANCELED", "EXPIRED"}
 # cancelada de forma esperada por ser la contraparte de un TP/SL que sí se disparó) en el
 # Informe de Confiabilidad. Todo lo demás cuenta como fallida.
 EFFECTIVE_STATUSES = {"MATCHED", "CANCELED_AS_EXPECTED"}
+
+
+def _reliability_label(reliability_pct: Optional[float]) -> str:
+    """Etiqueta de confiabilidad del bot según el % de órdenes efectivas."""
+    if reliability_pct is None:
+        return "Sin datos"
+    if reliability_pct >= 95:
+        return "Alta"
+    if reliability_pct >= 80:
+        return "Media"
+    return "Baja"
 
 
 def _position_side(action: Optional[str], side: Optional[str]) -> Optional[str]:
@@ -601,81 +613,142 @@ class OrderReconciler:
             "results": all_results,
         }
 
-    # ── Modo Test 3: verificación creación → envío → ejecución en Binance ─────
+    def _reconcile_ledger_order(self, binance_order_id: Any) -> Optional[Dict[str, Any]]:
+        """
+        Concilia contra Binance UNA orden concreta del ledger (buscada por su orderId) y
+        persiste el resultado. A diferencia de reconcile_pending, no toca ninguna otra orden
+        pendiente (de otros bots o de pruebas anteriores). None = no hay registro en el ledger.
+        """
+        db = SessionLocal()
+        try:
+            record = (
+                db.query(AppOrderRecord)
+                .filter(
+                    AppOrderRecord.binance_order_id == str(binance_order_id),
+                    AppOrderRecord.use_testnet == self.use_testnet,
+                )
+                .order_by(AppOrderRecord.created_at.desc())
+                .first()
+            )
+            if record is None:
+                return None
+            outcome = self.reconcile_order(record)
+            record.reconciled = True
+            record.reconciliation_status = outcome["match_status"]
+            db.add(record)
+            db.commit()
+        finally:
+            db.close()
+        self._persist_results([outcome])
+        return outcome
+
+    # ── Test 1: verificación de una orden (creación → envío → ejecución + deslizamiento) ─────
 
     def run_execution_verification_test(
         self, symbol: str = "BTC/USDT", quantity: float = 0.001, side: str = "long"
     ) -> Dict[str, Any]:
         """
-        Prueba puntual (sin SL/TP) de las tres condiciones que debe cumplir toda orden:
-        1) que quede CREADA en el ledger local de la app (`app_order_ledger`, vía
+        Prueba puntual (sin SL/TP) de todo lo que debe cumplir una orden de la app:
+        1) que se ENVÍE a Binance,
+        2) que quede REGISTRADA en el ledger local de la app (`app_order_ledger`, vía
            `_log_order_to_ledger` dentro de `place_futures_order`),
-        2) que se haya ENVIADO a Binance (status SENT_OK + binance_order_id), y
-        3) que Binance confirme que se EJECUTÓ realmente (estado FILLED al reconciliar).
+        3) que Binance confirme que se EJECUTÓ realmente (estado FILLED al conciliar) y
+        4) que el deslizamiento entre el precio de referencia (tomado justo antes de enviarla)
+           y el precio realmente ejecutado quede dentro de `slippage_tolerance_pct`.
 
-        A diferencia de "Modo Test 1" (que además coloca y retira SL/TP), este test es el
-        ciclo mínimo de una orden real: abre con una orden MARKET, la concilia de inmediato
-        (lo que también calcula el deslizamiento contra el precio de referencia) y cierra la
-        posición de prueba para no dejarla abierta. Solo corre en Testnet.
+        Abre con una orden MARKET, concilia esa orden concreta y cierra la posición de prueba
+        para no dejarla abierta. Devuelve además un veredicto (`verdict`) que responde si la
+        orden se ejecutó de acuerdo a lo que pidió el bot, con el motivo cuando no. Solo corre
+        en Testnet.
         """
         if not self.use_testnet:
             return {
                 "success": False,
-                "error": "El Modo Test 3 solo puede correr contra Testnet (nunca Mainnet) por seguridad.",
+                "error": "El Test 1 solo puede correr contra Testnet (nunca Mainnet) por seguridad.",
                 "steps": [],
                 "orders": [],
+                "verdict": {"executed_as_bot": False, "reason": "Solo disponible en Testnet."},
             }
 
         binance_symbol = symbol.replace("/", "").upper()
         steps: List[Dict[str, Any]] = []
 
-        def _step(name: str, ok: bool, detail: str):
+        def _step(name: str, ok: bool, detail: str) -> bool:
             steps.append({"step": name, "ok": ok, "detail": detail})
             return ok
+
+        def _verdict(executed_as_bot: bool, reason: str) -> Dict[str, Any]:
+            return {"executed_as_bot": executed_as_bot, "reason": reason}
 
         entry_order, entry_err = self.client.place_futures_order(
             symbol=symbol, side=side, quantity=quantity, order_type="MARKET", verify_execution=True
         )
         entry_ok = bool(entry_order) and not entry_err
         _step(
-            "1. Orden creada en la app y enviada a Binance",
+            "1. Enviada a Binance",
             entry_ok,
             entry_err or f"orderId={entry_order.get('orderId') if entry_order else None}",
         )
         if not entry_ok:
-            return {"success": False, "symbol": binance_symbol, "steps": steps, "orders": []}
+            return {
+                "success": False, "symbol": binance_symbol, "steps": steps, "orders": [],
+                "verdict": _verdict(False, entry_err or "La orden no se pudo enviar a Binance."),
+            }
 
-        # Reconciliar de inmediato confirma el paso 3 (ejecución real en Binance) y calcula
-        # el deslizamiento de esta misma orden contra el precio de referencia registrado.
-        recon_results = self.reconcile_pending(lookback_hours=0.05, limit=5)
-        entry_recon = next((r for r in recon_results if r.get("binance_order_id") == str(entry_order.get("orderId"))), None)
+        entry_recon = self._reconcile_ledger_order(entry_order.get("orderId"))
+        _step(
+            "2. Registrada en la app (ledger)",
+            entry_recon is not None,
+            "La orden quedó registrada en el ledger local." if entry_recon is not None
+            else "No se encontró la orden en el ledger de la app.",
+        )
+
         executed_ok = bool(entry_recon and entry_recon["checks"]["executed_in_binance"])
         _step(
-            "2. Ejecución confirmada por Binance al reconciliar",
+            "3. Ejecución confirmada por Binance",
             executed_ok,
-            (entry_recon or {}).get("details", "No se encontró el resultado de conciliación de la orden."),
+            (entry_recon or {}).get("details", "No se pudo conciliar la orden porque no está en el ledger."),
         )
+
+        slippage = (entry_recon or {}).get("slippage_pct")
+        if slippage is None:
+            slippage_ok = False
+            slippage_detail = "No se pudo medir el deslizamiento (falta precio de referencia o de ejecución)."
+        else:
+            slippage_ok = slippage <= self.slippage_tolerance_pct
+            slippage_detail = (
+                f"Deslizamiento {slippage:.4f}% (tolerancia {self.slippage_tolerance_pct}%): "
+                f"referencia {entry_recon.get('reference_price')} vs ejecutado {entry_recon.get('avg_price')}."
+            )
+        _step("4. Deslizamiento dentro de tolerancia", slippage_ok, slippage_detail)
 
         # Limpieza: cerrar la posición de prueba para no dejarla abierta en Testnet.
         close_order, close_err = self.client.close_futures_position(
             symbol=symbol, side=side, quantity=quantity, order_type="MARKET", verify_execution=True
         )
         _step(
-            "3. Cierre de la posición de prueba",
+            "5. Cierre de la posición de prueba",
             bool(close_order) and not close_err,
             close_err or f"orderId={close_order.get('orderId') if close_order else None}",
         )
-        close_recon = []
-        if close_order:
-            close_recon = self.reconcile_pending(lookback_hours=0.05, limit=5)
+        close_recon = self._reconcile_ledger_order(close_order.get("orderId")) if close_order else None
 
-        orders = (recon_results or []) + (close_recon or [])
-        overall_ok = all(s["ok"] for s in steps)
+        orders = [o for o in (entry_recon, close_recon) if o]
+        entry_matched = bool(entry_recon and entry_recon["match_status"] == "MATCHED")
+        if entry_matched and slippage_ok:
+            verdict = _verdict(True, "La orden se creó, se envió y se ejecutó tal como la pidió el bot, con deslizamiento dentro de tolerancia.")
+        else:
+            reasons = [s["detail"] for s in steps[:4] if not s["ok"]]
+            if not reasons and entry_recon:
+                reasons = [entry_recon.get("details", "")]
+            verdict = _verdict(False, " | ".join(r for r in reasons if r) or "La ejecución no coincide con lo pedido por el bot.")
+
         return {
-            "success": overall_ok,
+            "success": all(s["ok"] for s in steps) and verdict["executed_as_bot"],
             "symbol": binance_symbol,
             "steps": steps,
             "orders": orders,
+            "verdict": verdict,
         }
 
     # ── Reporte de Tests / Confiabilidad del Bot (histórico persistido) ────────
@@ -768,14 +841,7 @@ class OrderReconciler:
 
         total_checked = len(orders)
         reliability_pct = round((effective_count / total_checked) * 100.0, 2) if total_checked else None
-        if reliability_pct is None:
-            reliability_label = "Sin datos"
-        elif reliability_pct >= 95:
-            reliability_label = "Alta"
-        elif reliability_pct >= 80:
-            reliability_label = "Media"
-        else:
-            reliability_label = "Baja"
+        reliability_label = _reliability_label(reliability_pct)
 
         return {
             "lookback_hours": lookback_hours,
@@ -791,5 +857,118 @@ class OrderReconciler:
             "short_count": short_count,
             "reliability_pct": reliability_pct,
             "reliability_label": reliability_label,
+            "orders": orders,
+        }
+
+    # ── Test 2: informe de conciliación de una sesión de monitoreo de un bot ─────
+
+    def build_session_report(
+        self,
+        session_id: str,
+        bot_id: str,
+        bot_name: str,
+        symbol: str,
+        started_at: datetime,
+    ) -> Dict[str, Any]:
+        """
+        Concilia contra Binance TODAS las órdenes que `bot_id` envió desde `started_at` (naive
+        UTC) — Entrada, SL, TP y Salida — y arma el informe de la sesión: embudo creación →
+        envío → ejecución, deslizamiento (promedio / máximo / p95), órdenes conciliadas vs.
+        fallidas, y la confiabilidad resultante (% de órdenes efectivas, ver EFFECTIVE_STATUSES).
+
+        No modifica el ledger (no marca `reconciled`) ni escribe en `reconciliation_log`: se
+        invoca en cada ciclo de la sesión y eso duplicaría filas. El informe completo lo
+        persiste `reconciliation.reports.save_session_report`.
+        """
+        db = SessionLocal()
+        try:
+            records = (
+                db.query(AppOrderRecord)
+                .filter(
+                    AppOrderRecord.bot_id == bot_id,
+                    AppOrderRecord.use_testnet == self.use_testnet,
+                    AppOrderRecord.created_at >= started_at,
+                )
+                .order_by(AppOrderRecord.created_at.asc())
+                .all()
+            )
+            # Se desprenden de la sesión antes de cerrarla (expire_on_commit invalidaría sus
+            # atributos tras db.close()).
+            db.expunge_all()
+        finally:
+            db.close()
+
+        orders: List[Dict[str, Any]] = []
+        for record in records:
+            if record.status != "SENT_OK":
+                outcome = {
+                    **self._order_detail(record),
+                    "match_status": "SEND_FAILED",
+                    "severity": "CRITICAL",
+                    "details": record.error or "La orden nunca llegó a enviarse a Binance (rechazada antes de salir).",
+                    "binance_status": None,
+                    "binance_exec_qty": None,
+                    "binance_avg_price": None,
+                }
+            else:
+                outcome = self.reconcile_order(record)
+            orders.append({
+                "app_order_ref": record.app_order_ref,
+                "created_at": record.created_at.strftime("%d/%m %H:%M:%S") if record.created_at else None,
+                "symbol": outcome.get("symbol"),
+                "action": record.action,
+                "position_side": outcome.get("position_side"),
+                "side": record.side,
+                "order_type": record.order_type,
+                "requested_qty": record.requested_qty,
+                "executed_qty": outcome.get("executed_qty"),
+                "requested_price": record.requested_price,
+                "reference_price": outcome.get("reference_price"),
+                "avg_price": outcome.get("avg_price"),
+                "slippage_pct": outcome.get("slippage_pct"),
+                "binance_status": outcome.get("binance_status"),
+                "match_status": outcome["match_status"],
+                "severity": outcome["severity"],
+                "details": outcome["details"],
+                "binance_order_id": outcome.get("binance_order_id"),
+                "created_in_app": outcome["checks"]["created_in_app"],
+                "sent_to_binance": outcome["checks"]["sent_to_binance"],
+                "executed_in_binance": outcome["checks"]["executed_in_binance"],
+                "effective": outcome["match_status"] in EFFECTIVE_STATUSES,
+            })
+
+        total = len(orders)
+        effective = sum(1 for o in orders if o["effective"])
+        slippages = sorted(o["slippage_pct"] for o in orders if o["slippage_pct"] is not None)
+        if slippages:
+            slippage_avg = round(sum(slippages) / len(slippages), 4)
+            slippage_max = round(slippages[-1], 4)
+            slippage_p95 = round(slippages[max(0, math.ceil(0.95 * len(slippages)) - 1)], 4)
+        else:
+            slippage_avg = slippage_max = slippage_p95 = None
+
+        reliability_pct = round(effective / total * 100.0, 2) if total else None
+        return {
+            "session_id": session_id,
+            "bot_id": bot_id,
+            "bot_name": bot_name,
+            "symbol": symbol,
+            "use_testnet": self.use_testnet,
+            "started_at": started_at,
+            "total_orders": total,
+            "created_count": sum(1 for o in orders if o["created_in_app"]),
+            "sent_count": sum(1 for o in orders if o["sent_to_binance"]),
+            "executed_count": sum(1 for o in orders if o["executed_in_binance"]),
+            "effective_count": effective,
+            "failed_count": total - effective,
+            "slippage_failed_count": sum(1 for o in orders if o["match_status"] == "SLIPPAGE_EXCEEDED"),
+            "long_count": sum(1 for o in orders if o["position_side"] == "LONG"),
+            "short_count": sum(1 for o in orders if o["position_side"] == "SHORT"),
+            "slippage_avg_pct": slippage_avg,
+            "slippage_max_pct": slippage_max,
+            "slippage_p95_pct": slippage_p95,
+            "slippage_tolerance_pct": self.slippage_tolerance_pct,
+            "reliability_pct": reliability_pct,
+            "reliability_label": _reliability_label(reliability_pct),
             "orders": orders,
         }

@@ -3,17 +3,20 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import Boolean, Float
+from sqlalchemy import Boolean, Float, Integer
 
 from data_layer.storage import Base, SessionLocal, engine
-from reconciliation.models import AppOrderRecord, ReconciliationRecord
+from reconciliation.models import AppOrderRecord, ReconciliationRecord, ReconciliationReport
 
 logger = logging.getLogger("OrderLedger")
 
 # Las tablas del ledger viven en el mismo archivo SQLite que el resto de la app (via el
 # engine compartido de data_layer.storage), pero se crean desde este módulo separado para
 # no acoplar data_layer/storage.py al dominio de reconciliación.
-Base.metadata.create_all(bind=engine, tables=[AppOrderRecord.__table__, ReconciliationRecord.__table__])
+Base.metadata.create_all(
+    bind=engine,
+    tables=[AppOrderRecord.__table__, ReconciliationRecord.__table__, ReconciliationReport.__table__],
+)
 
 
 def _ensure_columns() -> None:
@@ -27,7 +30,7 @@ def _ensure_columns() -> None:
         return
     try:
         with engine.connect() as conn:
-            for table in (AppOrderRecord.__table__, ReconciliationRecord.__table__):
+            for table in (AppOrderRecord.__table__, ReconciliationRecord.__table__, ReconciliationReport.__table__):
                 existing = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table.name})").fetchall()}
                 for column in table.columns:
                     if column.name in existing:
@@ -36,6 +39,8 @@ def _ensure_columns() -> None:
                         col_type = "FLOAT"
                     elif isinstance(column.type, Boolean):
                         col_type = "BOOLEAN"
+                    elif isinstance(column.type, Integer):
+                        col_type = "INTEGER"
                     else:
                         col_type = "TEXT"
                     conn.exec_driver_sql(f"ALTER TABLE {table.name} ADD COLUMN {column.name} {col_type}")
@@ -64,6 +69,7 @@ def log_app_order(
     avg_price: Optional[float] = None,
     reference_price: Optional[float] = None,
     error: Optional[str] = None,
+    bot_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Registra en el ledger local un intento de orden enviado a Binance (exitoso o fallido).
@@ -78,6 +84,7 @@ def log_app_order(
             app_order_ref=app_order_ref,
             created_at=datetime.now(timezone.utc),
             symbol=symbol.replace("/", "").upper(),
+            bot_id=bot_id,
             side=side.upper(),
             action=action.upper(),
             order_type=order_type.upper(),

@@ -22,6 +22,10 @@ class AppOrderRecord(Base):
     created_at = Column(DateTime, index=True)
 
     symbol = Column(String, index=True)
+    # Bot que originó la orden (None = orden manual/de prueba sin bot). Permite que una
+    # sesión de conciliación (ReconciliationReport) tome SOLO las órdenes de su bot aunque
+    # otro bot opere el mismo símbolo.
+    bot_id = Column(String, nullable=True, index=True)
     side = Column(String)          # BUY / SELL (tal como se envía a Binance)
     action = Column(String)        # OPEN / CLOSE / TAKE_PROFIT / STOP_LOSS
     order_type = Column(String)    # MARKET / LIMIT / STOP / TAKE_PROFIT / ...
@@ -82,3 +86,45 @@ class ReconciliationRecord(Base):
     created_in_app = Column(Boolean, nullable=True)
     sent_to_binance = Column(Boolean, nullable=True)
     executed_in_binance = Column(Boolean, nullable=True)
+
+
+class ReconciliationReport(Base):
+    """
+    Informe de conciliación de UNA sesión de monitoreo (Test 2): órdenes de un bot desde que
+    se inició la sesión, comparadas contra lo ejecutado en Binance, con las estadísticas de
+    conciliación y la confiabilidad resultante. Se guarda/actualiza en cada ciclo del test
+    (status RUNNING) y queda FINISHED al detenerlo, para consultarlo después sin depender de
+    que el test siga corriendo ni de que la página siga abierta.
+    """
+    __tablename__ = "reconciliation_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, unique=True, index=True)
+    bot_id = Column(String, index=True)
+    bot_name = Column(String, nullable=True)
+    symbol = Column(String, nullable=True, index=True)
+    use_testnet = Column(Boolean, default=True)
+
+    started_at = Column(DateTime, index=True)   # UTC naive
+    updated_at = Column(DateTime)               # último ciclo que actualizó el informe (UTC naive)
+    ended_at = Column(DateTime, nullable=True)  # None mientras la sesión sigue en curso
+    status = Column(String, index=True)         # RUNNING | FINISHED
+
+    total_orders = Column(Integer, default=0)
+    created_count = Column(Integer, default=0)
+    sent_count = Column(Integer, default=0)
+    executed_count = Column(Integer, default=0)
+    effective_count = Column(Integer, default=0)
+    failed_count = Column(Integer, default=0)
+    slippage_failed_count = Column(Integer, default=0)
+    long_count = Column(Integer, default=0)
+    short_count = Column(Integer, default=0)
+    slippage_avg_pct = Column(Float, nullable=True)
+    slippage_max_pct = Column(Float, nullable=True)
+    slippage_p95_pct = Column(Float, nullable=True)
+    slippage_tolerance_pct = Column(Float, nullable=True)
+    reliability_pct = Column(Float, nullable=True)
+    reliability_label = Column(String, nullable=True)
+
+    # Detalle por orden de la sesión (lista de dicts serializada a JSON).
+    orders_json = Column(Text, nullable=True)

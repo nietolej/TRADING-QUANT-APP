@@ -4,11 +4,19 @@ Página de Conciliación App ↔ Binance.
 Muestra, sobre el módulo separado `reconciliation/`, si las órdenes que la app envió
 realmente se ejecutaron en Binance (Demo/Testnet por defecto) y si hay órdenes ejecutadas
 en Binance (con la etiqueta QTAPP_) que nunca quedaron registradas del lado de la app.
+
+Tests:
+- Test 1: envía UNA orden real a Testnet y verifica creación → envío → ejecución y el
+  deslizamiento de precio, con un veredicto de si se ejecutó según lo pedido por el bot.
+  (Test 1b: el ciclo completo con SL/TP.)
+- Test 2: sesión de conciliación en vivo de un bot; genera y guarda en BD el informe de
+  conciliación (estadísticas, deslizamientos y confiabilidad), consultable después.
 """
 import asyncio
 import logging
+import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from nicegui import ui
 
@@ -16,6 +24,7 @@ from data_layer.storage import SessionLocal
 from execution_engine.daemon_client import daemon_client as bot_manager
 from reconciliation.models import AppOrderRecord, ReconciliationRecord
 from reconciliation.reconciler import OrderReconciler
+from reconciliation.reports import get_session_report, list_session_reports, save_session_report
 
 logger = logging.getLogger("ReconciliationPage")
 
@@ -24,6 +33,14 @@ SEVERITY_BADGE = {
     "WARNING": "bg-amber-500/15 text-amber-400 border border-amber-500/40",
     "INFO": "bg-emerald-500/15 text-emerald-400 border border-emerald-500/40",
 }
+
+SEVERITY_SLOT = '''
+    <q-td :props="props">
+        <q-badge :color="props.value === 'CRITICAL' ? 'red' : (props.value === 'WARNING' ? 'amber' : 'green')">
+            {{ props.value }}
+        </q-badge>
+    </q-td>
+'''
 
 RESULT_COLUMNS = [
     {"name": "symbol", "label": "Símbolo", "field": "symbol", "align": "left"},
@@ -42,17 +59,44 @@ HISTORY_COLUMNS = [
     {"name": "details", "label": "Detalle", "field": "details", "align": "left"},
 ]
 
-TEST4_COLUMNS = [
+LEDGER_COLUMNS = [
+    {"name": "created_at", "label": "Fecha", "field": "created_at", "align": "left"},
+    {"name": "symbol", "label": "Símbolo", "field": "symbol", "align": "left"},
+    {"name": "bot_id", "label": "Bot", "field": "bot_id", "align": "left"},
+    {"name": "side", "label": "Lado", "field": "side", "align": "left"},
+    {"name": "action", "label": "Acción", "field": "action", "align": "left"},
+    {"name": "status", "label": "Envío", "field": "status", "align": "left"},
+    {"name": "binance_order_id", "label": "Orden Binance", "field": "binance_order_id", "align": "left"},
+    {"name": "reconciliation_status", "label": "Conciliación", "field": "reconciliation_status", "align": "left"},
+]
+
+# Detalle por orden de una sesión (Test 2, en vivo o consultada desde el historial) y de Test 1.
+ORDER_COLUMNS = [
     {"name": "created_at", "label": "Hora", "field": "created_at", "align": "left"},
     {"name": "role", "label": "Rol", "field": "role", "align": "left"},
-    {"name": "side", "label": "Lado", "field": "side", "align": "left"},
-    {"name": "requested_qty", "label": "Cant. App", "field": "requested_qty", "align": "right"},
-    {"name": "binance_exec_qty", "label": "Cant. Binance", "field": "binance_exec_qty", "align": "right"},
-    {"name": "requested_price", "label": "Precio App", "field": "requested_price", "align": "right"},
-    {"name": "binance_avg_price", "label": "Precio Binance", "field": "binance_avg_price", "align": "right"},
+    {"name": "position_side", "label": "Long/Short", "field": "position_side", "align": "left"},
+    {"name": "order_type", "label": "Tipo", "field": "order_type", "align": "left"},
+    {"name": "requested_qty", "label": "Cant. Solicitada", "field": "requested_qty", "align": "right"},
+    {"name": "executed_qty", "label": "Cant. Ejecutada", "field": "executed_qty", "align": "right"},
+    {"name": "reference_price", "label": "Precio Referencia", "field": "reference_price", "align": "right"},
+    {"name": "avg_price", "label": "Precio Ejecutado", "field": "avg_price", "align": "right"},
+    {"name": "slippage_pct", "label": "Deslizamiento %", "field": "slippage_pct", "align": "right"},
     {"name": "binance_status", "label": "Estado Binance", "field": "binance_status", "align": "left"},
-    {"name": "match_icon", "label": "Coincide", "field": "match_icon", "align": "center"},
+    {"name": "match_status", "label": "Conciliación", "field": "match_status", "align": "left"},
+    {"name": "severity", "label": "Severidad", "field": "severity", "align": "left"},
     {"name": "details", "label": "Detalle", "field": "details", "align": "left"},
+]
+
+SESSION_COLUMNS = [
+    {"name": "started_at", "label": "Inicio (UTC)", "field": "started_at", "align": "left"},
+    {"name": "ended_at", "label": "Fin (UTC)", "field": "ended_at", "align": "left"},
+    {"name": "bot_name", "label": "Bot", "field": "bot_name", "align": "left"},
+    {"name": "symbol", "label": "Símbolo", "field": "symbol", "align": "left"},
+    {"name": "status", "label": "Estado", "field": "status", "align": "left"},
+    {"name": "total_orders", "label": "Órdenes", "field": "total_orders", "align": "right"},
+    {"name": "reliability", "label": "Confiabilidad", "field": "reliability", "align": "left"},
+    {"name": "slippage_avg", "label": "Desliz. prom.", "field": "slippage_avg", "align": "right"},
+    {"name": "slippage_max", "label": "Desliz. máx.", "field": "slippage_max", "align": "right"},
 ]
 
 ROLE_BY_ACTION = {
@@ -62,32 +106,27 @@ ROLE_BY_ACTION = {
     "STOP_LOSS": "Stop Loss",
 }
 
-LEDGER_COLUMNS = [
-    {"name": "created_at", "label": "Fecha", "field": "created_at", "align": "left"},
-    {"name": "symbol", "label": "Símbolo", "field": "symbol", "align": "left"},
-    {"name": "side", "label": "Lado", "field": "side", "align": "left"},
-    {"name": "action", "label": "Acción", "field": "action", "align": "left"},
-    {"name": "status", "label": "Envío", "field": "status", "align": "left"},
-    {"name": "binance_order_id", "label": "Orden Binance", "field": "binance_order_id", "align": "left"},
-    {"name": "reconciliation_status", "label": "Conciliación", "field": "reconciliation_status", "align": "left"},
-]
+RELIABILITY_COLOR = {"Alta": "emerald-400", "Media": "amber-400", "Baja": "red-400", "Sin datos": "gray-400"}
 
-REPORT_COLUMNS = [
-    {"name": "run_at", "label": "Fecha", "field": "run_at", "align": "left"},
-    {"name": "symbol", "label": "Símbolo", "field": "symbol", "align": "left"},
-    {"name": "position_side", "label": "Long/Short", "field": "position_side", "align": "left"},
-    {"name": "action", "label": "Acción", "field": "action", "align": "left"},
-    {"name": "order_type", "label": "Tipo", "field": "order_type", "align": "left"},
-    {"name": "requested_qty", "label": "Cant. Solicitada", "field": "requested_qty", "align": "right"},
-    {"name": "executed_qty", "label": "Cant. Ejecutada", "field": "executed_qty", "align": "right"},
-    {"name": "reference_price", "label": "Precio Referencia", "field": "reference_price", "align": "right"},
-    {"name": "avg_price", "label": "Precio Ejecutado", "field": "avg_price", "align": "right"},
-    {"name": "slippage_pct", "label": "Deslizamiento %", "field": "slippage_pct", "align": "right"},
-    {"name": "match_status", "label": "Estado", "field": "match_status", "align": "left"},
-    {"name": "severity", "label": "Severidad", "field": "severity", "align": "left"},
-    {"name": "binance_order_id", "label": "Orden Binance", "field": "binance_order_id", "align": "left"},
-    {"name": "details", "label": "Detalle", "field": "details", "align": "left"},
-]
+
+def _fmt_pct(value: Optional[float], decimals: int = 3) -> str:
+    return f"{value:.{decimals}f}%" if value is not None else "-"
+
+
+def _fmt_dt(value: Optional[datetime]) -> str:
+    return value.strftime('%d/%m %H:%M:%S') if value else '-'
+
+
+def _order_rows(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Adapta el detalle por orden (reconciler) a filas de tabla: agrega el rol y evita celdas None."""
+    rows = []
+    for o in orders:
+        row = {k: ('-' if v is None else v) for k, v in o.items()}
+        row['role'] = ROLE_BY_ACTION.get(o.get('action'), o.get('action') or '-')
+        slip = o.get('slippage_pct')
+        row['slippage_pct'] = _fmt_pct(slip, 4) if slip is not None else '-'
+        rows.append(row)
+    return rows
 
 
 class ReconciliationPage:
@@ -95,11 +134,9 @@ class ReconciliationPage:
         self.use_testnet = True
         self.is_loading = False
         self.last_summary: Dict[str, Any] = {}
+        # Sesión activa de Test 2 (None = no hay monitoreo en curso).
+        self.test2_session: Optional[Dict[str, Any]] = None
         self._test2_timer = None
-        self.last_report: Dict[str, Any] = {}
-        self._test4_timer = None
-        self.test4_start_time = None
-        self.test4_bot_id = None
 
     def render(self):
         with ui.column().classes('w-full h-full p-2 md:p-4 gap-6 bg-[#0a0e17] text-white'):
@@ -132,106 +169,109 @@ class ReconciliationPage:
 
             ui.label('🧪 Modo Test — Validación antes de dinero real').classes('text-lg font-bold text-white mt-2')
             ui.label(
-                'Test 1 corre un ciclo completo de orden real en Testnet ahora mismo. Test 2 vigila '
-                'automáticamente un bot en vivo, conciliando cada cierto intervalo sin que tengas que '
-                'pulsar "Conciliar ahora" cada vez. Test 3 verifica, orden por orden, que se haya creado '
-                'en la app, enviado y ejecutado realmente en Binance, midiendo el deslizamiento de precio. '
-                'Test 4 marca un punto de partida y compara, orden por orden, todo el ciclo del bot desde '
-                'ese momento (Entrada, SL, TP, Salida) app vs Binance.'
+                'Test 1 envía una orden real a Testnet y verifica que se registró en la app, se envió, se '
+                'ejecutó en Binance y con qué deslizamiento de precio. Test 2 concilia en vivo todo lo que un '
+                'bot envía a Binance y genera —y guarda— el informe de conciliación con su confiabilidad.'
             ).classes('text-xs text-gray-400 -mt-1')
 
             with ui.row().classes('w-full gap-4 flex-wrap items-stretch'):
-                # ── Test 1: ciclo completo inmediato ──
+                # ── Test 1: verificación de una orden ──
+                with ui.card().classes('bg-[#111827] border border-[#1e293b] rounded-xl p-4 flex-1 min-w-[340px] gap-2'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('verified', color='violet-400', size='20px')
+                        ui.label('Test 1 — Verificación de una Orden').classes('text-base font-bold text-white')
+                    ui.label(
+                        'Envía una orden real a Testnet y confirma, paso a paso, que se registró en la app, que se '
+                        'envió a Binance y que Binance la ejecutó de verdad, midiendo el deslizamiento contra el '
+                        'precio de referencia tomado al enviarla. Termina con un veredicto: si se ejecutó de '
+                        'acuerdo al bot. Cierra la posición de prueba al final.'
+                    ).classes('text-xs text-gray-400')
+                    with ui.row().classes('gap-2 items-center flex-wrap'):
+                        self.verify_symbol_input = ui.input('Símbolo', value='BTC/USDT').classes('w-32')
+                        self.verify_qty_input = ui.number('Cantidad', value=0.001, step=0.001, format='%.3f').classes('w-28')
+                        self.verify_side_select = ui.select({'long': 'Long', 'short': 'Short'}, value='long').classes('w-24')
+                        self.verify_btn = ui.button('▶ Ejecutar Test 1', icon='fact_check', on_click=self._run_verify_async) \
+                            .classes('bg-violet-600 hover:bg-violet-500 text-white font-bold px-3 py-2 rounded-lg')
+                    self.verify_results_col = ui.column().classes('w-full gap-1 mt-2')
+
+                # ── Test 1b: ciclo completo con SL/TP ──
                 with ui.card().classes('bg-[#111827] border border-[#1e293b] rounded-xl p-4 flex-1 min-w-[340px] gap-2'):
                     with ui.row().classes('items-center gap-2'):
                         ui.icon('bolt', color='cyan-400', size='20px')
-                        ui.label('Test 1 — Ciclo Completo Inmediato').classes('text-base font-bold text-white')
+                        ui.label('Test 1b — Ciclo Completo Inmediato').classes('text-base font-bold text-white')
                     ui.label(
                         'Envía una orden real de prueba a Testnet (entrada + SL/TP condicional + cierre) usando '
                         'el mismo código que usan los bots, y la concilia al instante. Solo corre en Testnet.'
                     ).classes('text-xs text-gray-400')
                     with ui.row().classes('gap-2 items-center flex-wrap'):
-                        self.test1_symbol_input = ui.input('Símbolo', value='BTC/USDT').classes('w-32')
-                        self.test1_qty_input = ui.number('Cantidad', value=0.001, step=0.001, format='%.3f').classes('w-28')
-                        self.test1_btn = ui.button('▶ Ejecutar Test 1', icon='science', on_click=self._run_test1_async) \
+                        self.cycle_symbol_input = ui.input('Símbolo', value='BTC/USDT').classes('w-32')
+                        self.cycle_qty_input = ui.number('Cantidad', value=0.001, step=0.001, format='%.3f').classes('w-28')
+                        self.cycle_btn = ui.button('▶ Ejecutar Test 1b', icon='science', on_click=self._run_cycle_async) \
                             .classes('bg-cyan-600 hover:bg-cyan-500 text-white font-bold px-3 py-2 rounded-lg')
-                    self.test1_results_col = ui.column().classes('w-full gap-1 mt-2')
+                    self.cycle_results_col = ui.column().classes('w-full gap-1 mt-2')
 
-                # ── Test 2: monitoreo en vivo de un bot ──
+                # ── Test 2: sesión de conciliación en vivo de un bot ──
                 with ui.card().classes('bg-[#111827] border border-[#1e293b] rounded-xl p-4 flex-1 min-w-[340px] gap-2'):
                     with ui.row().classes('items-center gap-2'):
                         ui.icon('monitor_heart', color='emerald-400', size='20px')
-                        ui.label('Test 2 — Monitoreo en Vivo de un Bot').classes('text-base font-bold text-white')
+                        ui.label('Test 2 — Conciliación en Vivo de un Bot').classes('text-base font-bold text-white')
                     ui.label(
-                        'Selecciona un bot en Testnet ya corriendo: se concilia automáticamente cada '
-                        'cierto intervalo mientras opera en vivo, alertando discrepancias en tiempo real.'
+                        'Inicia una sesión sobre un bot de Testnet: concilia contra Binance, orden por orden, todo lo '
+                        'que el bot envía desde ese momento (Entrada, SL, TP, Salida) y calcula en vivo las '
+                        'estadísticas, los deslizamientos y la confiabilidad. El informe se guarda en la base de '
+                        'datos en cada ciclo para consultarlo después.'
                     ).classes('text-xs text-gray-400')
                     with ui.row().classes('gap-2 items-center flex-wrap'):
                         self.test2_bot_select = ui.select({}, label='Bot (Testnet)').classes('w-56')
-                        self.test2_interval_input = ui.number('Intervalo (s)', value=30, min=10, max=300).classes('w-28')
-                        self.test2_toggle_btn = ui.button('▶ Iniciar Monitoreo', icon='play_arrow', on_click=self._toggle_test2) \
+                        self.test2_interval_input = ui.number('Intervalo (s)', value=15, min=5, max=300).classes('w-28')
+                        self.test2_toggle_btn = ui.button('▶ Iniciar Sesión', icon='play_arrow', on_click=self._toggle_test2) \
                             .classes('bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-2 rounded-lg')
-                        # Detiene el monitoreo si está activo y limpia el log de Test 2 (no
-                        # borra nada de lo ya persistido en la BD, solo el panel en pantalla) —
-                        # para empezar una prueba nueva sin arrastrar líneas de la corrida anterior.
-                        ui.button('Reset', icon='restart_alt', on_click=self._reset_test2) \
-                            .classes('bg-slate-700 hover:bg-slate-600 text-white font-bold px-3 py-2 rounded-lg')
                     self.test2_status_label = ui.label('Inactivo').classes('text-xs text-gray-400 font-mono')
-                    self.test2_log_col = ui.column().classes('w-full gap-1 mt-2 max-h-64 overflow-y-auto')
 
-                # ── Test 3: verificación creación → envío → ejecución ──
-                with ui.card().classes('bg-[#111827] border border-[#1e293b] rounded-xl p-4 flex-1 min-w-[340px] gap-2'):
-                    with ui.row().classes('items-center gap-2'):
-                        ui.icon('verified', color='violet-400', size='20px')
-                        ui.label('Test 3 — Verificación Creación → Envío → Ejecución').classes('text-base font-bold text-white')
-                    ui.label(
-                        'Envía una orden real a Testnet y confirma, paso a paso, que quedó creada en el ledger '
-                        'de la app, que se envió a Binance y que Binance la ejecutó de verdad — midiendo además '
-                        'el deslizamiento de precio contra la referencia tomada al enviarla. Cierra la posición al final.'
-                    ).classes('text-xs text-gray-400')
-                    with ui.row().classes('gap-2 items-center flex-wrap'):
-                        self.test3_symbol_input = ui.input('Símbolo', value='BTC/USDT').classes('w-32')
-                        self.test3_qty_input = ui.number('Cantidad', value=0.001, step=0.001, format='%.3f').classes('w-28')
-                        self.test3_side_select = ui.select({'long': 'Long', 'short': 'Short'}, value='long').classes('w-24')
-                        self.test3_btn = ui.button('▶ Ejecutar Test 3', icon='fact_check', on_click=self._run_test3_async) \
-                            .classes('bg-violet-600 hover:bg-violet-500 text-white font-bold px-3 py-2 rounded-lg')
-                    self.test3_results_col = ui.column().classes('w-full gap-1 mt-2')
-
-                # ── Test 4: comparación de ciclo completo desde el inicio del test ──
-                with ui.card().classes('bg-[#111827] border border-[#1e293b] rounded-xl p-4 flex-1 min-w-[340px] gap-2'):
-                    with ui.row().classes('items-center gap-2'):
-                        ui.icon('compare_arrows', color='violet-400', size='20px')
-                        ui.label('Test 4 — Comparación de Ciclo Completo').classes('text-base font-bold text-white')
-                    ui.label(
-                        'Marca el inicio del test y compara en vivo, orden por orden, TODO lo que el bot vaya '
-                        'enviando desde ese momento — Entrada, Take Profit, Stop Loss, Salida — contra lo que '
-                        'Binance realmente ejecutó para cada una.'
-                    ).classes('text-xs text-gray-400')
-                    with ui.row().classes('gap-2 items-center flex-wrap'):
-                        self.test4_bot_select = ui.select({}, label='Bot (Testnet)').classes('w-56')
-                        self.test4_interval_input = ui.number('Intervalo (s)', value=15, min=5, max=300).classes('w-28')
-                        self.test4_toggle_btn = ui.button('▶ Iniciar Test', icon='play_arrow', on_click=self._toggle_test4) \
-                            .classes('bg-violet-600 hover:bg-violet-500 text-white font-bold px-3 py-2 rounded-lg')
-                        ui.button('Reset', icon='restart_alt', on_click=self._reset_test4) \
-                            .classes('bg-slate-700 hover:bg-slate-600 text-white font-bold px-3 py-2 rounded-lg')
-                    self.test4_status_label = ui.label('Inactivo').classes('text-xs text-gray-400 font-mono')
-
-            ui.label('Test 4 — Ciclo completo comparado (Entrada / SL / TP / Salida)').classes('text-lg font-bold text-white mt-2')
-            self.test4_table = ui.table(
-                columns=TEST4_COLUMNS, rows=[], row_key='app_order_ref', pagination={'rowsPerPage': 10}
+            # ── Test 2: estadística en vivo de la sesión ──
+            ui.label('Test 2 — Informe en vivo de la sesión').classes('text-lg font-bold text-white mt-2')
+            with ui.row().classes('w-full gap-4 flex-wrap') as self.test2_cards_row:
+                self._render_session_cards(self.test2_cards_row, {})
+            self.test2_table = ui.table(
+                columns=ORDER_COLUMNS, rows=[], row_key='app_order_ref', pagination={'rowsPerPage': 10}
             ).classes('w-full')
+            self.test2_table.add_slot('body-cell-severity', SEVERITY_SLOT)
 
             ui.label('Resultados de la última conciliación').classes('text-lg font-bold text-white mt-2')
             self.results_table = ui.table(
                 columns=RESULT_COLUMNS, rows=[], row_key='binance_order_id', pagination={'rowsPerPage': 10}
             ).classes('w-full')
-            self.results_table.add_slot('body-cell-severity', '''
+            self.results_table.add_slot('body-cell-severity', SEVERITY_SLOT)
+
+            # ── Historial de informes de conciliación (Test 2) ──
+            with ui.row().classes('w-full justify-between items-center mt-4 flex-wrap gap-2'):
+                with ui.column().classes('gap-0.5'):
+                    ui.label('🛡️ Informes de Conciliación (Test 2)').classes('text-lg font-bold text-white')
+                    ui.label(
+                        'Cada sesión de Test 2 queda guardada. Haz clic en una fila para ver su informe completo: '
+                        'estadísticas, deslizamientos, confiabilidad y el detalle de cada orden.'
+                    ).classes('text-xs text-gray-400')
+                ui.button('Actualizar', icon='refresh', on_click=self._refresh_sessions_async) \
+                    .classes('bg-indigo-600 hover:bg-indigo-500 text-white font-bold px-4 py-2 rounded-xl')
+            self.sessions_table = ui.table(
+                columns=SESSION_COLUMNS, rows=[], row_key='session_id', pagination={'rowsPerPage': 10}
+            ).classes('w-full cursor-pointer')
+            self.sessions_table.on('rowClick', self._on_session_click)
+            self.sessions_table.add_slot('body-cell-status', '''
                 <q-td :props="props">
-                    <q-badge :color="props.value === 'CRITICAL' ? 'red' : (props.value === 'WARNING' ? 'amber' : 'green')">
+                    <q-badge :color="props.value === 'FINISHED' ? 'green' : (props.value === 'RUNNING' ? 'blue' : 'grey')">
                         {{ props.value }}
                     </q-badge>
                 </q-td>
             ''')
+
+            self.detail_title = ui.label('Selecciona una sesión para ver su informe.').classes('text-sm text-gray-400')
+            with ui.row().classes('w-full gap-4 flex-wrap') as self.detail_cards_row:
+                pass
+            self.detail_table = ui.table(
+                columns=ORDER_COLUMNS, rows=[], row_key='app_order_ref', pagination={'rowsPerPage': 10}
+            ).classes('w-full')
+            self.detail_table.add_slot('body-cell-severity', SEVERITY_SLOT)
 
             ui.label('Historial de conciliaciones (persistido)').classes('text-lg font-bold text-white mt-4')
             self.history_table = ui.table(
@@ -243,47 +283,19 @@ class ReconciliationPage:
                 columns=LEDGER_COLUMNS, rows=[], row_key='id', pagination={'rowsPerPage': 15}
             ).classes('w-full')
 
-            # ── Informe de Confiabilidad del Bot (Reporte de Tests 1/2/3) ─
-            with ui.row().classes('w-full justify-between items-center mt-6 flex-wrap gap-2'):
-                with ui.column().classes('gap-0.5'):
-                    ui.label('🛡️ Informe de Confiabilidad del Bot').classes('text-lg font-bold text-white')
-                    ui.label(
-                        'Resultado de Test 1/2/3: cuántas órdenes se crearon en la app, se enviaron y se '
-                        'ejecutaron realmente en Binance, y cuántas quedaron conciliadas en cantidad y precio '
-                        'con deslizamiento menor al umbral — con el detalle completo por orden (activo, '
-                        'long/short, cantidad, precio, % de deslizamiento) para evaluar qué tan segura es la '
-                        'ejecución del bot.'
-                    ).classes('text-xs text-gray-400')
-                with ui.row().classes('gap-2 items-center'):
-                    self.report_hours_input = ui.number('Horas atrás', value=24, min=1, max=720).classes('w-24')
-                    self.report_btn = ui.button('Ver Informe de Confiabilidad', icon='summarize', on_click=self._load_test_report_async) \
-                        .classes('bg-indigo-600 hover:bg-indigo-500 text-white font-bold px-4 py-2 rounded-xl')
-
-            with ui.row().classes('w-full gap-4 flex-wrap') as self.report_summary_row:
-                self._render_report_summary_cards({})
-
-            self.report_table = ui.table(
-                columns=REPORT_COLUMNS, rows=[], row_key='binance_order_id', pagination={'rowsPerPage': 15}
-            ).classes('w-full')
-            self.report_table.add_slot('body-cell-severity', '''
-                <q-td :props="props">
-                    <q-badge :color="props.value === 'CRITICAL' ? 'red' : (props.value === 'WARNING' ? 'amber' : 'green')">
-                        {{ props.value }}
-                    </q-badge>
-                </q-td>
-            ''')
-            self.report_table.add_slot('body-cell-position_side', '''
-                <q-td :props="props">
-                    <q-badge :color="props.value === 'LONG' ? 'emerald' : (props.value === 'SHORT' ? 'red' : 'grey')">
-                        {{ props.value || '-' }}
-                    </q-badge>
-                </q-td>
-            ''')
-
         ui.timer(0.5, self._load_persisted_data_async, once=True)
-        ui.timer(0.5, self._refresh_test2_bot_options, once=True)
+        ui.timer(0.5, self._refresh_bot_options, once=True)
+        ui.timer(0.5, self._refresh_sessions_async, once=True)
 
     # ── Helpers de UI ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _stat_card(label: str, value: Any, icon: str, color: str, min_width: int = 150):
+        with ui.column().classes(f'bg-[#111827] border border-[#1e293b] rounded-xl px-4 py-3 min-w-[{min_width}px] gap-1'):
+            with ui.row().classes('items-center gap-2'):
+                ui.icon(icon, size='18px', color=color)
+                ui.label(label).classes('text-xs text-gray-400 font-semibold uppercase tracking-wide')
+            ui.label(str(value)).classes(f'text-2xl font-extrabold text-{color} font-mono')
 
     def _render_summary_cards(self, summary: Dict[str, Any]):
         self.summary_row.clear()
@@ -296,59 +308,38 @@ class ReconciliationPage:
                 ("Huérfanas en Binance", summary.get("summary", {}).get("ORPHAN_ON_BINANCE", "-"), "report", "amber-400"),
             ]
             for label, value, icon, color in cards:
-                with ui.column().classes('bg-[#111827] border border-[#1e293b] rounded-xl px-4 py-3 min-w-[160px] gap-1'):
-                    with ui.row().classes('items-center gap-2'):
-                        ui.icon(icon, size='18px', color=color)
-                        ui.label(label).classes('text-xs text-gray-400 font-semibold uppercase tracking-wide')
-                    ui.label(str(value)).classes(f'text-2xl font-extrabold text-{color} font-mono')
+                self._stat_card(label, value, icon, color, min_width=160)
 
-    def _render_report_summary_cards(self, report: Dict[str, Any]):
-        self.report_summary_row.clear()
-        with self.report_summary_row:
+    @staticmethod
+    def _render_session_cards(row, report: Dict[str, Any]):
+        """Tarjetas de estadística de una sesión de conciliación (en vivo o consultada del historial)."""
+        row.clear()
+        with row:
+            tolerance = report.get('slippage_tolerance_pct')
+            slip_max = report.get('slippage_max_pct')
+            slip_max_color = 'red-400' if (slip_max is not None and tolerance is not None and slip_max > tolerance) else 'emerald-400'
+            long_short = f"{report.get('long_count', 0)} / {report.get('short_count', 0)}" if report else "-"
+
+            ReconciliationPage._stat_card("Órdenes", report.get("total_orders", "-"), "receipt_long", "cyan-400")
+            ReconciliationPage._stat_card("Creadas en la app", report.get("created_count", "-"), "note_add", "cyan-400", 170)
+            ReconciliationPage._stat_card("Enviadas a Binance", report.get("sent_count", "-"), "send", "sky-400", 170)
+            ReconciliationPage._stat_card("Ejecutadas en Binance", report.get("executed_count", "-"), "bolt", "violet-400", 190)
+            ReconciliationPage._stat_card("Conciliadas OK", report.get("effective_count", "-"), "verified", "emerald-400", 170)
+            ReconciliationPage._stat_card("Fallidas", report.get("failed_count", "-"), "cancel", "red-400")
+            ReconciliationPage._stat_card("Desliz. promedio", _fmt_pct(report.get("slippage_avg_pct"), 4), "trending_flat", "amber-400", 170)
+            ReconciliationPage._stat_card("Desliz. máximo", _fmt_pct(slip_max, 4), "trending_up", slip_max_color, 170)
+            ReconciliationPage._stat_card("Desliz. p95", _fmt_pct(report.get("slippage_p95_pct"), 4), "show_chart", "amber-400", 170)
+            ReconciliationPage._stat_card("Long / Short", long_short, "swap_vert", "sky-400")
+
             reliability_pct = report.get("reliability_pct")
             reliability_label = report.get("reliability_label", "Sin datos")
-            reliability_color = {
-                "Alta": "emerald-400", "Media": "amber-400", "Baja": "red-400", "Sin datos": "gray-400",
-            }.get(reliability_label, "gray-400")
-            reliability_value = f"{reliability_pct:.1f}% ({reliability_label})" if reliability_pct is not None else "-"
-
-            # Embudo: creada en la app → enviada a Binance → ejecutada en Binance → confiable.
-            funnel_cards = [
-                ("Órdenes creadas en la app", report.get("created_in_app_count", "-"), "note_add", "cyan-400"),
-                ("Enviadas a Binance", report.get("sent_to_binance_count", "-"), "send", "sky-400"),
-                ("Ejecutadas en Binance", report.get("executed_in_binance_count", "-"), "bolt", "violet-400"),
-                (
-                    f"Confiables (deslizamiento < {report.get('slippage_tolerance_pct', 0.05)}%)",
-                    report.get("effective_count", "-"), "verified", "emerald-400",
-                ),
-            ]
-            for label, value, icon, color in funnel_cards:
-                with ui.column().classes('bg-[#111827] border border-[#1e293b] rounded-xl px-4 py-3 min-w-[190px] gap-1'):
-                    with ui.row().classes('items-center gap-2'):
-                        ui.icon(icon, size='18px', color=color)
-                        ui.label(label).classes('text-xs text-gray-400 font-semibold uppercase tracking-wide')
-                    ui.label(str(value)).classes(f'text-2xl font-extrabold text-{color} font-mono')
-
-            other_cards = [
-                ("Fallidas", report.get("failed_count", "-"), "cancel", "red-400"),
-                ("Fallos por deslizamiento", report.get("slippage_failed_count", "-"), "trending_down", "amber-400"),
-                ("Long", report.get("long_count", "-"), "trending_up", "emerald-400"),
-                ("Short", report.get("short_count", "-"), "trending_down", "red-400"),
-            ]
-            for label, value, icon, color in other_cards:
-                with ui.column().classes('bg-[#111827] border border-[#1e293b] rounded-xl px-4 py-3 min-w-[150px] gap-1'):
-                    with ui.row().classes('items-center gap-2'):
-                        ui.icon(icon, size='18px', color=color)
-                        ui.label(label).classes('text-xs text-gray-400 font-semibold uppercase tracking-wide')
-                    ui.label(str(value)).classes(f'text-2xl font-extrabold text-{color} font-mono')
-
-            with ui.column().classes(
-                f'bg-[#111827] border-2 border-{reliability_color} rounded-xl px-4 py-3 min-w-[220px] gap-1'
-            ):
+            color = RELIABILITY_COLOR.get(reliability_label, "gray-400")
+            value = f"{reliability_pct:.1f}% ({reliability_label})" if reliability_pct is not None else "-"
+            with ui.column().classes(f'bg-[#111827] border-2 border-{color} rounded-xl px-4 py-3 min-w-[220px] gap-1'):
                 with ui.row().classes('items-center gap-2'):
-                    ui.icon('shield', size='18px', color=reliability_color)
+                    ui.icon('shield', size='18px', color=color)
                     ui.label('Confiabilidad del bot').classes('text-xs text-gray-400 font-semibold uppercase tracking-wide')
-                ui.label(reliability_value).classes(f'text-2xl font-extrabold text-{reliability_color} font-mono')
+                ui.label(value).classes(f'text-2xl font-extrabold text-{color} font-mono')
 
     def _switch_network(self, use_testnet: bool):
         self.use_testnet = use_testnet
@@ -434,7 +425,7 @@ class ReconciliationPage:
         self.history_table.rows = [
             {
                 "id": r.id,
-                "run_at": r.run_at.strftime('%d/%m %H:%M:%S') if r.run_at else '-',
+                "run_at": _fmt_dt(r.run_at),
                 "symbol": r.symbol,
                 "match_status": r.match_status,
                 "severity": r.severity,
@@ -448,8 +439,9 @@ class ReconciliationPage:
         self.ledger_table.rows = [
             {
                 "id": r.id,
-                "created_at": r.created_at.strftime('%d/%m %H:%M:%S') if r.created_at else '-',
+                "created_at": _fmt_dt(r.created_at),
                 "symbol": r.symbol,
+                "bot_id": r.bot_id or '-',
                 "side": r.side,
                 "action": r.action,
                 "status": r.status,
@@ -460,26 +452,92 @@ class ReconciliationPage:
         ]
         self.ledger_table.update()
 
-    # ── Modo Test 1: ciclo completo inmediato ───────────────────────────
-
-    async def _run_test1_async(self):
-        self.test1_btn.props('loading')
-        self.test1_results_col.clear()
+    async def _refresh_bot_options(self):
+        """Alimenta el selector de bot de Test 2 (bots de Testnet)."""
+        loop = asyncio.get_event_loop()
         try:
-            symbol = (self.test1_symbol_input.value or 'BTC/USDT').strip()
-            qty = float(self.test1_qty_input.value or 0.001)
+            bots = await loop.run_in_executor(None, bot_manager.get_all_bots)
+        except Exception as e:
+            logger.debug("No se pudo listar bots para Test 2: %s", e)
+            return
+        self.test2_bot_select.options = {
+            b.bot_id: f"{b.name} ({b.symbol}) {'🟡 Testnet' if b.use_testnet else '🌐 Real'}"
+            for b in bots if getattr(b, 'use_testnet', True)
+        }
+        self.test2_bot_select.update()
+
+    # ── Test 1: verificación de una orden ────────────────────────────────
+
+    async def _run_verify_async(self):
+        self.verify_btn.props('loading')
+        self.verify_results_col.clear()
+        try:
+            symbol = (self.verify_symbol_input.value or 'BTC/USDT').strip()
+            qty = float(self.verify_qty_input.value or 0.001)
+            side = self.verify_side_select.value or 'long'
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: OrderReconciler(use_testnet=True).run_execution_verification_test(
+                    symbol=symbol, quantity=qty, side=side
+                )
+            )
+
+            verdict = result.get('verdict') or {}
+            executed_as_bot = bool(verdict.get('executed_as_bot'))
+            with self.verify_results_col:
+                if result.get('error'):
+                    ui.label(result['error']).classes('text-xs text-red-400')
+                for s in result.get('steps', []):
+                    ok = bool(s.get('ok'))
+                    color = 'emerald-400' if ok else 'red-400'
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('check_circle' if ok else 'cancel', color=color, size='16px')
+                        ui.label(f"{s.get('step')}: {s.get('detail')}").classes(f'text-xs text-{color}')
+                orders = result.get('orders', [])
+                if orders:
+                    table = ui.table(
+                        columns=ORDER_COLUMNS, rows=_order_rows(orders), row_key='app_order_ref'
+                    ).classes('w-full mt-2').props('dense')
+                    table.add_slot('body-cell-severity', SEVERITY_SLOT)
+                color = 'emerald-400' if executed_as_bot else 'red-400'
+                with ui.column().classes(f'w-full border-2 border-{color} rounded-lg px-3 py-2 mt-2 gap-0.5'):
+                    ui.label(
+                        '✅ Se ejecutó de acuerdo al bot' if executed_as_bot else '🚨 NO se ejecutó de acuerdo al bot'
+                    ).classes(f'text-sm font-extrabold text-{color}')
+                    ui.label(verdict.get('reason', '')).classes('text-xs text-gray-300')
+
+            if executed_as_bot:
+                ui.notify('✅ Test 1: la orden se creó, se envió y se ejecutó según el bot.', type='positive', duration=6000)
+            else:
+                ui.notify('⚠️ Test 1: la ejecución no coincide con lo pedido — revisa el detalle en la tarjeta.', type='negative', duration=8000)
+
+            await self._load_persisted_data_async()
+        except Exception as e:
+            logger.error("Error ejecutando Test 1: %s", e)
+            ui.notify(f"Error ejecutando Test 1: {e}", type='negative', duration=8000)
+        finally:
+            self.verify_btn.props(remove='loading')
+
+    # ── Test 1b: ciclo completo inmediato (entrada + SL/TP + cierre) ─────
+
+    async def _run_cycle_async(self):
+        self.cycle_btn.props('loading')
+        self.cycle_results_col.clear()
+        try:
+            symbol = (self.cycle_symbol_input.value or 'BTC/USDT').strip()
+            qty = float(self.cycle_qty_input.value or 0.001)
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
                 None, lambda: OrderReconciler(use_testnet=True).run_full_cycle_test(symbol=symbol, quantity=qty)
             )
 
-            with self.test1_results_col:
+            with self.cycle_results_col:
                 for s in result.get('steps', []):
                     ok = bool(s.get('ok'))
-                    icon = 'check_circle' if ok else 'cancel'
                     color = 'emerald-400' if ok else 'red-400'
                     with ui.row().classes('items-center gap-2'):
-                        ui.icon(icon, color=color, size='16px')
+                        ui.icon('check_circle' if ok else 'cancel', color=color, size='16px')
                         ui.label(f"{s.get('step')}: {s.get('detail')}").classes(f'text-xs text-{color}')
                 recon = result.get('reconciliation', [])
                 if recon:
@@ -489,88 +547,30 @@ class ReconciliationPage:
                     ).classes('text-xs text-gray-400 mt-1')
 
             if result.get('success'):
-                ui.notify('✅ Test 1 completado con éxito: ciclo completo validado en Testnet.', type='positive', duration=6000)
+                ui.notify('✅ Test 1b completado con éxito: ciclo completo validado en Testnet.', type='positive', duration=6000)
             else:
-                ui.notify('⚠️ Test 1 encontró fallos — revisa el detalle en la tarjeta.', type='negative', duration=8000)
+                ui.notify('⚠️ Test 1b encontró fallos — revisa el detalle en la tarjeta.', type='negative', duration=8000)
 
             await self._load_persisted_data_async()
         except Exception as e:
-            logger.error("Error ejecutando Test 1: %s", e)
-            ui.notify(f"Error ejecutando Test 1: {e}", type='negative', duration=8000)
+            logger.error("Error ejecutando Test 1b: %s", e)
+            ui.notify(f"Error ejecutando Test 1b: {e}", type='negative', duration=8000)
         finally:
-            self.test1_btn.props(remove='loading')
+            self.cycle_btn.props(remove='loading')
 
-    # ── Modo Test 3: verificación creación → envío → ejecución ──────────
+    # ── Test 2: sesión de conciliación en vivo de un bot ─────────────────
 
-    async def _run_test3_async(self):
-        self.test3_btn.props('loading')
-        self.test3_results_col.clear()
-        try:
-            symbol = (self.test3_symbol_input.value or 'BTC/USDT').strip()
-            qty = float(self.test3_qty_input.value or 0.001)
-            side = self.test3_side_select.value or 'long'
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: OrderReconciler(use_testnet=True).run_execution_verification_test(
-                    symbol=symbol, quantity=qty, side=side
-                )
-            )
-
-            with self.test3_results_col:
-                for s in result.get('steps', []):
-                    ok = bool(s.get('ok'))
-                    icon = 'check_circle' if ok else 'cancel'
-                    color = 'emerald-400' if ok else 'red-400'
-                    with ui.row().classes('items-center gap-2'):
-                        ui.icon(icon, color=color, size='16px')
-                        ui.label(f"{s.get('step')}: {s.get('detail')}").classes(f'text-xs text-{color}')
-                for o in result.get('orders', []):
-                    slip = o.get('slippage_pct')
-                    slip_txt = f", deslizamiento {slip:.3f}%" if slip is not None else ""
-                    ui.label(
-                        f"{o.get('symbol')} {o.get('position_side') or ''} {o.get('order_type') or ''} — "
-                        f"{o.get('match_status')}: cant. {o.get('executed_qty')} @ {o.get('avg_price')}{slip_txt}"
-                    ).classes('text-xs text-gray-400 mt-1')
-
-            if result.get('success'):
-                ui.notify('✅ Test 3 completado: orden creada, enviada y ejecutada en Binance sin discrepancias.', type='positive', duration=6000)
-            else:
-                ui.notify('⚠️ Test 3 encontró fallos — revisa el detalle en la tarjeta.', type='negative', duration=8000)
-
-            await self._load_persisted_data_async()
-        except Exception as e:
-            logger.error("Error ejecutando Test 3: %s", e)
-            ui.notify(f"Error ejecutando Test 3: {e}", type='negative', duration=8000)
-        finally:
-            self.test3_btn.props(remove='loading')
-
-    # ── Modo Test 2: monitoreo en vivo de un bot ────────────────────────
-
-    async def _refresh_test2_bot_options(self):
-        """Alimenta los selectores de bot de Test 2 y Test 4 (misma lista: bots de Testnet)."""
-        loop = asyncio.get_event_loop()
-        try:
-            bots = await loop.run_in_executor(None, bot_manager.get_all_bots)
-        except Exception as e:
-            logger.debug("No se pudo listar bots para Test 2/3: %s", e)
-            return
-        options = {
-            b.bot_id: f"{b.name} ({b.symbol}) {'🟡 Testnet' if b.use_testnet else '🌐 Real'}"
-            for b in bots if getattr(b, 'use_testnet', True)
-        }
-        self.test2_bot_select.options = options
-        self.test2_bot_select.update()
-        self.test4_bot_select.options = options
-        self.test4_bot_select.update()
+    def _set_test2_button(self, running: bool):
+        if running:
+            self.test2_toggle_btn.set_text('⏹ Detener Sesión')
+            self.test2_toggle_btn.classes(replace='bg-red-600 hover:bg-red-500 text-white font-bold px-3 py-2 rounded-lg')
+        else:
+            self.test2_toggle_btn.set_text('▶ Iniciar Sesión')
+            self.test2_toggle_btn.classes(replace='bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-2 rounded-lg')
 
     def _toggle_test2(self):
-        if self._test2_timer is not None:
-            self._test2_timer.deactivate()
-            self._test2_timer = None
-            self.test2_toggle_btn.set_text('▶ Iniciar Monitoreo')
-            self.test2_toggle_btn.classes(replace='bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-2 rounded-lg')
-            self.test2_status_label.set_text('Inactivo')
+        if self.test2_session is not None:
+            asyncio.create_task(self._stop_test2())
             return
 
         bot_id = self.test2_bot_select.value
@@ -578,281 +578,182 @@ class ReconciliationPage:
             ui.notify('Selecciona un bot de Testnet primero.', type='warning')
             return
 
-        interval = max(10.0, float(self.test2_interval_input.value or 30))
+        # Ancla de la sesión: solo se concilia lo que ESTE bot envíe a Binance a partir de este
+        # instante (naive UTC, igual que `created_at` en el ledger), no todo su historial.
+        started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        self.test2_session = {
+            "session_id": str(uuid.uuid4()),
+            "bot_id": bot_id,
+            "bot_name": None,
+            "symbol": None,
+            "started_at": started_at,
+            "busy": False,
+        }
+        self.test2_table.rows = []
+        self.test2_table.update()
+        self._render_session_cards(self.test2_cards_row, {})
 
-        async def _tick():
-            await self._run_test2_tick(bot_id)
+        interval = max(5.0, float(self.test2_interval_input.value or 15))
+        self._test2_timer = ui.timer(interval, self._run_test2_tick)
+        self._set_test2_button(True)
+        self.test2_status_label.set_text(
+            f"Sesión iniciada a las {started_at.strftime('%H:%M:%S')} UTC. Esperando órdenes del bot..."
+        )
+        asyncio.create_task(self._run_test2_tick())
 
-        self._test2_timer = ui.timer(interval, _tick)
-        self.test2_toggle_btn.set_text('⏹ Detener Monitoreo')
-        self.test2_toggle_btn.classes(replace='bg-red-600 hover:bg-red-500 text-white font-bold px-3 py-2 rounded-lg')
-        self.test2_status_label.set_text('Monitoreando... (primera pasada en curso)')
-        asyncio.create_task(_tick())
-
-    async def _run_test2_tick(self, bot_id: str):
+    async def _build_and_render_test2(self, finished: bool) -> Optional[Dict[str, Any]]:
+        """Concilia la sesión, guarda el informe en BD (en curso o finalizado) y refresca la pantalla."""
+        session = self.test2_session
         loop = asyncio.get_event_loop()
-        try:
-            bots = await loop.run_in_executor(None, bot_manager.get_all_bots)
-        except Exception as e:
-            self._append_test2_log(f"⚠️ No se pudo listar bots: {e}", critical=True)
-            return
-
-        bot = next((b for b in bots if b.bot_id == bot_id), None)
-        if not bot:
-            self.test2_status_label.set_text('⚠️ El bot seleccionado ya no existe.')
-            self._toggle_test2()  # detiene el monitoreo automáticamente
-            return
-
-        if not bot.is_running:
-            self.test2_status_label.set_text(f"⏸ {bot.name} no está corriendo — esperando a que arranque...")
-            return
-
-        try:
-            result = await loop.run_in_executor(
-                None,
-                lambda: OrderReconciler(use_testnet=True).run(
-                    symbols=[bot.symbol.replace('/', '').upper()], lookback_hours=2.0
-                )
+        report = await loop.run_in_executor(
+            None,
+            lambda: OrderReconciler(use_testnet=True, notify=False).build_session_report(
+                session_id=session["session_id"],
+                bot_id=session["bot_id"],
+                bot_name=session["bot_name"],
+                symbol=session["symbol"],
+                started_at=session["started_at"],
             )
-        except Exception as e:
-            self._append_test2_log(f"⚠️ Error conciliando {bot.name}: {e}", critical=True)
+        )
+        # Un ciclo en curso que termina DESPUÉS de detener la sesión no debe volver a guardarla
+        # como RUNNING encima del informe ya marcado FINISHED.
+        if finished or self.test2_session is session:
+            saved = await loop.run_in_executor(None, lambda: save_session_report(report, finished=finished))
+            if not saved:
+                ui.notify('⚠️ No se pudo guardar el informe de la sesión en la base de datos.', type='warning')
+
+        self._render_session_cards(self.test2_cards_row, report)
+        self.test2_table.rows = _order_rows(report['orders'])
+        self.test2_table.update()
+        await self._refresh_sessions_async()
+        return report
+
+    async def _run_test2_tick(self):
+        session = self.test2_session
+        if session is None or session["busy"]:
             return
+        session["busy"] = True
+        try:
+            loop = asyncio.get_event_loop()
+            try:
+                bots = await loop.run_in_executor(None, bot_manager.get_all_bots)
+            except Exception as e:
+                self.test2_status_label.set_text(f'⚠️ No se pudo listar bots: {e}')
+                return
 
-        critical = result.get('critical_count', 0)
-        checked = result.get('total_checked', 0)
-        if critical:
-            self.test2_status_label.set_text(f"🚨 {bot.name}: {critical} discrepancia(s) crítica(s) detectada(s)")
-            self._append_test2_log(f"🚨 {bot.name}: {critical} crítica(s) de {checked} revisadas", critical=True)
-        else:
-            self.test2_status_label.set_text(f"✅ {bot.name}: OK ({checked} orden(es) revisadas)")
-            self._append_test2_log(f"✅ {bot.name}: sin discrepancias ({checked} revisadas)", critical=False)
+            bot = next((b for b in bots if b.bot_id == session["bot_id"]), None)
+            if not bot:
+                self.test2_status_label.set_text('⚠️ El bot seleccionado ya no existe: sesión finalizada.')
+                await self._stop_test2()
+                return
+            session["bot_name"] = bot.name
+            session["symbol"] = bot.symbol.replace('/', '').upper()
 
-        await self._load_persisted_data_async()
+            try:
+                report = await self._build_and_render_test2(finished=False)
+            except Exception as e:
+                logger.error("Error conciliando la sesión de Test 2: %s", e)
+                self.test2_status_label.set_text(f'⚠️ Error conciliando {bot.name}: {e}')
+                return
 
-    def _reset_test2(self):
-        """Detiene el monitoreo de Test 2 si está corriendo y limpia el log/estado en
-        pantalla, para arrancar una prueba nueva desde cero sin arrastrar líneas de la
-        corrida anterior. No borra nada de lo ya persistido en reconciliation_log/
-        app_order_ledger (eso se ve en las tablas de historial más abajo)."""
+            if not self.test2_session:  # se detuvo mientras se conciliaba
+                return
+            since = session["started_at"].strftime('%H:%M:%S')
+            total = report["total_orders"]
+            if not total:
+                estado = 'corriendo' if bot.is_running else 'detenido'
+                self.test2_status_label.set_text(
+                    f"Monitoreando {bot.name} ({estado}) desde las {since} UTC — aún no envió ninguna orden."
+                )
+            else:
+                pct = report["reliability_pct"]
+                self.test2_status_label.set_text(
+                    f"{'✅' if not report['failed_count'] else '🚨'} {bot.name}: {total} orden(es), "
+                    f"{report['failed_count']} con discrepancia — confiabilidad {pct:.1f}% ({report['reliability_label']}). "
+                    f"Sesión desde las {since} UTC."
+                )
+        finally:
+            session["busy"] = False
+
+    async def _stop_test2(self):
+        """Detiene la sesión: hace una última conciliación y deja el informe guardado como FINISHED."""
+        session = self.test2_session
+        if session is None or session.get("stopping"):
+            return
+        session["stopping"] = True
         if self._test2_timer is not None:
             self._test2_timer.deactivate()
             self._test2_timer = None
-            self.test2_toggle_btn.set_text('▶ Iniciar Monitoreo')
-            self.test2_toggle_btn.classes(replace='bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-2 rounded-lg')
+        self._set_test2_button(False)
 
-        self._test2_log_entries = []
-        self.test2_log_col.clear()
-        self.test2_status_label.set_text('Inactivo')
-        ui.notify('Test 2 reseteado.', type='info')
+        report = None
+        if session["symbol"] is not None:  # si nunca llegó a correr un ciclo no hay nada que guardar
+            try:
+                report = await self._build_and_render_test2(finished=True)
+            except Exception as e:
+                logger.error("Error finalizando la sesión de Test 2: %s", e)
+                ui.notify(f"Error guardando el informe final: {e}", type='negative')
+        self.test2_session = None
 
-    def _append_test2_log(self, text: str, critical: bool):
-        ts = datetime.now().strftime('%H:%M:%S')
-        entries = getattr(self, '_test2_log_entries', None)
-        if entries is None:
-            entries = self._test2_log_entries = []
-        entries.append((ts, text, critical))
-        # Limitar el log a las últimas 30 líneas para no crecer indefinidamente en sesiones largas
-        del entries[:-30]
-
-        self.test2_log_col.clear()
-        with self.test2_log_col:
-            for e_ts, e_text, e_critical in reversed(entries):
-                color = 'red-400' if e_critical else 'emerald-400'
-                ui.label(f"[{e_ts}] {e_text}").classes(f'text-xs font-mono text-{color}')
-
-    # ── Reporte de Tests ─────────────────────────────────────────────────
-
-    async def _load_test_report_async(self):
-        self.report_btn.props('loading')
-        try:
-            hours = float(self.report_hours_input.value or 24)
-            use_testnet = self.use_testnet
-            loop = asyncio.get_event_loop()
-            report = await loop.run_in_executor(
-                None, lambda: OrderReconciler(use_testnet=use_testnet, notify=False).build_test_report(lookback_hours=hours)
+        if report is not None:
+            pct = report["reliability_pct"]
+            self.test2_status_label.set_text(
+                f"Sesión finalizada — {report['total_orders']} orden(es), confiabilidad "
+                f"{f'{pct:.1f}%' if pct is not None else 'sin datos'} ({report['reliability_label']}). "
+                f"Informe guardado."
             )
-            self.last_report = report
-            self._render_report_summary_cards(report)
+            ui.notify('Sesión finalizada: el informe quedó guardado en la base de datos.', type='positive')
+        else:
+            self.test2_status_label.set_text('Inactivo')
 
-            self.report_table.rows = report.get('orders', [])
-            self.report_table.update()
+    # ── Historial de informes de sesión ──────────────────────────────────
 
-            rel_pct = report.get('reliability_pct')
-            rel_txt = f"{rel_pct:.1f}% ({report.get('reliability_label')})" if rel_pct is not None else "sin datos"
-            ui.notify(
-                f"Confiabilidad del bot: {rel_txt} — {report.get('created_in_app_count', 0)} creada(s) en la app, "
-                f"{report.get('sent_to_binance_count', 0)} enviada(s), {report.get('executed_in_binance_count', 0)} "
-                f"ejecutada(s) en Binance, {report.get('effective_count', 0)} confiable(s) de "
-                f"{report.get('total_checked', 0)} ({report.get('slippage_failed_count', 0)} por deslizamiento).",
-                type='positive' if not report.get('failed_count') else 'warning', duration=8000
-            )
-        except Exception as e:
-            logger.error("Error generando el Reporte de Tests: %s", e)
-            ui.notify(f"Error generando el Reporte de Tests: {e}", type='negative', duration=8000)
-        finally:
-            self.report_btn.props(remove='loading')
-
-    # ── Modo Test 4: comparación de ciclo completo desde el inicio del test ─────
-
-    def _toggle_test4(self):
-        if self._test4_timer is not None:
-            self._test4_timer.deactivate()
-            self._test4_timer = None
-            self.test4_toggle_btn.set_text('▶ Iniciar Test')
-            self.test4_toggle_btn.classes(replace='bg-violet-600 hover:bg-violet-500 text-white font-bold px-3 py-2 rounded-lg')
-            self.test4_status_label.set_text('Detenido.')
-            return
-
-        bot_id = self.test4_bot_select.value
-        if not bot_id:
-            ui.notify('Selecciona un bot de Testnet primero.', type='warning')
-            return
-
-        # Ancla del test: solo se compara lo que el bot envíe a Binance A PARTIR de este
-        # instante, no todo su historial — así una corrida anterior (o discrepancias ya
-        # resueltas) no ensucian la comparación de esta prueba.
-        self.test4_start_time = datetime.now(timezone.utc)
-        self.test4_bot_id = bot_id
-        self.test4_table.rows = []
-        self.test4_table.update()
-
-        interval = max(5.0, float(self.test4_interval_input.value or 15))
-
-        async def _tick():
-            await self._run_test4_tick()
-
-        self._test4_timer = ui.timer(interval, _tick)
-        self.test4_toggle_btn.set_text('⏹ Detener Test')
-        self.test4_toggle_btn.classes(replace='bg-red-600 hover:bg-red-500 text-white font-bold px-3 py-2 rounded-lg')
-        self.test4_status_label.set_text(
-            f"Test iniciado a las {self.test4_start_time.strftime('%H:%M:%S')} UTC. Esperando órdenes del bot..."
-        )
-        asyncio.create_task(_tick())
-
-    async def _run_test4_tick(self):
-        bot_id = self.test4_bot_id
-        start_time = self.test4_start_time
+    async def _refresh_sessions_async(self):
         loop = asyncio.get_event_loop()
         try:
-            bots = await loop.run_in_executor(None, bot_manager.get_all_bots)
+            sessions = await loop.run_in_executor(None, list_session_reports)
         except Exception as e:
-            self.test4_status_label.set_text(f'⚠️ No se pudo listar bots: {e}')
+            logger.warning("No se pudo cargar el historial de informes: %s", e)
             return
+        self.sessions_table.rows = [
+            {
+                "session_id": s["session_id"],
+                "started_at": _fmt_dt(s["started_at"]),
+                "ended_at": _fmt_dt(s["ended_at"]),
+                "bot_name": s["bot_name"] or s["bot_id"],
+                "symbol": s["symbol"] or '-',
+                "status": s["status"],
+                "total_orders": s["total_orders"] or 0,
+                "reliability": (
+                    f"{s['reliability_pct']:.1f}% ({s['reliability_label']})"
+                    if s["reliability_pct"] is not None else "Sin datos"
+                ),
+                "slippage_avg": _fmt_pct(s["slippage_avg_pct"], 4),
+                "slippage_max": _fmt_pct(s["slippage_max_pct"], 4),
+            }
+            for s in sessions
+        ]
+        self.sessions_table.update()
 
-        bot = next((b for b in bots if b.bot_id == bot_id), None)
-        if not bot:
-            self.test4_status_label.set_text('⚠️ El bot seleccionado ya no existe.')
-            self._toggle_test4()  # detiene el test automáticamente
-            return
-
-        binance_symbol = bot.symbol.replace('/', '').upper()
-
-        def _work():
-            db = SessionLocal()
-            try:
-                records = (
-                    db.query(AppOrderRecord)
-                    .filter(
-                        AppOrderRecord.symbol == binance_symbol,
-                        AppOrderRecord.use_testnet == True,  # noqa: E712
-                        AppOrderRecord.created_at >= start_time.replace(tzinfo=None),
-                    )
-                    .order_by(AppOrderRecord.created_at.asc())
-                    .all()
-                )
-                # Se desprenden de la sesión ANTES de cerrarla (expire_on_commit por
-                # defecto invalidaría sus atributos al hacer db.close() más abajo).
-                db.expunge_all()
-                return records
-            finally:
-                db.close()
-
+    async def _on_session_click(self, e):
         try:
-            records = await loop.run_in_executor(None, _work)
-        except Exception as e:
-            self.test4_status_label.set_text(f'⚠️ Error leyendo el ledger: {e}')
+            session_id = e.args[1]["session_id"]
+        except (IndexError, KeyError, TypeError):
             return
-
-        if not records:
-            self.test4_status_label.set_text(
-                f"Monitoreando {bot.name} desde las {start_time.strftime('%H:%M:%S')} UTC — "
-                f"aún no envió ninguna orden."
-            )
+        loop = asyncio.get_event_loop()
+        report = await loop.run_in_executor(None, lambda: get_session_report(session_id))
+        if report is None:
+            ui.notify('No se encontró el informe de esa sesión.', type='warning')
             return
-
-        def _reconcile_all():
-            reconciler = OrderReconciler(use_testnet=True, notify=False)
-            rows = []
-            critical = 0
-            for r in records:
-                if r.status != 'SENT_OK':
-                    outcome = {
-                        'match_status': 'SEND_FAILED',
-                        'severity': 'CRITICAL',
-                        'details': r.error or 'La orden nunca llegó a enviarse a Binance (rechazada antes de salir).',
-                        'binance_status': None,
-                        'binance_exec_qty': None,
-                        'binance_avg_price': None,
-                    }
-                else:
-                    outcome = reconciler.reconcile_order(r)
-
-                if outcome['severity'] == 'CRITICAL':
-                    critical += 1
-                    icon = '🚨'
-                elif outcome['severity'] == 'WARNING':
-                    icon = '⚠️'
-                else:
-                    icon = '✅'
-
-                rows.append({
-                    'app_order_ref': r.app_order_ref,
-                    'created_at': r.created_at.strftime('%H:%M:%S') if r.created_at else '-',
-                    'role': ROLE_BY_ACTION.get(r.action, r.action or '-'),
-                    'side': r.side,
-                    'requested_qty': r.requested_qty,
-                    'binance_exec_qty': outcome.get('binance_exec_qty'),
-                    'requested_price': r.requested_price if r.requested_price else '-',
-                    'binance_avg_price': outcome.get('binance_avg_price') or '-',
-                    'binance_status': outcome.get('binance_status') or outcome['match_status'],
-                    'match_icon': icon,
-                    'details': outcome['details'],
-                })
-            return rows, critical
-
-        try:
-            rows, critical = await loop.run_in_executor(None, _reconcile_all)
-        except Exception as e:
-            self.test4_status_label.set_text(f'⚠️ Error conciliando contra Binance: {e}')
-            return
-
-        self.test4_table.rows = rows
-        self.test4_table.update()
-
-        if critical:
-            self.test4_status_label.set_text(
-                f"🚨 {bot.name}: {critical} de {len(rows)} orden(es) del ciclo NO coinciden con Binance."
-            )
-        else:
-            self.test4_status_label.set_text(
-                f"✅ {bot.name}: {len(rows)} orden(es) del ciclo coinciden con Binance (Entrada/SL/TP/Salida)."
-            )
-
-    def _reset_test4(self):
-        """Detiene el Test 4 si está corriendo y limpia la tabla/estado en pantalla — no
-        borra nada de app_order_ledger/reconciliation_log, solo la vista de esta prueba."""
-        if self._test4_timer is not None:
-            self._test4_timer.deactivate()
-            self._test4_timer = None
-            self.test4_toggle_btn.set_text('▶ Iniciar Test')
-            self.test4_toggle_btn.classes(replace='bg-violet-600 hover:bg-violet-500 text-white font-bold px-3 py-2 rounded-lg')
-
-        self.test4_start_time = None
-        self.test4_bot_id = None
-        self.test4_table.rows = []
-        self.test4_table.update()
-        self.test4_status_label.set_text('Inactivo')
-        ui.notify('Test 4 reseteado.', type='info')
+        self.detail_title.set_text(
+            f"Informe de {report['bot_name'] or report['bot_id']} ({report['symbol'] or '-'}) — "
+            f"{_fmt_dt(report['started_at'])} a {_fmt_dt(report['ended_at']) if report['ended_at'] else 'en curso'} UTC "
+            f"[{report['status']}]"
+        )
+        self.detail_title.classes(replace='text-base font-bold text-white')
+        self._render_session_cards(self.detail_cards_row, report)
+        self.detail_table.rows = _order_rows(report['orders'])
+        self.detail_table.update()
 
 
 def render_reconciliation_page():

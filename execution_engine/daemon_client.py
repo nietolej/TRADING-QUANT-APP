@@ -79,7 +79,7 @@ class BotProxy:
         if self._cached_binance_client is None:
             try:
                 from execution_engine.binance_client import BinanceTestnetClient
-                self._cached_binance_client = BinanceTestnetClient(use_testnet=self.use_testnet)
+                self._cached_binance_client = BinanceTestnetClient(use_testnet=self.use_testnet, bot_id=self.bot_id)
             except Exception as e:
                 logger.warning("No se pudo instanciar BinanceTestnetClient en BotProxy: %s", e)
         return self._cached_binance_client

@@ -266,8 +266,12 @@ def verify_binance_credentials(
 class BinanceTestnetClient:
     """Cliente unificado para interactuar con Binance (Futures Testnet y Real Mainnet)."""
 
-    def __init__(self, use_testnet: bool = False, api_key: Optional[str] = None, api_secret: Optional[str] = None):
+    def __init__(self, use_testnet: bool = False, api_key: Optional[str] = None, api_secret: Optional[str] = None,
+                 bot_id: Optional[str] = None):
         self.use_testnet = use_testnet
+        # Bot al que se atribuyen las órdenes que este cliente registre en el ledger de
+        # reconciliación (None = orden manual/de prueba, sin bot asociado).
+        self.bot_id = bot_id
         if api_key is not None and api_secret is not None:
             self.api_key = api_key.strip()
             self.api_secret = api_secret.strip()
@@ -534,6 +538,7 @@ class BinanceTestnetClient:
             initial_status = str(order.get("status", "")).upper()
             logger.info("Orden %s (%s) creada en Binance Futures. ID: %s, Estado inicial: %s", o_type, binance_side, order_id, initial_status)
             _log_order_to_ledger(
+                bot_id=self.bot_id,
                 symbol=binance_symbol, side=binance_side, action="OPEN", order_type=o_type,
                 requested_qty=qty, requested_price=price, reference_price=ref_price, use_testnet=self.use_testnet,
                 status="SENT_OK", binance_order_id=order_id, client_order_id=client_order_id,
@@ -558,6 +563,7 @@ class BinanceTestnetClient:
         except Exception as e:
             logger.error("Error enviando orden %s a Binance Futures: %s", o_type, e)
             _log_order_to_ledger(
+                bot_id=self.bot_id,
                 symbol=binance_symbol, side=binance_side, action="OPEN", order_type=o_type,
                 requested_qty=qty, requested_price=price, reference_price=ref_price, use_testnet=self.use_testnet,
                 status="SEND_FAILED", client_order_id=client_order_id, error=str(e),
@@ -624,6 +630,7 @@ class BinanceTestnetClient:
             initial_status = str(order.get("status", "")).upper()
             logger.info("Cierre de posición %s (%s) enviado a Binance Futures. ID: %s, Estado inicial: %s", o_type, close_side, order_id, initial_status)
             _log_order_to_ledger(
+                bot_id=self.bot_id,
                 symbol=binance_symbol, side=close_side, action="CLOSE", order_type=params["type"],
                 requested_qty=qty, requested_price=price, reference_price=ref_price, use_testnet=self.use_testnet,
                 status="SENT_OK", binance_order_id=order_id, client_order_id=client_order_id,
@@ -647,6 +654,7 @@ class BinanceTestnetClient:
         except Exception as e:
             logger.error("Error cerrando posición en Binance Futures: %s", e)
             _log_order_to_ledger(
+                bot_id=self.bot_id,
                 symbol=binance_symbol, side=close_side, action="CLOSE", order_type=o_type,
                 requested_qty=qty, requested_price=price, reference_price=ref_price, use_testnet=self.use_testnet,
                 status="SEND_FAILED", client_order_id=client_order_id, error=str(e),
@@ -713,6 +721,7 @@ class BinanceTestnetClient:
                 results["tp_order"] = tp_res
                 logger.info("Orden TP (%s) enviada a Binance: %s", tp_type, tp_res)
                 _log_order_to_ledger(
+                    bot_id=self.bot_id,
                     symbol=binance_symbol, side=close_side, action="TAKE_PROFIT", order_type=tp_type,
                     requested_qty=qty, requested_price=tp_price, use_testnet=self.use_testnet,
                     status="SENT_OK", binance_order_id=tp_ref_id, client_order_id=tp_client_order_id,
@@ -722,6 +731,7 @@ class BinanceTestnetClient:
                 logger.warning("No se pudo colocar orden TP en Binance: %s", e)
                 results["errors"].append(f"TP Error: {e}")
                 _log_order_to_ledger(
+                    bot_id=self.bot_id,
                     symbol=binance_symbol, side=close_side, action="TAKE_PROFIT", order_type=tp_order_type.upper(),
                     requested_qty=qty, requested_price=tp_price, use_testnet=self.use_testnet,
                     status="SEND_FAILED", client_order_id=tp_client_order_id, error=str(e),
@@ -756,6 +766,7 @@ class BinanceTestnetClient:
                 results["sl_order"] = sl_res
                 logger.info("Orden SL (%s) enviada a Binance: %s", sl_type, sl_res)
                 _log_order_to_ledger(
+                    bot_id=self.bot_id,
                     symbol=binance_symbol, side=close_side, action="STOP_LOSS", order_type=sl_type,
                     requested_qty=qty, requested_price=sl_price, use_testnet=self.use_testnet,
                     status="SENT_OK", binance_order_id=sl_ref_id, client_order_id=sl_client_order_id,
@@ -765,6 +776,7 @@ class BinanceTestnetClient:
                 logger.warning("No se pudo colocar orden SL en Binance: %s", e)
                 results["errors"].append(f"SL Error: {e}")
                 _log_order_to_ledger(
+                    bot_id=self.bot_id,
                     symbol=binance_symbol, side=close_side, action="STOP_LOSS", order_type=sl_order_type.upper(),
                     requested_qty=qty, requested_price=sl_price, use_testnet=self.use_testnet,
                     status="SEND_FAILED", client_order_id=sl_client_order_id, error=str(e),
