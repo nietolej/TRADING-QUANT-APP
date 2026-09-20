@@ -411,3 +411,69 @@ reportado. Se recomienda que el usuario vuelva a correr una conciliación ("Conc
 Test 1 o Test 3) sobre su instancia real una vez desplegado este cambio, para confirmar que
 los TP/SL de su ledger existente pasan a `CANCELED_AS_EXPECTED` en la próxima corrida (los
 registros históricos ya persistidos como `STATUS_MISMATCH` no se recalculan retroactivamente).
+
+---
+
+## Actualización 4 — Suite de tests automatizados (`tests/test_reconciliation.py`)
+
+**Fecha:** 2026-09-20 (UTC), misma sesión.
+
+### Qué se probó
+Hasta este punto, todo lo documentado en este informe eran ejecuciones manuales puntuales
+(reales o con datos simulados a mano), sin quedar como tests repetibles. Se agregó
+`tests/test_reconciliation.py` (39 tests con `pytest`) para dejar cubiertos de forma
+automatizada, en particular, los **estados de orden que pueden confundirse con una falla del
+bot** cuando en realidad son comportamiento esperado (y viceversa):
+
+- **Clasificación de estados en `reconcile_order`:** TP/SL cancelado (`CANCELED_AS_EXPECTED`) vs.
+  OPEN/CLOSE cancelado (sigue siendo `STATUS_MISMATCH`/CRITICAL, para que la excepción no se
+  amplíe por error); `REJECTED`/`EXPIRED` siempre críticos, incluso en TP/SL; estado inesperado
+  no contemplado (`WARNING`, no `CRITICAL`); orden sin `binance_order_id`; excepción al
+  consultar Binance (`MISSING_ON_BINANCE`).
+- **Llenado parcial y precio:** `PARTIALLY_FILLED` dentro/fuera de tolerancia de cantidad;
+  `PRICE_MISMATCH` solo aplica a órdenes LIMIT (una MARKET no lo dispara aunque el precio
+  ejecutado difiera del de referencia).
+- **Deslizamiento:** dentro de tolerancia (`MATCHED`), por encima pero por debajo de 3x la
+  tolerancia (`SLIPPAGE_EXCEEDED`/WARNING) y por encima de 3x (`SLIPPAGE_EXCEEDED`/CRITICAL).
+- **Detección de huérfanos (`find_orphan_trades`):** sin cliente/credenciales, excepción de
+  Binance, orden sin tag de la app (se ignora), orden FILLED/PARTIALLY_FILLED con tag de la app
+  sin registro local (huérfana), y orden con tag ya conocida en el ledger (no se marca huérfana).
+- **`reconcile_pending`:** registros `SEND_FAILED` se marcan `APP_SIDE_ONLY` sin llamar a
+  Binance; registros fuera de `lookback_hours` o de otra red (`use_testnet` distinto) no se
+  procesan; un registro `SENT_OK` se concilia y persiste correctamente.
+- **`build_test_report`:** `created_in_app_count` incluye los `SEND_FAILED` pero
+  `sent_to_binance_count` no; `CANCELED_AS_EXPECTED` cuenta como orden efectiva; umbrales de
+  `reliability_label` (Alta ≥95%, Media ≥80%, Baja <80%) y el caso sin datos.
+
+### Cómo se probó
+A diferencia de las secciones anteriores de este informe, estos tests **no dependen de red ni
+de credenciales de Binance**: `reconcile_order` se ejercita mockeando directamente
+`self.client.client.futures_get_order` (no toca la base de datos), y `find_orphan_trades` /
+`reconcile_pending` / `build_test_report` usan una fixture (`isolated_db`) que redirige
+`SessionLocal` a un SQLite en memoria propio de cada test, para no tocar
+`data/trading_quant.db`. Se corrieron con `pytest tests/test_reconciliation.py`.
+
+Nota de entorno: a diferencia de la sesión que generó las secciones anteriores de este informe
+(sin `sqlalchemy`/`python-binance`/`pytest` instalados), en esta sesión sí se pudieron instalar
+esas dependencias, lo que permitió correr los 39 tests de punta a punta con resultado real
+(no solo simulado a mano).
+
+### Resultado obtenido
+```
+39 passed in 10.16s
+```
+
+### Hallazgo pendiente de decisión (no corregido en esta sesión)
+Un test (`test_new_status_currently_falls_through_to_matched`) documenta un comportamiento
+existente que puede ser un falso positivo: si `reconcile_order` consulta Binance y el estado es
+`NEW` (orden todavía no ejecutada), el código no lo distingue de una ejecución real y cae en el
+`return` final como `MATCHED`/INFO. Es el caso opuesto al de TP/SL cancelado: una orden pendiente
+se reporta como confirmada. Se dejó como test de regresión del comportamiento actual, a la
+espera de que el usuario confirme si debe corregirse (por ejemplo, agregando un
+`match_status = "PENDING"` explícito para `NEW`) o si se prefiere mantenerlo así.
+
+**Conclusión:** el módulo de conciliación queda, por primera vez, con cobertura automatizada
+repetible en CI para los casos de clasificación de estados de orden más propensos a falsos
+positivos/negativos. Las ejecuciones reales contra Binance Testnet (Test 1, Test 2, Test 3)
+documentadas en las secciones anteriores siguen pendientes de validarse en un entorno con
+red y credenciales.
