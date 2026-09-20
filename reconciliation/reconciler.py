@@ -19,6 +19,9 @@ FAILED_STATUSES = {"REJECTED", "CANCELED", "EXPIRED"}
 # Informe de Confiabilidad. Todo lo demás cuenta como fallida.
 EFFECTIVE_STATUSES = {"MATCHED", "CANCELED_AS_EXPECTED"}
 
+# Estados de una orden en Binance a partir de los cuales ya no cambia.
+TERMINAL_EXCHANGE_STATUSES = {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}
+
 
 def _reliability_label(reliability_pct: Optional[float]) -> str:
     """Etiqueta de confiabilidad del bot según el % de órdenes efectivas."""
@@ -886,6 +889,7 @@ class OrderReconciler:
         bot_name: str,
         symbol: str,
         started_at: datetime,
+        outcome_cache: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Concilia contra Binance TODAS las órdenes que `bot_id` envió desde `started_at` (naive
@@ -927,8 +931,14 @@ class OrderReconciler:
                     "binance_exec_qty": None,
                     "binance_avg_price": None,
                 }
+            elif outcome_cache is not None and record.app_order_ref in outcome_cache:
+                outcome = outcome_cache[record.app_order_ref]
             else:
                 outcome = self.reconcile_order(record)
+                # Una orden que Binance ya dio por terminada no cambia más: no se vuelve a consultar en cada
+                # ciclo. Con varias sesiones en paralelo evita cientos de consultas repetidas por minuto.
+                if outcome_cache is not None and outcome.get("binance_status") in TERMINAL_EXCHANGE_STATUSES:
+                    outcome_cache[record.app_order_ref] = outcome
             orders.append({
                 "app_order_ref": record.app_order_ref,
                 "created_at": record.created_at.strftime("%d/%m %H:%M:%S") if record.created_at else None,

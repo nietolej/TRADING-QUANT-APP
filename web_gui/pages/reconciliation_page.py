@@ -9,8 +9,8 @@ Tests:
 - Test 1: envía UNA orden real a Testnet y verifica creación → envío → ejecución y el
   deslizamiento de precio, con un veredicto de si se ejecutó según lo pedido por el bot.
   (Test 1b: el ciclo completo con SL/TP.)
-- Test 2: sesión de conciliación en vivo de un bot; genera y guarda en BD el informe de
-  conciliación (estadísticas, deslizamientos y confiabilidad), consultable después.
+- Test 2: sesiones de conciliación en vivo, una por bot y varias a la vez; cada una genera y guarda
+  en BD su informe de conciliación (estadísticas, deslizamientos y confiabilidad), consultable después.
 """
 import asyncio
 import logging
@@ -135,9 +135,8 @@ class ReconciliationPage:
         self.use_testnet = True
         self.is_loading = False
         self.last_summary: Dict[str, Any] = {}
-        # Sesión activa de Test 2 (None = no hay monitoreo en curso).
-        self.test2_session: Optional[Dict[str, Any]] = None
-        self._test2_timer = None
+        # Sesiones de Test 2 por bot_id (varias a la vez); las finalizadas conservan su panel hasta limpiarlas.
+        self.test2_sessions: Dict[str, Dict[str, Any]] = {}
 
     def render(self):
         with ui.column().classes('w-full h-full p-2 md:p-4 gap-6 bg-[#0a0e17] text-white'):
@@ -211,32 +210,37 @@ class ReconciliationPage:
                             .classes('bg-cyan-600 hover:bg-cyan-500 text-white font-bold px-3 py-2 rounded-lg')
                     self.cycle_results_col = ui.column().classes('w-full gap-1 mt-2')
 
-                # ── Test 2: sesión de conciliación en vivo de un bot ──
+                # ── Test 2: sesiones de conciliación en vivo (uno o varios bots a la vez) ──
                 with ui.card().classes('bg-[#111827] border border-[#1e293b] rounded-xl p-4 flex-1 min-w-[340px] gap-2'):
                     with ui.row().classes('items-center gap-2'):
                         ui.icon('monitor_heart', color='emerald-400', size='20px')
-                        ui.label('Test 2 — Conciliación en Vivo de un Bot').classes('text-base font-bold text-white')
+                        ui.label('Test 2 — Conciliación en Vivo de Bots').classes('text-base font-bold text-white')
                     ui.label(
-                        'Inicia una sesión sobre un bot de Testnet: concilia contra Binance, orden por orden, todo lo '
-                        'que el bot envía desde ese momento (Entrada, SL, TP, Salida) y calcula en vivo las '
-                        'estadísticas, los deslizamientos y la confiabilidad. El informe se guarda en la base de '
-                        'datos en cada ciclo para consultarlo después.'
+                        'Elige uno o VARIOS bots de Testnet y inicia una sesión para cada uno, en paralelo: concilia '
+                        'contra Binance, orden por orden, todo lo que cada bot envía desde ese momento (Entrada, SL, '
+                        'TP, Salida) y calcula en vivo las estadísticas, los deslizamientos y la confiabilidad. Cada '
+                        'sesión guarda su propio informe en la base de datos en cada ciclo.'
                     ).classes('text-xs text-gray-400')
+                    self.test2_bot_select = ui.select({}, label='Bots (Testnet)', multiple=True) \
+                        .props('use-chips').classes('w-full')
                     with ui.row().classes('gap-2 items-center flex-wrap'):
-                        self.test2_bot_select = ui.select({}, label='Bot (Testnet)').classes('w-56')
                         self.test2_interval_input = ui.number('Intervalo (s)', value=15, min=5, max=300).classes('w-28')
-                        self.test2_toggle_btn = ui.button('▶ Iniciar Sesión', icon='play_arrow', on_click=self._toggle_test2) \
+                        self.test2_start_btn = ui.button('▶ Iniciar sesiones', icon='play_arrow', on_click=self._start_test2_sessions) \
                             .classes('bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-2 rounded-lg')
+                        ui.button('⏹ Detener todas', icon='stop', on_click=self._stop_all_test2) \
+                            .classes('bg-red-600 hover:bg-red-500 text-white font-bold px-3 py-2 rounded-lg')
                     self.test2_status_label = ui.label('Inactivo').classes('text-xs text-gray-400 font-mono')
 
-            # ── Test 2: estadística en vivo de la sesión ──
-            ui.label('Test 2 — Informe en vivo de la sesión').classes('text-lg font-bold text-white mt-2')
-            with ui.row().classes('w-full gap-4 flex-wrap') as self.test2_cards_row:
-                self._render_session_cards(self.test2_cards_row, {})
-            self.test2_table = ui.table(
-                columns=ORDER_COLUMNS, rows=[], row_key='app_order_ref', pagination={'rowsPerPage': 10}
-            ).classes('w-full')
-            self.test2_table.add_slot('body-cell-severity', SEVERITY_SLOT)
+            # ── Test 2: informes en vivo, un panel por sesión ──
+            with ui.row().classes('w-full items-center justify-between mt-2 flex-wrap gap-2'):
+                ui.label('Test 2 — Informes en vivo de las sesiones').classes('text-lg font-bold text-white')
+                ui.button('Limpiar finalizadas', icon='cleaning_services', on_click=self._clear_finished_test2) \
+                    .props('flat dense').classes('text-slate-300 text-xs')
+            self.test2_panels_col = ui.column().classes('w-full gap-4')
+            with self.test2_panels_col:
+                self.test2_empty_label = ui.label(
+                    'Sin sesiones activas. Elige bots y pulsa "Iniciar sesiones".'
+                ).classes('text-sm text-gray-500')
 
             ui.label('Resultados de la última conciliación').classes('text-lg font-bold text-white mt-2')
             self.results_table = ui.table(
@@ -454,7 +458,7 @@ class ReconciliationPage:
         self.ledger_table.update()
 
     async def _refresh_bot_options(self):
-        """Alimenta el selector de bot de Test 2 (bots de Testnet)."""
+        """Alimenta el selector de bots de Test 2 (bots de Testnet)."""
         loop = asyncio.get_event_loop()
         try:
             bots = await loop.run_in_executor(None, bot_manager.get_all_bots)
@@ -462,7 +466,7 @@ class ReconciliationPage:
             logger.debug("No se pudo listar bots para Test 2: %s", e)
             return
         self.test2_bot_select.options = {
-            b.bot_id: f"{b.name} ({b.symbol}) {'🟡 Testnet' if b.use_testnet else '🌐 Real'}"
+            b.bot_id: f"{b.name} {'🟡 Testnet' if b.use_testnet else '🌐 Real'}"
             for b in bots if getattr(b, 'use_testnet', True)
         }
         self.test2_bot_select.update()
@@ -591,52 +595,97 @@ class ReconciliationPage:
         finally:
             self.cycle_btn.props(remove='loading')
 
-    # ── Test 2: sesión de conciliación en vivo de un bot ─────────────────
+    # ── Test 2: sesiones de conciliación en vivo (varios bots en paralelo) ─────────
 
-    def _set_test2_button(self, running: bool):
-        if running:
-            self.test2_toggle_btn.set_text('⏹ Detener Sesión')
-            self.test2_toggle_btn.classes(replace='bg-red-600 hover:bg-red-500 text-white font-bold px-3 py-2 rounded-lg')
+    def _active_test2_sessions(self) -> List[Dict[str, Any]]:
+        return [s for s in self.test2_sessions.values() if not s["finished"]]
+
+    def _update_test2_summary(self):
+        active = self._active_test2_sessions()
+        finished = len(self.test2_sessions) - len(active)
+        if active:
+            names = ', '.join(s["bot_name"] or s["bot_id"][-6:] for s in active)
+            self.test2_status_label.set_text(f"{len(active)} sesión(es) activa(s): {names}")
+        elif finished:
+            self.test2_status_label.set_text(f"Sin sesiones activas ({finished} finalizada(s) con su informe guardado).")
         else:
-            self.test2_toggle_btn.set_text('▶ Iniciar Sesión')
-            self.test2_toggle_btn.classes(replace='bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-2 rounded-lg')
+            self.test2_status_label.set_text('Inactivo')
+        self.test2_empty_label.set_visibility(not self.test2_sessions)
 
-    def _toggle_test2(self):
-        if self.test2_session is not None:
-            spawn(self._stop_test2())
+    def _make_test2_panel(self, session: Dict[str, Any]):
+        """Panel de una sesión: estado, estadísticas en vivo y tabla de órdenes de ESE bot."""
+        with self.test2_panels_col:
+            with ui.card().classes('w-full bg-[#0f172a] border border-[#1e293b] rounded-xl p-3 gap-2') as card:
+                with ui.row().classes('w-full items-center justify-between flex-wrap gap-2'):
+                    with ui.column().classes('gap-0'):
+                        title = ui.label(f"🤖 {session['bot_name'] or 'Bot ' + session['bot_id'][-6:]}") \
+                            .classes('text-base font-bold text-white')
+                        status = ui.label('Iniciando...').classes('text-xs text-gray-400 font-mono')
+                    stop_btn = ui.button('⏹ Detener', on_click=lambda s=session: spawn(self._stop_test2_session(s))) \
+                        .props('dense').classes('bg-red-600 hover:bg-red-500 text-white text-xs font-bold px-3 rounded-lg')
+                with ui.row().classes('w-full gap-4 flex-wrap') as cards_row:
+                    self._render_session_cards(cards_row, {})
+                table = ui.table(
+                    columns=ORDER_COLUMNS, rows=[], row_key='app_order_ref', pagination={'rowsPerPage': 8}
+                ).classes('w-full')
+                table.add_slot('body-cell-severity', SEVERITY_SLOT)
+        session["ui"] = {"card": card, "title": title, "status": status, "stop_btn": stop_btn,
+                         "cards_row": cards_row, "table": table}
+
+    def _set_test2_status(self, session: Dict[str, Any], text: str):
+        session["ui"]["status"].set_text(text)
+
+    def _start_test2_sessions(self):
+        bot_ids = list(self.test2_bot_select.value or [])
+        if not bot_ids:
+            ui.notify('Selecciona al menos un bot de Testnet.', type='warning')
             return
-
-        bot_id = self.test2_bot_select.value
-        if not bot_id:
-            ui.notify('Selecciona un bot de Testnet primero.', type='warning')
-            return
-
-        # Ancla de la sesión: solo se concilia lo que ESTE bot envíe a Binance a partir de este
-        # instante (naive UTC, igual que `created_at` en el ledger), no todo su historial.
-        started_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        self.test2_session = {
-            "session_id": str(uuid.uuid4()),
-            "bot_id": bot_id,
-            "bot_name": None,
-            "symbol": None,
-            "started_at": started_at,
-            "busy": False,
-        }
-        self.test2_table.rows = []
-        self.test2_table.update()
-        self._render_session_cards(self.test2_cards_row, {})
 
         interval = max(5.0, float(self.test2_interval_input.value or 15))
-        self._test2_timer = ui.timer(interval, self._run_test2_tick)
-        self._set_test2_button(True)
-        self.test2_status_label.set_text(
-            f"Sesión iniciada a las {started_at.strftime('%H:%M:%S')} UTC. Esperando órdenes del bot..."
-        )
-        spawn(self._run_test2_tick())
+        started = []
+        for bot_id in bot_ids:
+            previous = self.test2_sessions.get(bot_id)
+            if previous is not None and not previous["finished"]:
+                continue  # ya tiene una sesión en curso
+            if previous is not None:
+                previous["ui"]["card"].delete()  # se reemplaza el panel de la sesión anterior ya finalizada
 
-    async def _build_and_render_test2(self, finished: bool) -> Optional[Dict[str, Any]]:
-        """Concilia la sesión, guarda el informe en BD (en curso o finalizado) y refresca la pantalla."""
-        session = self.test2_session
+            # Ancla de la sesión: solo se concilia lo que ESTE bot envíe a Binance a partir de este
+            # instante (naive UTC, igual que `created_at` en el ledger), no todo su historial.
+            options = self.test2_bot_select.options
+            label = options.get(bot_id, bot_id) if isinstance(options, dict) else bot_id
+            session = {
+                "session_id": str(uuid.uuid4()),
+                "bot_id": bot_id,
+                "bot_name": str(label).replace(' 🟡 Testnet', '').replace(' 🌐 Real', '') if label != bot_id else None,
+                "symbol": None,
+                "started_at": datetime.now(timezone.utc).replace(tzinfo=None),
+                "interval": interval,
+                "busy": False,
+                "stopping": False,
+                "finished": False,
+                "cache": {},   # resultados definitivos de órdenes ya cerradas en Binance: no se vuelven a consultar
+            }
+            self.test2_sessions[bot_id] = session
+            self._make_test2_panel(session)
+            self._set_test2_status(
+                session,
+                f"Sesión iniciada a las {session['started_at'].strftime('%H:%M:%S')} UTC. Esperando órdenes del bot..."
+            )
+
+            async def _tick(s=session):
+                await self._run_test2_tick(s)
+
+            session["timer"] = ui.timer(interval, _tick)
+            spawn(self._run_test2_tick(session))
+            started.append(bot_id)
+
+        if not started:
+            ui.notify('Los bots elegidos ya tienen una sesión en curso.', type='info')
+        self._update_test2_summary()
+
+    async def _build_and_render_test2(self, session: Dict[str, Any], finished: bool) -> Optional[Dict[str, Any]]:
+        """Concilia la sesión, guarda el informe en BD (en curso o finalizado) y refresca su panel."""
         loop = asyncio.get_event_loop()
         report = await loop.run_in_executor(
             None,
@@ -646,98 +695,117 @@ class ReconciliationPage:
                 bot_name=session["bot_name"],
                 symbol=session["symbol"],
                 started_at=session["started_at"],
+                outcome_cache=session["cache"],
             )
         )
         # Un ciclo en curso que termina DESPUÉS de detener la sesión no debe volver a guardarla
         # como RUNNING encima del informe ya marcado FINISHED.
-        if finished or self.test2_session is session:
+        if finished or not session["finished"]:
             saved = await loop.run_in_executor(None, lambda: save_session_report(report, finished=finished))
             if not saved:
                 ui.notify('⚠️ No se pudo guardar el informe de la sesión en la base de datos.', type='warning')
 
-        self._render_session_cards(self.test2_cards_row, report)
-        self.test2_table.rows = _order_rows(report['orders'])
-        self.test2_table.update()
+        panel = session["ui"]
+        self._render_session_cards(panel["cards_row"], report)
+        panel["table"].rows = _order_rows(report['orders'])
+        panel["table"].update()
         await self._refresh_sessions_async()
         return report
 
-    async def _run_test2_tick(self):
-        session = self.test2_session
-        if session is None or session["busy"]:
+    async def _run_test2_tick(self, session: Dict[str, Any]):
+        if session["busy"] or session["finished"] or session["stopping"]:
             return
         session["busy"] = True
         try:
             loop = asyncio.get_event_loop()
             try:
-                bots = await loop.run_in_executor(None, bot_manager.get_all_bots)
+                bot = await loop.run_in_executor(None, bot_manager.get_bot, session["bot_id"])
             except Exception as e:
-                self.test2_status_label.set_text(f'⚠️ No se pudo listar bots: {e}')
+                self._set_test2_status(session, f'⚠️ No se pudo consultar el bot: {e}')
                 return
 
-            bot = next((b for b in bots if b.bot_id == session["bot_id"]), None)
-            if not bot:
-                self.test2_status_label.set_text('⚠️ El bot seleccionado ya no existe: sesión finalizada.')
-                await self._stop_test2()
+            if bot is None:
+                if not bot_manager.is_daemon_online():
+                    self._set_test2_status(session, '⏸ Daemon apagado: sesión en pausa hasta que vuelva.')
+                    return
+                self._set_test2_status(session, '⚠️ El bot ya no existe: sesión finalizada.')
+                await self._stop_test2_session(session)
                 return
             session["bot_name"] = bot.name
             session["symbol"] = bot.symbol.replace('/', '').upper()
+            session["ui"]["title"].set_text(f"🤖 {bot.name}")
 
             try:
-                report = await self._build_and_render_test2(finished=False)
+                report = await self._build_and_render_test2(session, finished=False)
             except Exception as e:
-                logger.error("Error conciliando la sesión de Test 2: %s", e)
-                self.test2_status_label.set_text(f'⚠️ Error conciliando {bot.name}: {e}')
+                logger.exception("Error conciliando la sesión de Test 2 de %s", bot.name)
+                self._set_test2_status(session, f'⚠️ Error conciliando {bot.name}: {e}')
                 return
 
-            if not self.test2_session:  # se detuvo mientras se conciliaba
+            if session["finished"]:  # se detuvo mientras se conciliaba
                 return
             since = session["started_at"].strftime('%H:%M:%S')
             total = report["total_orders"]
             if not total:
                 estado = 'corriendo' if bot.is_running else 'detenido'
-                self.test2_status_label.set_text(
-                    f"Monitoreando {bot.name} ({estado}) desde las {since} UTC — aún no envió ninguna orden."
+                self._set_test2_status(
+                    session, f"Monitoreando ({estado}) desde las {since} UTC — aún no envió ninguna orden."
                 )
             else:
                 pct = report["reliability_pct"]
-                self.test2_status_label.set_text(
-                    f"{'✅' if not report['failed_count'] else '🚨'} {bot.name}: {total} orden(es), "
-                    f"{report['failed_count']} con discrepancia — confiabilidad {pct:.1f}% ({report['reliability_label']}). "
-                    f"Sesión desde las {since} UTC."
+                self._set_test2_status(
+                    session,
+                    f"{'✅' if not report['failed_count'] else '🚨'} {total} orden(es), {report['failed_count']} con "
+                    f"discrepancia — confiabilidad {pct:.1f}% ({report['reliability_label']}). Desde las {since} UTC."
                 )
         finally:
             session["busy"] = False
 
-    async def _stop_test2(self):
-        """Detiene la sesión: hace una última conciliación y deja el informe guardado como FINISHED."""
-        session = self.test2_session
-        if session is None or session.get("stopping"):
+    async def _stop_test2_session(self, session: Dict[str, Any]):
+        """Detiene UNA sesión: última conciliación y el informe queda guardado como FINISHED."""
+        if session["finished"] or session["stopping"]:
             return
         session["stopping"] = True
-        if self._test2_timer is not None:
-            self._test2_timer.deactivate()
-            self._test2_timer = None
-        self._set_test2_button(False)
+        timer = session.get("timer")
+        if timer is not None:
+            timer.deactivate()
+        session["ui"]["stop_btn"].set_enabled(False)
 
         report = None
         if session["symbol"] is not None:  # si nunca llegó a correr un ciclo no hay nada que guardar
             try:
-                report = await self._build_and_render_test2(finished=True)
+                report = await self._build_and_render_test2(session, finished=True)
             except Exception as e:
-                logger.error("Error finalizando la sesión de Test 2: %s", e)
-                ui.notify(f"Error guardando el informe final: {e}", type='negative')
-        self.test2_session = None
+                logger.exception("Error finalizando la sesión de Test 2 de %s", session["bot_name"])
+                ui.notify(f"Error guardando el informe final de {session['bot_name']}: {e}", type='negative')
+        session["finished"] = True
 
         if report is not None:
             pct = report["reliability_pct"]
-            self.test2_status_label.set_text(
-                f"Sesión finalizada — {report['total_orders']} orden(es), confiabilidad "
-                f"{f'{pct:.1f}%' if pct is not None else 'sin datos'} ({report['reliability_label']}). "
-                f"Informe guardado."
+            self._set_test2_status(
+                session,
+                f"Finalizada — {report['total_orders']} orden(es), confiabilidad "
+                f"{f'{pct:.1f}%' if pct is not None else 'sin datos'} ({report['reliability_label']}). Informe guardado."
             )
-            ui.notify('Sesión finalizada: el informe quedó guardado en la base de datos.', type='positive')
         else:
-            self.test2_status_label.set_text('Inactivo')
+            self._set_test2_status(session, 'Finalizada sin órdenes que informar.')
+        self._update_test2_summary()
+
+    def _stop_all_test2(self):
+        active = self._active_test2_sessions()
+        if not active:
+            ui.notify('No hay sesiones activas.', type='info')
+            return
+        for session in active:
+            spawn(self._stop_test2_session(session))
+        ui.notify(f'Deteniendo {len(active)} sesión(es): los informes quedan guardados.', type='positive')
+
+    def _clear_finished_test2(self):
+        for bot_id, session in list(self.test2_sessions.items()):
+            if session["finished"]:
+                session["ui"]["card"].delete()
+                del self.test2_sessions[bot_id]
+        self._update_test2_summary()
 
     # ── Historial de informes de sesión ──────────────────────────────────
 
