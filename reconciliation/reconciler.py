@@ -100,38 +100,114 @@ class OrderReconciler:
         }
 
     def reconcile_order(self, record: AppOrderRecord) -> Dict[str, Any]:
-        """Consulta Binance para UNA orden del ledger y determina si coincide con lo reportado al enviarla."""
+        """Consulta Binance para UNA orden del ledger y determina si coincide con lo reportado al enviarla.
+
+        Además de match_status/severity/details (y el detalle de la orden, ver _order_detail),
+        el resultado siempre incluye binance_status/binance_exec_qty/binance_avg_price (None
+        cuando no se pudo obtener nada de Binance) — pensado para que quien llame pueda armar
+        una comparación app-vs-Binance campo a campo (ver "Test 3" en la página de
+        Conciliación) sin tener que re-parsear `details`.
+        """
         detail = self._order_detail(record)
 
-        if not record.binance_order_id:
+        def _result(match_status: str, severity: str, details: str,
+                    b_status: Optional[str] = None, b_qty: Optional[float] = None,
+                    b_price: Optional[float] = None) -> Dict[str, Any]:
             return {
                 **detail,
-                "match_status": "ERROR",
-                "severity": "WARNING",
-                "details": "El registro no tiene binance_order_id (la orden nunca llegó a crearse en Binance).",
+                "match_status": match_status,
+                "severity": severity,
+                "details": details,
+                "binance_status": b_status,
+                "binance_exec_qty": b_qty,
+                "binance_avg_price": b_price,
             }
+
+        if not record.binance_order_id:
+            return _result(
+                "ERROR", "WARNING",
+                "El registro no tiene binance_order_id (la orden nunca llegó a crearse en Binance).",
+            )
 
         try:
             order_id = int(record.binance_order_id)
         except (TypeError, ValueError):
             order_id = record.binance_order_id
 
-        try:
-            exchange_order = self.client.client.futures_get_order(symbol=record.symbol, orderId=order_id)
-        except Exception as e:
-            return {
-                **detail,
-                "match_status": "MISSING_ON_BINANCE",
-                "severity": "CRITICAL",
-                "details": (
-                    f"La app registró el envío de la orden {record.binance_order_id} ({record.symbol}) pero "
-                    f"Binance no la reconoce: {format_binance_error(e)}"
-                ),
-            }
+        # Los SL/TP condicionales que coloca esta app (binance_client.place_futures_sl_tp)
+        # se registran en el ledger con el `algoId` que devuelve Binance para ese tipo de
+        # orden (ver comentario en place_futures_sl_tp y el mismo criterio ya usado en
+        # cancel_all_open_orders/futures_get_open_algo_orders), NO con un `orderId` de
+        # órdenes estándar. futures_get_order() siempre responde -2013 "Order does not
+        # exist" para un algoId, así que antes esto marcaba TODO SL/TP como
+        # MISSING_ON_BINANCE/CRITICAL aunque la orden estuviera perfectamente viva —
+        # auditoría 2026-09-19: 12 de 25 "discrepancias" en Test 2 eran exactamente esto.
+        is_conditional = record.action in ("STOP_LOSS", "TAKE_PROFIT")
 
-        status = str(exchange_order.get("status", "")).upper()
-        exec_qty = float(exchange_order.get("executedQty", 0.0) or 0.0)
-        avg_price = float(exchange_order.get("avgPrice", 0.0) or 0.0)
+        exchange_order = None
+        lookup_errors = []
+        is_algo_response = False
+
+        if is_conditional:
+            try:
+                exchange_order = self.client.client.futures_get_algo_order(symbol=record.symbol, algoId=order_id)
+                is_algo_response = True
+            except Exception as e:
+                lookup_errors.append(format_binance_error(e))
+
+        if exchange_order is None:
+            try:
+                exchange_order = self.client.client.futures_get_order(symbol=record.symbol, orderId=order_id)
+                is_algo_response = False
+            except Exception as e:
+                lookup_errors.append(format_binance_error(e))
+
+        if exchange_order is None:
+            return _result(
+                "MISSING_ON_BINANCE", "CRITICAL",
+                (
+                    f"La app registró el envío de la orden {record.binance_order_id} ({record.symbol}) pero "
+                    f"Binance no la reconoce en ningún endpoint ({'; '.join(lookup_errors)})."
+                ),
+            )
+
+        if is_algo_response:
+            # La respuesta de "Query Algo Order" no usa los mismos nombres de campo que una
+            # orden estándar (status/executedQty/avgPrice) — se prueban las variantes
+            # conocidas y, si no se puede identificar el estado, se acepta como MATCHED en
+            # vez de arriesgar un falso CRÍTICO: lo único que de verdad importa aquí es que
+            # Binance reconoce el algoId (si no lo reconociera, ya se habría devuelto
+            # MISSING_ON_BINANCE arriba).
+            raw_status = str(exchange_order.get("algoStatus") or exchange_order.get("status") or "").upper()
+            exec_qty = float(exchange_order.get("executedQty") or exchange_order.get("executedAmt") or 0.0)
+            avg_price = float(exchange_order.get("avgPrice") or exchange_order.get("avgFillPrice") or 0.0)
+            if not raw_status:
+                return _result(
+                    "MATCHED", "INFO",
+                    (
+                        f"Orden condicional {record.binance_order_id} ({record.symbol}) confirmada en Binance "
+                        f"vía Algo Orders (sin campo de estado reconocible en la respuesta)."
+                    ),
+                    b_status="UNKNOWN", b_qty=exec_qty, b_price=avg_price or None,
+                )
+            # El vocabulario de estados de Algo Orders (WORKING/FINISHED/CANCELLED/...) no
+            # coincide con el de órdenes estándar (NEW/FILLED/CANCELED/...) que usan
+            # FAILED_STATUSES/FILLED_STATUSES más abajo — se traduce para reusar la misma
+            # lógica en vez de duplicarla.
+            ALGO_STATUS_MAP = {
+                "WORKING": "NEW",
+                "FINISHED": "FILLED",
+                "CANCELLED": "CANCELED",
+                "CANCELED": "CANCELED",
+                "REJECTED": "REJECTED",
+                "EXPIRED": "EXPIRED",
+            }
+            status = ALGO_STATUS_MAP.get(raw_status, raw_status)
+        else:
+            status = str(exchange_order.get("status", "")).upper()
+            exec_qty = float(exchange_order.get("executedQty", 0.0) or 0.0)
+            avg_price = float(exchange_order.get("avgPrice", 0.0) or 0.0)
+
         detail["executed_qty"] = exec_qty or detail["executed_qty"]
         detail["avg_price"] = avg_price or detail["avg_price"]
 
@@ -143,35 +219,32 @@ class OrderReconciler:
         # orden MARKET. Sin este caso especial, TODO TP/SL quedaba marcado STATUS_MISMATCH
         # CRITICAL de forma sistemática, aunque el bot esté operando exactamente como se espera.
         if status == "CANCELED" and record.action in ("TAKE_PROFIT", "STOP_LOSS"):
-            return {
-                **detail,
-                "match_status": "CANCELED_AS_EXPECTED",
-                "severity": "INFO",
-                "details": (
+            return _result(
+                "CANCELED_AS_EXPECTED", "INFO",
+                (
                     f"Orden {record.action} {record.binance_order_id} ({record.symbol}) cancelada en Binance — "
                     f"comportamiento esperado: se dispara como máximo una de las dos condicionales (TP/SL) del par, "
                     f"o ambas se cancelan al cerrar la posición manualmente."
                 ),
-            }
+                b_status=status, b_qty=exec_qty, b_price=avg_price or None,
+            )
 
         if status in FAILED_STATUSES:
-            return {
-                **detail,
-                "match_status": "STATUS_MISMATCH",
-                "severity": "CRITICAL",
-                "details": (
+            return _result(
+                "STATUS_MISMATCH", "CRITICAL",
+                (
                     f"Orden {record.binance_order_id} ({record.symbol}) en estado terminal fallido "
                     f"'{status}' en Binance: la app la contaba como ejecutada."
                 ),
-            }
+                b_status=status, b_qty=exec_qty, b_price=avg_price or None,
+            )
 
         if status not in FILLED_STATUSES and status != "NEW":
-            return {
-                **detail,
-                "match_status": "STATUS_MISMATCH",
-                "severity": "WARNING",
-                "details": f"Orden {record.binance_order_id} ({record.symbol}) en estado inesperado '{status}'.",
-            }
+            return _result(
+                "STATUS_MISMATCH", "WARNING",
+                f"Orden {record.binance_order_id} ({record.symbol}) en estado inesperado '{status}'.",
+                b_status=status, b_qty=exec_qty, b_price=avg_price or None,
+            )
 
         if status in FILLED_STATUSES:
             # A partir de aquí la orden sí se creó en la app, sí se envió y sí se ejecutó en
@@ -179,27 +252,25 @@ class OrderReconciler:
             detail["checks"]["executed_in_binance"] = True
 
             if not self._within_tolerance(record.requested_qty, exec_qty, self.qty_tolerance_pct):
-                return {
-                    **detail,
-                    "match_status": "QTY_MISMATCH",
-                    "severity": "WARNING",
-                    "details": (
+                return _result(
+                    "QTY_MISMATCH", "WARNING",
+                    (
                         f"Cantidad solicitada {record.requested_qty} vs ejecutada {exec_qty} en Binance "
                         f"para la orden {record.binance_order_id} ({record.symbol})."
                     ),
-                }
+                    b_status=status, b_qty=exec_qty, b_price=avg_price or None,
+                )
             if record.order_type == "LIMIT" and avg_price and not self._within_tolerance(
                 record.requested_price, avg_price, self.price_tolerance_pct
             ):
-                return {
-                    **detail,
-                    "match_status": "PRICE_MISMATCH",
-                    "severity": "WARNING",
-                    "details": (
+                return _result(
+                    "PRICE_MISMATCH", "WARNING",
+                    (
                         f"Precio solicitado {record.requested_price} vs avgPrice ejecutado {avg_price} en "
                         f"Binance para la orden {record.binance_order_id} ({record.symbol})."
                     ),
-                }
+                    b_status=status, b_qty=exec_qty, b_price=avg_price or None,
+                )
 
             # Deslizamiento: compara el precio realmente ejecutado contra el precio de
             # referencia tomado justo antes de enviar la orden (cubre también MARKET, que no
@@ -209,23 +280,22 @@ class OrderReconciler:
                 slippage_pct = abs(avg_price - reference) / abs(reference) * 100.0
                 detail["slippage_pct"] = round(slippage_pct, 4)
                 if slippage_pct > self.slippage_tolerance_pct:
-                    return {
-                        **detail,
-                        "match_status": "SLIPPAGE_EXCEEDED",
-                        "severity": "CRITICAL" if slippage_pct > self.slippage_tolerance_pct * 3 else "WARNING",
-                        "details": (
+                    return _result(
+                        "SLIPPAGE_EXCEEDED",
+                        "CRITICAL" if slippage_pct > self.slippage_tolerance_pct * 3 else "WARNING",
+                        (
                             f"Deslizamiento de {slippage_pct:.3f}% (tolerancia {self.slippage_tolerance_pct}%) "
                             f"en la orden {record.binance_order_id} ({record.symbol}): referencia {reference} "
                             f"vs ejecutado {avg_price}."
                         ),
-                    }
+                        b_status=status, b_qty=exec_qty, b_price=avg_price or None,
+                    )
 
-        return {
-            **detail,
-            "match_status": "MATCHED",
-            "severity": "INFO",
-            "details": f"Orden {record.binance_order_id} ({record.symbol}) confirmada en Binance con estado {status}.",
-        }
+        return _result(
+            "MATCHED", "INFO",
+            f"Orden {record.binance_order_id} ({record.symbol}) confirmada en Binance con estado {status}.",
+            b_status=status, b_qty=exec_qty, b_price=avg_price or None,
+        )
 
     def reconcile_pending(self, lookback_hours: float = 48.0, limit: int = 500) -> List[Dict[str, Any]]:
         """Concilia todas las órdenes del ledger local aún no verificadas contra Binance."""
