@@ -1,7 +1,8 @@
 from nicegui import ui, run
 import pandas as pd
 from data_layer.storage import SessionLocal, OHLCV
-from ml_engine.model_trainer import MLModelTrainer
+# scikit-learn se importa al ENTRENAR, no al arrancar la app: cargarlo cuesta ~2 s en cada inicio/recarga
+# del servidor y solo lo necesita esta página.
 
 def render_ml_page():
     with ui.column().classes('w-full q-pa-sm'):
@@ -58,6 +59,7 @@ def render_ml_page():
                         status_label.text = 'Training Model...'
 
                         # 2. Train Model en un hilo aparte para no bloquear el event loop de NiceGUI
+                        from ml_engine.model_trainer import MLModelTrainer
                         trainer = MLModelTrainer(model_type=state['model_type'].lower().replace(" ", "_"))
                         metrics = await run.io_bound(trainer.train, df)
                         

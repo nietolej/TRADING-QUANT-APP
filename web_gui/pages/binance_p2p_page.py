@@ -7,6 +7,7 @@ from typing import Dict, Any, List
 from nicegui import ui
 
 from execution_engine.binance_client import BinanceTestnetClient, get_binance_credentials
+from app_runtime.async_utils import spawn
 
 
 class BinanceP2PPage:
@@ -76,7 +77,7 @@ class BinanceP2PPage:
         else:
             self.btn_sell.classes('bg-yellow-500 text-black font-black', remove='text-gray-400')
             self.btn_buy.classes('text-gray-400 hover:text-white', remove='bg-yellow-500 text-black font-black')
-        asyncio.create_task(self._refresh())
+        spawn(self._refresh())
 
     async def _refresh(self):
         if self.is_loading:

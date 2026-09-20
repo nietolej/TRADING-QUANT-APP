@@ -14,6 +14,7 @@ from execution_engine.security_manager import (
     is_real_trading_enabled,
     set_real_trading_enabled,
 )
+from app_runtime.async_utils import spawn
 from data_layer.provider_credentials import (
     list_providers,
     save_provider_key,
@@ -445,7 +446,7 @@ class ApiCredentialsManager:
                 ).classes('text-xs text-slate-300 leading-relaxed')
                 with ui.row().classes('w-full justify-end gap-2 mt-2'):
                     ui.button('Cancelar (Mantener Candado Cerrado)', on_click=lambda: [cancel_unlock(), confirm_dialog.close()]).props('dense flat').classes('text-xs text-slate-400')
-                    ui.button('Acepto el Riesgo y Desbloqueo', on_click=lambda: [confirm_dialog.close(), asyncio.create_task(confirm_unlock())]).classes('bg-red-600 hover:bg-red-500 text-white font-extrabold text-xs px-3 py-1.5 rounded-lg')
+                    ui.button('Acepto el Riesgo y Desbloqueo', on_click=lambda: [confirm_dialog.close(), spawn(confirm_unlock())]).classes('bg-red-600 hover:bg-red-500 text-white font-extrabold text-xs px-3 py-1.5 rounded-lg')
             confirm_dialog.open()
         else:
             # Apagar candado -> MODO SOLO LECTURA INMEDIATO

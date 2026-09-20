@@ -4,7 +4,7 @@ import requests
 import pandas as pd
 import plotly.graph_objects as from_plotly
 from plotly.subplots import make_subplots
-from nicegui import ui, background_tasks
+from nicegui import ui, background_tasks, run
 from datetime import datetime, timezone, timedelta
 from data_layer.storage import SessionLocal, OnChainMetric
 from data_layer.onchain_flows import BlockExplorerClient
@@ -13,6 +13,9 @@ from data_layer.market_data import MarketDataManager
 from data_layer.unified_dataset import build_unified_daily, get_unified_wide_df
 import asyncio
 import concurrent.futures
+import logging
+
+logger = logging.getLogger("OnChainPage")
 
 
 def _glassnode_key_configured() -> bool:
@@ -164,6 +167,22 @@ def _binance_public_reachable() -> bool:
     return ok
 
 
+def _cached_availability(key: str) -> bool:
+    """Resultado cacheado de una comprobación de proveedor; True (optimista) si aún no se ha hecho."""
+    cached = _availability_cache.get(key)
+    if cached and (time.time() - cached[1]) < _AVAILABILITY_TTL_SECONDS:
+        return cached[0]
+    return True
+
+
+def _probe_availability_blocking() -> None:
+    """Ejecuta y cachea las comprobaciones de red de los proveedores. Bloquea (hasta ~15 s con
+    timeouts): llamar SIEMPRE fuera del event loop (run.io_bound)."""
+    _cryptoquant_indicator_access_ok()
+    _cryptoquant_market_data_access_ok()
+    _binance_public_reachable()
+
+
 def _available_metrics_for(symbol: str) -> list:
     """Filtra METRICS_BY_SYMBOL a solo las métricas que la app puede descargar AHORA MISMO
     con la configuración/red actuales, para que el selector no ofrezca combinaciones que
@@ -174,10 +193,13 @@ def _available_metrics_for(symbol: str) -> list:
     if symbol not in ('BTC', 'ETH'):
         return list(all_metrics)
 
-    cq_ok = _cryptoquant_indicator_access_ok()
-    cq_market_data_ok = _cryptoquant_market_data_access_ok()
+    # Solo se leen resultados YA cacheados; lo que aún no se ha comprobado se asume disponible
+    # (optimista) hasta que _probe_availability_blocking() lo confirme en segundo plano. Antes
+    # esta función hacía 3 peticiones HTTPS síncronas: 5 s bloqueando TODO el servidor al abrir la página.
+    cq_ok = _cached_availability('cryptoquant_indicators')
+    cq_market_data_ok = _cached_availability('cryptoquant_market_data')
     glassnode_ok = _glassnode_key_configured()
-    binance_ok = _binance_public_reachable()
+    binance_ok = _cached_availability('binance_public')
 
     available = []
     for m in all_metrics:
@@ -399,6 +421,25 @@ def render_onchain_analyzer():
 
             fetch_btn = ui.button('Sincronizar APIs', icon='sync').classes('bg-amber-500 text-slate-900 font-bold')
             plot_btn = ui.button('Graficar Datos', icon='insights').classes('bg-slate-700 text-white font-bold')
+
+            async def _refresh_availability():
+                """Comprueba los proveedores en un hilo y afina el selector sin tocar la métrica elegida si sigue válida."""
+                try:
+                    await run.io_bound(_probe_availability_blocking)
+                except Exception:
+                    logger.exception("Falló la comprobación de disponibilidad de proveedores On-Chain")
+                    return
+                current = metric_select.value
+                valid_metrics = _available_metrics_for(symbol_select.value)
+                metric_select.options = valid_metrics
+                metric_select.value = current if current in valid_metrics else (valid_metrics[0] if valid_metrics else None)
+                metric_select.set_visibility(bool(valid_metrics))
+                no_metrics_label.set_visibility(not valid_metrics)
+                fetch_btn.set_enabled(bool(valid_metrics))
+                plot_btn.set_enabled(bool(valid_metrics))
+                metric_select.update()
+
+            ui.timer(0.2, _refresh_availability, once=True)
             # Reconstruye la "Tabla Diaria Completa" (data_layer/unified_dataset.py) desde
             # lo que YA está en la BD, sin volver a llamar a ninguna API — útil la primera
             # vez que se usa esta tabla, ya que "Sincronizar APIs" la reconstruye
@@ -710,7 +751,8 @@ def render_onchain_analyzer():
             # seleccionada en el dropdown. Se lee de la tabla ya construida en vez de
             # recalcular el pivot en cada render: "Sincronizar APIs" y "Reconstruir Base
             # Unificada" son quienes la actualizan.
-            df_unified_wide = get_unified_wide_df(start_date=start_date)
+            # Lectura + pivot de toda la tabla (~0.8 s): en un hilo para no congelar el servidor.
+            df_unified_wide = await run.io_bound(get_unified_wide_df, start_date=start_date)
 
             with table_container:
                 if not df_unified_wide.empty:

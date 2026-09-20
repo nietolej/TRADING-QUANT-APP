@@ -19,6 +19,7 @@ from nicegui import ui
 
 from data_layer.data_sources.binance_options_provider import BinanceOptionsProvider
 from execution_engine.algo_execution_engine import algo_engine, AlgoExecutionTask
+from app_runtime.async_utils import spawn
 
 logger = logging.getLogger("OptionsAlgoPage")
 
@@ -232,11 +233,11 @@ class OptionsAlgoPage:
     def _change_asset(self, asset: str):
         self.current_asset = asset
         self.current_expiry = None
-        asyncio.create_task(self._refresh_options_async())
+        spawn(self._refresh_options_async())
 
     def _change_expiry(self, exp_code: str):
         self.current_expiry = exp_code
-        asyncio.create_task(self._refresh_options_async())
+        spawn(self._refresh_options_async())
 
     async def _refresh_options_async(self):
         """Descarga la cadena de opciones y actualiza la matriz y los gráficos Plotly."""
@@ -436,7 +437,7 @@ class OptionsAlgoPage:
         self.slices_table_container.clear()
 
         # Lanzar TWAP asíncrono
-        asyncio.create_task(
+        spawn(
             algo_engine.execute_twap_async(
                 symbol=sym,
                 side=side,

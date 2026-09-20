@@ -193,7 +193,7 @@ def render_backtest_history_page(on_load_in_analyzer=None, on_open_portfolio=Non
                             cfg = json.loads(run.config_snapshot)
                             custom_p = cfg.get('custom_parameters', {})
                             params_summary = ", ".join([f"{k}:{v}" for k, v in custom_p.items()])
-                        except:
+                        except Exception:
                             params_summary = str(run.config_snapshot)[:40]
 
                     cagr_val = run.cagr if run.cagr is not None else 0.0

@@ -21,6 +21,7 @@ from backtest_engine.metrics import calculate_metrics, calculate_equity_curve_me
 import yaml
 from web_gui.components.tradingview_chart import build_tradingview_plotly_figure
 from data_layer.export_utils import export_df_to_ninjatrader8, format_dt_display, format_date_display, parse_flexible_date
+from app_runtime.async_utils import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -254,7 +255,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                                     'sl': f"{sl}%" if isinstance(sl, (int, float)) else str(sl),
                                     'description': data.get('description', '')
                                 })
-                    except:
+                    except Exception:
                         pass
                 catalog_table.rows = rows
                 catalog_table.update()
@@ -351,7 +352,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                                 cfg = json.loads(run.config_snapshot)
                                 custom_p = cfg.get('custom_parameters', {})
                                 params_summary = ", ".join([f"{k}:{v}" for k, v in custom_p.items()])
-                            except:
+                            except Exception:
                                 params_summary = str(run.config_snapshot)[:40]
 
                         rows.append({
@@ -985,7 +986,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                             try:
                                 dt = pd.to_datetime(v)
                                 return dt.strftime('%d/%m/%y %H:%M')
-                            except:
+                            except Exception:
                                 s = str(v).replace('T', ' ')
                                 return s[:16]
     
@@ -1019,7 +1020,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                                         price_lookup[ts_p.strftime('%Y-%m-%d')] = d_val
                                         price_lookup[format_dt_display(ts_p)] = d_val
                                         price_lookup[format_date_display(ts_p)] = d_val
-                                    except:
+                                    except Exception:
                                         pass
 
                             def _get_ohlc(raw_t):
@@ -1031,7 +1032,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                                     if hasattr(p_ts, 'tz_localize') and p_ts.tz is not None:
                                         p_ts_naive = p_ts.tz_localize(None)
                                         if p_ts_naive in price_lookup: return price_lookup[p_ts_naive]
-                                except:
+                                except Exception:
                                     pass
                                 s = str(raw_t)[:19]
                                 return price_lookup.get(s, {})
@@ -1557,7 +1558,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
         with ui.row().classes('w-full mt-4 gap-3 items-center'):
             btn_run = ui.button(
                 'EJECUTAR PRUEBA RETROSPECTIVA',
-                on_click=lambda e: asyncio.create_task(run_backtest(e))
+                on_click=lambda e: spawn(run_backtest(e))
             ).classes('bg-blue-700 hover:bg-blue-800 text-white font-bold flex-1 py-3')
             
             if on_go_to_live:
@@ -1793,7 +1794,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
 
             def _set_cfg(k, v):
                 chart_config[k] = v
-                asyncio.create_task(render_tradingview_plotly())
+                spawn(render_tradingview_plotly())
 
             def _make_toggle(key, label):
                 return ui.checkbox(label, value=chart_config.get(key, False), on_change=lambda e, k=key: _set_cfg(k, e.value)).classes('text-slate-200 text-sm')
@@ -1877,7 +1878,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
 
         # Renderizado inicial no bloqueante
         import asyncio
-        ui.timer(0.1, lambda: asyncio.create_task(render_tradingview_plotly()), once=True)
+        ui.timer(0.1, lambda: spawn(render_tradingview_plotly()), once=True)
 
 
         _b_init, _q_init = _parse_assets(state.get('symbol', 'BTC/USDT'))

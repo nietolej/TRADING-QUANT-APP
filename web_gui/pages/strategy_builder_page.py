@@ -728,12 +728,12 @@ def render_strategy_builder():
                     ec_start_opts = opts.copy()
                     if state['ec_start_dd'] not in ec_start_opts: ec_start_opts.append(state['ec_start_dd'])
                     try: ec_start.options = ec_start_opts; ec_start.update()
-                    except: pass
+                    except Exception: pass
 
                     ec_stop_opts = opts.copy()
                     if state['ec_stop_dd'] not in ec_stop_opts: ec_stop_opts.append(state['ec_stop_dd'])
                     try: ec_stop.options = ec_stop_opts; ec_stop.update()
-                    except: pass
+                    except Exception: pass
 
                 render_params()
 
@@ -852,7 +852,7 @@ def render_strategy_builder():
                                             'sl': sl_str,
                                             'description': data.get('description', '')
                                         })
-                            except:
+                            except Exception:
                                 pass
                         catalog_table.rows = rows
                         catalog_table.update()
@@ -958,7 +958,7 @@ def render_strategy_builder():
                                         sl_type_select.value = state['sl_type']
                                         _on_tp_type_change(state['tp_type'])
                                         _on_sl_type_change(state['sl_type'])
-                                    except:
+                                    except Exception:
                                         pass
                                     
                                     ui.notify(f"Estrategia '{strategy_name}' cargada", type='info')

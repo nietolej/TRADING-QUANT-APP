@@ -17,6 +17,7 @@ import plotly.graph_objects as go
 from nicegui import ui
 
 from data_layer.data_sources.binance_derivatives_provider import BinanceDerivativesProvider
+from app_runtime.async_utils import spawn
 
 logger = logging.getLogger("DerivativesAnalyzerPage")
 
@@ -220,14 +221,14 @@ class DerivativesAnalyzerPage:
             return
         self.current_symbol = sym
         self._render_symbol_buttons()
-        asyncio.create_task(self._refresh_data_async())
+        spawn(self._refresh_data_async())
 
     def _change_period(self, per: str):
         if self.current_period == per:
             return
         self.current_period = per
         self._render_period_buttons()
-        asyncio.create_task(self._refresh_data_async())
+        spawn(self._refresh_data_async())
 
     def _on_date_changed(self):
         """Manejador cuando el usuario cambia manualmente las fechas en los inputs."""
@@ -235,7 +236,7 @@ class DerivativesAnalyzerPage:
             self.start_date_str = self.input_start_date.value
         if hasattr(self, 'input_end_date') and self.input_end_date.value:
             self.end_date_str = self.input_end_date.value
-        asyncio.create_task(self._refresh_data_async())
+        spawn(self._refresh_data_async())
 
     def _apply_preset(self, preset: str):
         """Aplica rangos temporales rápidos (7D, 30D, 90D, YTD, 1A)."""
@@ -257,7 +258,7 @@ class DerivativesAnalyzerPage:
         if hasattr(self, 'input_end_date'):
             self.input_end_date.value = self.end_date_str
 
-        asyncio.create_task(self._refresh_data_async())
+        spawn(self._refresh_data_async())
 
     def _export_csv_action(self):
         """Exporta los datos a CSV en data/derivatives/ y lanza la descarga en el navegador."""

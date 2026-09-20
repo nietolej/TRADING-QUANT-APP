@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional
 from nicegui import ui
 
 from execution_engine.binance_client import BinanceTestnetClient
+from app_runtime.async_utils import spawn
 
 COMMON_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT']
 
@@ -252,7 +253,7 @@ class BinanceOperationsPage:
             self.btn_mainnet.classes('bg-yellow-500 text-black font-bold', remove='text-gray-400')
             self.btn_testnet.classes('text-gray-400 hover:text-white', remove='bg-yellow-500 text-black font-bold')
         import asyncio
-        asyncio.create_task(self._refresh_all())
+        spawn(self._refresh_all())
 
     def _switch_wallet(self, wallet: str):
         self.selected_wallet = wallet
@@ -266,7 +267,7 @@ class BinanceOperationsPage:
             self.btn_wallet_spot.classes('bg-yellow-500 text-black font-black', remove='text-gray-400')
             self.btn_wallet_futures.classes('text-gray-400 hover:text-white', remove='bg-yellow-500 text-black font-black')
         import asyncio
-        asyncio.create_task(self._refresh_all())
+        spawn(self._refresh_all())
 
     def _client(self) -> BinanceTestnetClient:
         return BinanceTestnetClient(use_testnet=(self.selected_network == 'testnet'))

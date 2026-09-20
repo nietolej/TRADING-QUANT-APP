@@ -1,3 +1,7 @@
+import asyncio
+import json
+import logging
+
 import pandas as pd
 from nicegui.json import orjson_wrapper
 
@@ -32,10 +36,18 @@ from .components.api_credentials_dialog import open_api_credentials_dialog
 from .components.quant_copilot import render_quant_copilot
 from execution_engine.daemon_client import daemon_client as bot_manager
 
+logger = logging.getLogger("WebGUI")
+
+
 def create_gui(app):
     """
     Integra la interfaz de NiceGUI en la aplicación FastAPI existente.
     """
+    # Vigilante del event loop: si el servidor se congela, vuelca la pila de todos los hilos a logs/web.stall.log
+    from nicegui import app as nicegui_app
+    from app_runtime.watchdog import LoopWatchdog
+    nicegui_app.on_startup(LoopWatchdog("web").start)
+
     
     @ui.page('/')
     def dashboard():
@@ -235,8 +247,25 @@ def create_gui(app):
         # Contenedores de las páginas (mantienen estado al ocultarse en lugar de destruirse)
         pages = {}
         menu_buttons = {}
-        live_page = None
-        
+        states = {}     # estado devuelto por cada página YA construida
+        builders = {}   # nombre -> función que construye la página (se ejecuta al abrirla por 1ª vez)
+
+        def ensure_page(page_name):
+            """
+            Construye la página la primera vez que hace falta y devuelve su estado. Antes las 18 páginas
+            se construían en CADA carga (4–10 s con todo el servidor bloqueado, y ~10 tareas de red/BD
+            disparándose aunque nadie las mirara); ahora solo se construye lo que el usuario abre.
+            """
+            if page_name not in states:
+                with pages[page_name]:
+                    states[page_name] = builders[page_name]()
+            return states[page_name]
+
+        def _notify_live_visibility(page_name):
+            live = states.get('live')
+            if live is not None and hasattr(live, 'set_page_active'):
+                live.set_page_active(page_name == 'live')
+
         def show_page(page_name):
             for name, container in pages.items():
                 container.set_visibility(name == page_name)
@@ -245,12 +274,30 @@ def create_gui(app):
                     btn.classes(replace='w-full justify-start text-left bg-amber-500/20 text-amber-400 font-bold border border-amber-500/50 shadow-sm text-xs py-2.5 px-3 rounded-lg transition-all')
                 else:
                     btn.classes(replace='w-full justify-start text-left text-slate-300 hover:text-white hover:bg-slate-800/80 font-medium text-xs py-2.5 px-3 rounded-lg transition-all border border-transparent')
-            
-            if live_page and hasattr(live_page, 'set_page_active'):
-                live_page.set_page_active(page_name == 'live')
 
             # Persistir la página activa en localStorage del navegador
             ui.run_javascript(f"localStorage.setItem('tqa_active_page', '{page_name}');")
+
+            if page_name in states:
+                _notify_live_visibility(page_name)
+                return
+
+            # Primera vez: se muestra "Cargando…" y se construye tras dejar que el navegador pinte.
+            with pages[page_name]:
+                with ui.row().classes('w-full items-center justify-center gap-3 p-10') as loading:
+                    ui.spinner('dots', size='lg', color='amber')
+                    ui.label('Cargando módulo…').classes('text-slate-400 text-sm')
+
+            def _build():
+                loading.delete()
+                try:
+                    ensure_page(page_name)
+                except Exception as exc:
+                    logger.exception("No se pudo construir la página '%s'", page_name)
+                    ui.notify(f"Error cargando el módulo '{page_name}': {exc}", type='negative', timeout=10000)
+                _notify_live_visibility(page_name)
+
+            ui.timer(0.05, _build, once=True)
 
         # Menú Lateral Vertical Izquierdo (Left Drawer) con estilo Bloomberg Obsidian
         with ui.left_drawer(value=True).classes('bg-[#080c14] text-white border-r border-[#1e293b] p-3 flex flex-col justify-between overflow-y-auto').props('bordered width=260 :breakpoint="0" no-swipe-open') as left_drawer:
@@ -327,117 +374,126 @@ def create_gui(app):
                 ).props('flat no-caps align=left').classes('w-full justify-start text-left text-slate-300 hover:text-white hover:bg-slate-800/80 font-medium text-xs py-2 px-3 rounded-lg transition-all')
 
 
-        # Contenedor principal
+        # Contenedor principal: un contenedor vacío por página; su contenido se construye al abrirla.
+        page_names = [
+            'builder', 'catalog', 'analyzer', 'portfolio', 'optimizer', 'history', 'market', 'ml', 'live', 'mle',
+            'onchain', 'halving', 'binance_account', 'binance_operations', 'binance_p2p', 'derivatives',
+            'options_algo', 'reconciliation',
+        ]
         with ui.column().classes('w-full h-full p-2 md:p-3 bg-[#0a0e17]'):
-            
-            # --- Instanciar Páginas ---
-            with ui.column().classes('w-full h-full') as pages['builder']:
-                builder_state = render_strategy_builder()
-                
-            with ui.column().classes('w-full h-full') as pages['catalog']:
-                def on_edit(row):
-                    if builder_state and 'load_strategy_data' in builder_state:
-                        builder_state['load_strategy_data'](row['name'])
-                    show_page('builder')
+            for _name in page_names:
+                with ui.column().classes('w-full h-full') as pages[_name]:
+                    pass
 
-                def on_analyze(row):
-                    if analyzer_state and 'select_strategy' in analyzer_state:
-                        analyzer_state['select_strategy'](row.get('filename'))
-                    show_page('analyzer')
-                render_strategy_catalog(on_edit_strategy=on_edit, on_select_strategy=on_analyze)
+        # --- Constructores de cada página (los callbacks entre páginas construyen la de destino si hace falta) ---
+        def build_builder():
+            return render_strategy_builder()
 
-            with ui.column().classes('w-full h-full') as pages['analyzer']:
-                def on_back_to_builder():
-                    show_page('builder')
-                
-                def on_go_to_live(strategy_filename):
-                    if strategy_filename and live_page:
-                        matching = [b for b in bot_manager.get_all_bots() if strategy_filename in getattr(b, 'strategy_yaml_path', '')]
-                        if matching:
-                            live_page._select_bot(matching[0].bot_id)
-                    show_page('live')
+        def build_catalog():
+            def on_edit(row):
+                builder_state = ensure_page('builder')
+                if builder_state and 'load_strategy_data' in builder_state:
+                    builder_state['load_strategy_data'](row['name'])
+                show_page('builder')
 
-                def on_go_to_portfolio_page():
-                    show_page('portfolio')
-                    
-                analyzer_state = render_strategy_analyzer(
-                    on_back_to_builder=on_back_to_builder,
-                    on_go_to_live=on_go_to_live,
-                    on_go_to_portfolio=on_go_to_portfolio_page
-                )
+            def on_analyze(row):
+                analyzer_state = ensure_page('analyzer')
+                if analyzer_state and 'select_strategy' in analyzer_state:
+                    analyzer_state['select_strategy'](row.get('filename'))
+                show_page('analyzer')
 
-            with ui.column().classes('w-full h-full') as pages['portfolio']:
-                portfolio_state = render_portfolio_page()
+            render_strategy_catalog(on_edit_strategy=on_edit, on_select_strategy=on_analyze)
+            return True
 
-            with ui.column().classes('w-full h-full') as pages['optimizer']:
-                def on_opt_go_to_analyzer(strat_name=None, symbol=None, timeframe=None, custom_params=None):
-                    if analyzer_state and 'select_strategy' in analyzer_state:
-                        if strat_name:
-                            analyzer_state['select_strategy'](strat_name, symbol=symbol, timeframe=timeframe, custom_params=custom_params)
-                    show_page('analyzer')
+        def build_analyzer():
+            def on_back_to_builder():
+                show_page('builder')
 
-                render_optimizer_page(on_go_to_analyzer=on_opt_go_to_analyzer)
+            def on_go_to_live(strategy_filename):
+                live_page = ensure_page('live')
+                if strategy_filename and live_page:
+                    matching = [b for b in bot_manager.get_all_bots() if strategy_filename in getattr(b, 'strategy_yaml_path', '')]
+                    if matching:
+                        live_page._select_bot(matching[0].bot_id)
+                show_page('live')
 
-            with ui.column().classes('w-full h-full') as pages['history']:
-                def on_load_to_analyzer(row):
-                    if analyzer_state and 'load_from_history' in analyzer_state:
-                        analyzer_state['load_from_history'](row)
-                    show_page('analyzer')
+            def on_go_to_portfolio_page():
+                show_page('portfolio')
 
-                def on_open_portfolio(row=None):
-                    if row and portfolio_state and 'load_strategy' in portfolio_state:
-                        cfg_custom = None
-                        if row.get('config_snapshot'):
-                            try:
-                                cfg = json.loads(row['config_snapshot'])
-                                cfg_custom = cfg.get('custom_parameters')
-                            except Exception:
-                                pass
-                        portfolio_state['load_strategy'](
-                            row.get('strategy_name'),
-                            symbol=row.get('symbol'),
-                            timeframe=row.get('timeframe'),
-                            custom_params=cfg_custom
-                        )
-                    show_page('portfolio')
+            return render_strategy_analyzer(
+                on_back_to_builder=on_back_to_builder,
+                on_go_to_live=on_go_to_live,
+                on_go_to_portfolio=on_go_to_portfolio_page
+            )
 
-                render_backtest_history_page(on_load_in_analyzer=on_load_to_analyzer, on_open_portfolio=on_open_portfolio)
-                
-            with ui.column().classes('w-full h-full') as pages['market']:
-                render_market_analyzer()
-                
-            with ui.column().classes('w-full h-full') as pages['ml']:
-                render_ml_page()
+        def build_portfolio():
+            return render_portfolio_page()
 
-            with ui.column().classes('w-full h-full') as pages['live']:
-                live_page = render_live_monitor_page()
-                
-            with ui.column().classes('w-full h-full') as pages['mle']:
-                render_mle_thermometer_page()
-                
-            with ui.column().classes('w-full h-full') as pages['onchain']:
-                render_onchain_analyzer()
-                
-            with ui.column().classes('w-full h-full') as pages['halving']:
-                render_halving_analyzer()
+        def build_optimizer():
+            def on_opt_go_to_analyzer(strat_name=None, symbol=None, timeframe=None, custom_params=None):
+                analyzer_state = ensure_page('analyzer')
+                if analyzer_state and 'select_strategy' in analyzer_state:
+                    if strat_name:
+                        analyzer_state['select_strategy'](strat_name, symbol=symbol, timeframe=timeframe, custom_params=custom_params)
+                show_page('analyzer')
 
-            with ui.column().classes('w-full h-full') as pages['binance_account']:
-                render_binance_account_page()
+            render_optimizer_page(on_go_to_analyzer=on_opt_go_to_analyzer)
+            return True
 
-            with ui.column().classes('w-full h-full') as pages['binance_operations']:
-                render_binance_operations_page()
+        def build_history():
+            def on_load_to_analyzer(row):
+                analyzer_state = ensure_page('analyzer')
+                if analyzer_state and 'load_from_history' in analyzer_state:
+                    analyzer_state['load_from_history'](row)
+                show_page('analyzer')
 
-            with ui.column().classes('w-full h-full') as pages['binance_p2p']:
-                render_binance_p2p_page()
+            def on_open_portfolio(row=None):
+                portfolio_state = ensure_page('portfolio')
+                if row and portfolio_state and 'load_strategy' in portfolio_state:
+                    cfg_custom = None
+                    if row.get('config_snapshot'):
+                        try:
+                            cfg = json.loads(row['config_snapshot'])
+                            cfg_custom = cfg.get('custom_parameters')
+                        except Exception:
+                            logger.warning("config_snapshot ilegible en el historial de backtests", exc_info=True)
+                    portfolio_state['load_strategy'](
+                        row.get('strategy_name'),
+                        symbol=row.get('symbol'),
+                        timeframe=row.get('timeframe'),
+                        custom_params=cfg_custom
+                    )
+                show_page('portfolio')
 
-            with ui.column().classes('w-full h-full') as pages['derivatives']:
-                render_derivatives_analyzer_page()
+            render_backtest_history_page(on_load_in_analyzer=on_load_to_analyzer, on_open_portfolio=on_open_portfolio)
+            return True
 
-            with ui.column().classes('w-full h-full') as pages['options_algo']:
-                render_options_algo_page()
+        def simple(render_fn):
+            def _build():
+                result = render_fn()
+                return result if result is not None else True
+            return _build
 
-            with ui.column().classes('w-full h-full') as pages['reconciliation']:
-                render_reconciliation_page()
+        builders.update({
+            'builder': build_builder,
+            'catalog': build_catalog,
+            'analyzer': build_analyzer,
+            'portfolio': build_portfolio,
+            'optimizer': build_optimizer,
+            'history': build_history,
+            'market': simple(render_market_analyzer),
+            'ml': simple(render_ml_page),
+            'live': render_live_monitor_page,
+            'mle': simple(render_mle_thermometer_page),
+            'onchain': simple(render_onchain_analyzer),
+            'halving': simple(render_halving_analyzer),
+            'binance_account': simple(render_binance_account_page),
+            'binance_operations': simple(render_binance_operations_page),
+            'binance_p2p': simple(render_binance_p2p_page),
+            'derivatives': simple(render_derivatives_analyzer_page),
+            'options_algo': simple(render_options_algo_page),
+            'reconciliation': simple(render_reconciliation_page),
+        })
 
         # Renderizar Copiloto Cuantitativo Flotante (Conectado a Binance MCP)
         copilot_holder[0] = render_quant_copilot()

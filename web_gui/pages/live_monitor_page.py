@@ -1,5 +1,6 @@
 from nicegui import ui, run
 import asyncio
+import time
 import os
 import glob
 import yaml
@@ -12,6 +13,7 @@ from typing import Optional, Dict, Any
 from execution_engine.daemon_client import daemon_client as bot_manager, daemon_client, BotProxy
 from execution_engine.paper_trader import PaperTrader
 from execution_engine.binance_client import BinanceTestnetClient
+from app_runtime.async_utils import spawn
 
 logger = logging.getLogger("LiveMonitorPage")
 
@@ -83,7 +85,7 @@ class LiveMonitorPage:
         if is_active:
             self._last_chart_kline_len = -1
             self._last_trades_hash = None
-            asyncio.create_task(self._sync_exchange_positions(show_notify=False))
+            spawn(self._sync_exchange_positions(show_notify=False))
             self._refresh_ui_elements(force_dom_rebuild=True)
 
     def _get_available_strategies(self) -> list[str]:
@@ -103,34 +105,37 @@ class LiveMonitorPage:
 
     def _ensure_default_bot(self):
         """Si no hay bots registrados, crear uno inicial por defecto con saldo en la divisa base (1.0 BTC)."""
+        # Sin daemon no hay bots que gestionar ni crear (los bots viven solo en el daemon).
+        if not bot_manager.is_daemon_online():
+            return
         bots = bot_manager.get_all_bots()
         has_api_key = bool(os.getenv("BINANCE_API_KEY", "").strip())
-        
+
         if not bots:
             strategies = self._get_available_strategies()
             strat_file = strategies[0] if strategies else "ema_long.yaml"
             strat_path = os.path.join(self.strategies_dir, strat_file)
-            
+
             if os.path.exists(strat_path):
                 params = self._load_strategy_params(strat_file)
-                default_bot = bot_manager.create_bot(
-                    strategy_yaml_path=strat_path,
-                    name="Bot 1 (BTC/USDT)",
-                    symbol="BTC/USDT",
-                    timeframe="1m",
-                    initial_balance=1.0,
-                    currency="BTC",
-                    use_testnet=has_api_key,
-                    custom_parameters=params,
-                )
-                self.selected_bot_id = default_bot.bot_id
+                try:
+                    default_bot = bot_manager.create_bot(
+                        strategy_yaml_path=strat_path,
+                        name="Bot 1 (BTC/USDT)",
+                        symbol="BTC/USDT",
+                        timeframe="1m",
+                        initial_balance=1.0,
+                        currency="BTC",
+                        use_testnet=has_api_key,
+                        custom_parameters=params,
+                    )
+                    self.selected_bot_id = default_bot.bot_id
+                except Exception:
+                    logger.exception("No se pudo crear el bot por defecto")
         else:
-            for b in bots:
-                # Si hay API key de Binance pero el bot tenía testnet desactivado, activarlo
-                if has_api_key and not b.use_testnet:
-                    b.use_testnet = True
-                    if b._client:
-                        b._client.use_testnet = True
+            # (Antes aquí se forzaba use_testnet=True en cualquier bot cuando había API key de Binance
+            # definida: cambiaba en silencio la red elegida por el usuario —un bot Mainnet pasaba a
+            # Testnet cada vez que se abría esta página—. La red la decide solo el usuario.)
             if not self.selected_bot_id or not bot_manager.get_bot(self.selected_bot_id):
                 self.selected_bot_id = bots[0].bot_id
 
@@ -1210,7 +1215,7 @@ class LiveMonitorPage:
             self._sync_counter = getattr(self, '_sync_counter', 0) + 1
             # Sincronizar activamente con Binance cada 2 ciclos (~3 segundos)
             if self._sync_counter % 2 == 0:
-                asyncio.create_task(self._sync_exchange_positions(show_notify=False))
+                spawn(self._sync_exchange_positions(show_notify=False))
 
             # Prefetch de red fuera del event loop principal
             bots, summary, all_unexec, daemon_status = await run.io_bound(self._fetch_live_monitor_data)
@@ -1223,7 +1228,12 @@ class LiveMonitorPage:
                 prefetched_daemon_status=daemon_status
             )
         except Exception:
-            pass
+            # Antes se tragaba en silencio: si la actualización fallaba, el monitor se quedaba congelado
+            # sin ninguna pista. Se registra como máximo una vez cada 30 s para no inundar el log.
+            now = time.monotonic()
+            if now - getattr(self, '_last_ui_error_log', 0.0) > 30.0:
+                self._last_ui_error_log = now
+                logger.exception("Error actualizando el Live Monitor")
 
     def _fetch_live_monitor_data(self):
         """Ejecuta en un hilo aparte (run.io_bound) todas las llamadas de red bloqueantes

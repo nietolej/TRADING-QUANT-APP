@@ -25,6 +25,7 @@ from execution_engine.daemon_client import daemon_client as bot_manager
 from reconciliation.models import AppOrderRecord, ReconciliationRecord
 from reconciliation.reconciler import OrderReconciler
 from reconciliation.reports import get_session_report, list_session_reports, save_session_report
+from app_runtime.async_utils import spawn
 
 logger = logging.getLogger("ReconciliationPage")
 
@@ -602,7 +603,7 @@ class ReconciliationPage:
 
     def _toggle_test2(self):
         if self.test2_session is not None:
-            asyncio.create_task(self._stop_test2())
+            spawn(self._stop_test2())
             return
 
         bot_id = self.test2_bot_select.value
@@ -631,7 +632,7 @@ class ReconciliationPage:
         self.test2_status_label.set_text(
             f"Sesión iniciada a las {started_at.strftime('%H:%M:%S')} UTC. Esperando órdenes del bot..."
         )
-        asyncio.create_task(self._run_test2_tick())
+        spawn(self._run_test2_tick())
 
     async def _build_and_render_test2(self, finished: bool) -> Optional[Dict[str, Any]]:
         """Concilia la sesión, guarda el informe en BD (en curso o finalizado) y refresca la pantalla."""

@@ -16,6 +16,7 @@ from execution_engine.binance_client import (
 from execution_engine.security_manager import SecurityManager, is_real_trading_enabled
 from analytics.portfolio_risk_analyzer import PortfolioRiskAnalyzer
 from web_gui.components.api_credentials_dialog import open_api_credentials_dialog
+from app_runtime.async_utils import spawn
 
 
 def _format_time(ts) -> str:
@@ -523,7 +524,7 @@ class BinanceAccountPage:
             if hasattr(self, 'multi_assets_btn'):
                 self.multi_assets_btn.set_visibility(False)
 
-        asyncio.create_task(self._refresh_account_data_async())
+        spawn(self._refresh_account_data_async())
 
     def _switch_network(self, net: str):
         self.selected_network = net
@@ -542,7 +543,7 @@ class BinanceAccountPage:
             if hasattr(self, 'kpi_spot_net_badge'):
                 self.kpi_spot_net_badge.set_text('Entorno: Binance Real (Mainnet)')
         
-        asyncio.create_task(self._refresh_account_data_async())
+        spawn(self._refresh_account_data_async())
 
     async def _refresh_account_data_async(self):
         """Descarga de forma asíncrona todos los datos de la cuenta según la cartera y red seleccionadas."""
@@ -1145,7 +1146,7 @@ class BinanceAccountPage:
                 ui.button('Cancelar', on_click=dlg.close).props('flat').classes('text-gray-400 hover:text-white font-bold text-xs')
                 ui.button(
                     '🚨 SÍ, ACTIVAR KILL-SWITCH', 
-                    on_click=lambda: [dlg.close(), asyncio.create_task(self._execute_emergency_kill_switch())]
+                    on_click=lambda: [dlg.close(), spawn(self._execute_emergency_kill_switch())]
                 ).classes('bg-red-600 hover:bg-red-700 text-white font-black text-xs px-4 py-2 rounded-xl shadow-lg')
         dlg.open()
 

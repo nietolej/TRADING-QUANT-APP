@@ -6,7 +6,9 @@ el cálculo de métricas de impacto, matrices de correlación y modelos de proye
 """
 
 import os
+import copy
 import logging
+import functools
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
@@ -83,6 +85,43 @@ CACHE_FILE = os.path.join(DATA_DIR, "btc_daily_historical.parquet")
 STABLECOIN_CACHE_FILE = os.path.join(DATA_DIR, "stablecoins_daily_historical.csv")
 
 
+
+def _data_fingerprint(analyzer) -> tuple:
+    """Identifica los datos vigentes: cambia si se recargan/refrescan los DataFrames."""
+    parts = []
+    for df in (analyzer.df_btc, analyzer.df_stables):
+        if df is None or df.empty:
+            parts.append(None)
+        else:
+            parts.append((id(df), len(df), str(df.index[-1])))
+    return tuple(parts)
+
+
+def _memoized(method):
+    """
+    Cachea el resultado de un cálculo pesado del analizador mientras no cambien sus datos.
+
+    La página de Halving recalculaba métricas de ciclo, series y crecimientos periódicos en CADA
+    apertura (~2 s bloqueando el servidor). El resultado solo depende de los argumentos y de los
+    DataFrames cargados, así que se reutiliza; se devuelve una copia profunda porque los llamadores
+    añaden columnas y modifican lo recibido.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            key = (method.__name__, args, tuple(sorted(kwargs.items())))
+            hash(key)
+        except TypeError:
+            return method(self, *args, **kwargs)  # argumentos no hasheables (p. ej. DataFrames): sin caché
+        fingerprint = _data_fingerprint(self)
+        hit = self._memo.get(key)
+        if hit is not None and hit[0] == fingerprint:
+            return copy.deepcopy(hit[1])
+        result = method(self, *args, **kwargs)
+        self._memo[key] = (fingerprint, result)
+        return copy.deepcopy(result)
+    return wrapper
+
 class BTCHalvingAnalyzer:
     """
     Analizador cuantitativo de los ciclos de Halving de Bitcoin y Liquidez de Stablecoins.
@@ -93,6 +132,7 @@ class BTCHalvingAnalyzer:
         self.stablecoin_cache_file = stablecoin_cache_file
         self.df_btc: Optional[pd.DataFrame] = None
         self.df_stables: Optional[pd.DataFrame] = None
+        self._memo: dict = {}
         self.halvings = [h for h in HALVING_EVENTS if h["id"] != "H5"]  # Ciclos pasados y actual
         self.ensure_data_loaded()
 
@@ -328,6 +368,7 @@ class BTCHalvingAnalyzer:
         if self.df_stables is None or self.df_stables.empty:
             self.df_stables = self.fetch_historical_stablecoin_data()
 
+    @_memoized
     def get_stablecoins_halving_series(
         self,
         pre_days: int = 180,
@@ -410,6 +451,7 @@ class BTCHalvingAnalyzer:
 
         return cycle_series
 
+    @_memoized
     def calculate_stablecoin_summary_kpis(self) -> Dict[str, Any]:
         """
         Calcula KPIs macroeconómicos de liquidez de stablecoins para tarjetas de cabecera.
@@ -458,6 +500,7 @@ class BTCHalvingAnalyzer:
             "avg_sem1_growth_pct": round(avg_sem1, 1)
         }
 
+    @_memoized
     def get_halving_series(
         self,
         pre_days: int = 365,
@@ -569,6 +612,7 @@ class BTCHalvingAnalyzer:
 
         return pd.DataFrame(bench_rows)
 
+    @_memoized
     def calculate_cycle_metrics(self) -> List[Dict[str, Any]]:
         """
         Calcula las métricas cuantitativas clave de impacto para cada uno de los 4 Halvings.
@@ -693,6 +737,7 @@ class BTCHalvingAnalyzer:
 
         return metrics_list
 
+    @_memoized
     def calculate_correlation_matrix(self, max_day_window: int = 450) -> Dict[str, Any]:
         """
         Calcula la matriz de correlación de Pearson y Spearman entre todos los ciclos de Halving
@@ -738,6 +783,7 @@ class BTCHalvingAnalyzer:
             "similarity_scores": similarity_scores
         }
 
+    @_memoized
     def calculate_diminishing_returns_model(self) -> Dict[str, Any]:
         """
         Calcula el modelo de rendimientos decrecientes (Diminishing Returns)
@@ -815,6 +861,7 @@ class BTCHalvingAnalyzer:
             "estimated_peak_window": estimated_peak_window
         }
 
+    @_memoized
     def calculate_periodic_growth_analysis(
         self,
         timeframe: str = "month",

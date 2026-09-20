@@ -17,6 +17,7 @@ from backtest_engine.optimizer import run_grid_search, count_combinations, _buil
 from backtest_engine.robustness_analyzer import analyze_robustness
 from sqlalchemy import func
 from data_layer.export_utils import format_date_display, format_dt_display, parse_flexible_date
+from app_runtime.async_utils import spawn
 
 SAVED_OPTIMIZATIONS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "saved_optimizations.json")
 
@@ -487,7 +488,7 @@ def render_optimizer_page(on_go_to_analyzer=None):
                 with ui.row().classes('items-center gap-2'):
                     btn_run_opt = ui.button(
                         '🚀 INICIAR OPTIMIZADOR (GRID SEARCH)',
-                        on_click=lambda: asyncio.create_task(_run_optimizer())
+                        on_click=lambda: spawn(_run_optimizer())
                     ).classes('bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold px-8 py-3 rounded-xl shadow-lg transition-all text-sm tracking-wide')
 
                     def _cancel_optimizer():
@@ -503,7 +504,7 @@ def render_optimizer_page(on_go_to_analyzer=None):
 
                     btn_wf = ui.button(
                         '🔄 WALK-FORWARD',
-                        on_click=lambda: asyncio.create_task(_run_walk_forward_ui())
+                        on_click=lambda: spawn(_run_walk_forward_ui())
                     ).classes('bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold px-5 py-3 rounded-xl shadow transition-all text-sm')
 
             # Barra de Progreso

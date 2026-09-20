@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from nicegui import ui
 
+from app_runtime.async_utils import spawn
 from api.mcp.binance_mcp_server import (
     binance_test_connection,
     binance_get_account_balance,
@@ -152,7 +153,7 @@ class QuantCopilotChat:
         })
         self.is_thinking = True
         self._render_messages_dom()
-        asyncio.create_task(self._process_copilot_response(text))
+        spawn(self._process_copilot_response(text))
 
     def _render_messages_dom(self):
         """Reconstruye los mensajes dentro del contenedor de manera segura."""
