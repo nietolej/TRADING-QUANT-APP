@@ -347,7 +347,7 @@ class PaperTrader:
                                         # que el SL/TP interno la vigile.
                                         adopted_side = "long" if pos_amt > 0 else "short"
                                         adopted_entry = entry_p if entry_p > 0 else mark_p
-                                        self.position = Position(adopted_side, adopted_entry, abs(pos_amt), datetime.now())
+                                        self.position = Position(adopted_side, adopted_entry, abs(pos_amt), datetime.now(timezone.utc))
                                         try:
                                             idx = len(self.klines_df) - 1
                                             sl_p, tp_p = self.strategy.risk_manager.compute_sl_tp(self.klines_df, idx, adopted_side)
@@ -381,7 +381,7 @@ class PaperTrader:
                                         exit_p = mark_p if mark_p > 0 else (self.current_bid if self.position.side == 'long' else self.current_ask)
                                         if exit_p <= 0:
                                             exit_p = self.position.entry_price
-                                        self._close_position(exit_p, datetime.now(), reason="BINANCE_EXCHANGE_CLOSED")
+                                        self._close_position(exit_p, datetime.now(timezone.utc), reason="BINANCE_EXCHANGE_CLOSED")
 
                                     # Cancelar cualquier orden condicional huérfana restante si no hay posición abierta en el exchange
                                     if getattr(self, '_had_open_binance_pos', False) or (self.position is None and self.use_testnet and self._client):
@@ -1078,6 +1078,36 @@ class PaperTrader:
         )
         self._save_state()
 
+    def _find_real_exit_fill(self, pos: "Position"):
+        """
+        Busca en el historial de fills de Binance el cierre real de `pos`: los fills del lado
+        contrario posteriores al último fill de entrada de esa posición.
+
+        Devuelve (estado, precio): ("FOUND", precio medio ponderado) si hubo cierre real,
+        ("NONE", None) si Binance no registra ningún cierre (la posición nunca existió allí) o
+        ("ERROR", None) si no se pudo consultar (el llamador conserva el comportamiento previo).
+        """
+        try:
+            entry_ts = pd.Timestamp(pos.entry_timestamp)
+            entry_ts = entry_ts.tz_localize("UTC") if entry_ts.tzinfo is None else entry_ts.tz_convert("UTC")
+            # Margen de 2 min: para posiciones propias entry_timestamp es la apertura de la vela,
+            # hasta 1 min antes del fill de entrada real.
+            start_ms = int(entry_ts.timestamp() * 1000) - 120_000
+            fills = self._client.client.futures_account_trades(
+                symbol=self.symbol.replace("/", "").upper(), startTime=start_ms, limit=1000
+            )
+            entry_side, exit_side = ("BUY", "SELL") if pos.side == "long" else ("SELL", "BUY")
+            fills = sorted(fills, key=lambda f: f["time"])
+            last_entry_idx = max((i for i, f in enumerate(fills) if f["side"] == entry_side), default=-1)
+            closing = [f for f in fills[last_entry_idx + 1:] if f["side"] == exit_side]
+            qty = sum(float(f["qty"]) for f in closing)
+            if qty <= 0:
+                return "NONE", None
+            return "FOUND", sum(float(f["qty"]) * float(f["price"]) for f in closing) / qty
+        except Exception as e:
+            logger.warning("[%s] No se pudo consultar el fill de cierre real en Binance: %s", self.name, e)
+            return "ERROR", None
+
     def _close_position(self, price: float, ts, reason: str):
         """Cierra la posición abierta, calcula PNL y persiste el trade, verificando ejecución en el exchange."""
         pos = self.position
@@ -1136,11 +1166,33 @@ class PaperTrader:
                         )
                         self._client.cancel_all_open_orders(self.symbol)
                     elif reduce_only_rejected:
-                        self._notify(
-                            "ℹ️ Binance reporta que la posición ya no existe (ReduceOnly rechazado). "
-                            "Sincronizando estado interno como cerrada."
-                        )
+                        # Antes se cerraba internamente al precio de la señal SIN verificar que la
+                        # posición hubiera existido: una posición adoptada que ya no estaba en
+                        # Binance (ej. la de un test ejecutado en el mismo símbolo) se registraba
+                        # como un trade con PNL inventado. Ahora se busca el cierre real en el
+                        # historial de fills de Binance.
+                        fill_status, real_exit_price = self._find_real_exit_fill(pos)
                         self._client.cancel_all_open_orders(self.symbol)
+                        if fill_status == "NONE":
+                            self._notify(
+                                f"⚠️ Posición {pos.side.upper()} {pos.quantity:.6f} @ {pos.entry_price:.4f} descartada: "
+                                f"Binance no la tiene y no hay ningún fill de cierre desde su apertura. "
+                                f"No se registra ningún trade (no existió en el exchange)."
+                            )
+                            self.position = None
+                            self._save_state()
+                            return
+                        if fill_status == "FOUND":
+                            price = real_exit_price
+                            self._notify(
+                                f"ℹ️ Binance ya había cerrado la posición (ReduceOnly rechazado). "
+                                f"Se registra el cierre al precio real del fill: {price:.2f}."
+                            )
+                        else:
+                            self._notify(
+                                "ℹ️ Binance reporta que la posición ya no existe (ReduceOnly rechazado) y no se pudo "
+                                "consultar el fill de cierre. Sincronizando estado interno como cerrada al precio de la señal."
+                            )
                     else:
                         err_msg = str(err or "Orden de cierre rechazada o no confirmada por Binance")
                         self.record_unexecuted_order(

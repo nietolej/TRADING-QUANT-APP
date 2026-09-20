@@ -103,6 +103,7 @@ class OrderReconciler:
             "requested_price": record.requested_price,
             "avg_price": record.avg_price,
             "reference_price": record.reference_price,
+            # Costo de deslizamiento firmado en % (positivo = en contra, negativo = a favor).
             "slippage_pct": None,
             "checks": {
                 "created_in_app": True,
@@ -287,9 +288,14 @@ class OrderReconciler:
             # Deslizamiento: compara el precio realmente ejecutado contra el precio de
             # referencia tomado justo antes de enviar la orden (cubre también MARKET, que no
             # tiene requested_price). Sin referencia disponible, no se puede evaluar slippage.
+            # El deslizamiento es un COSTO firmado: positivo = ejecutado peor que la referencia
+            # (compra más cara / venta más barata), negativo = a favor. Solo el que va en contra
+            # cuenta contra la tolerancia; antes se medía en valor absoluto y una venta que salió
+            # MEJOR de lo esperado se marcaba como SLIPPAGE_EXCEEDED.
             reference = record.reference_price or record.requested_price
             if reference and avg_price:
-                slippage_pct = abs(avg_price - reference) / abs(reference) * 100.0
+                direction = 1.0 if (record.side or "").upper() == "BUY" else -1.0
+                slippage_pct = (avg_price - reference) / abs(reference) * 100.0 * direction
                 detail["slippage_pct"] = round(slippage_pct, 4)
                 if slippage_pct > self.slippage_tolerance_pct:
                     return _result(

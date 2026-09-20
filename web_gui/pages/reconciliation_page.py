@@ -80,7 +80,7 @@ ORDER_COLUMNS = [
     {"name": "executed_qty", "label": "Cant. Ejecutada", "field": "executed_qty", "align": "right"},
     {"name": "reference_price", "label": "Precio Referencia", "field": "reference_price", "align": "right"},
     {"name": "avg_price", "label": "Precio Ejecutado", "field": "avg_price", "align": "right"},
-    {"name": "slippage_pct", "label": "Deslizamiento %", "field": "slippage_pct", "align": "right"},
+    {"name": "slippage_pct", "label": "Deslizamiento % (+ en contra)", "field": "slippage_pct", "align": "right"},
     {"name": "binance_status", "label": "Estado Binance", "field": "binance_status", "align": "left"},
     {"name": "match_status", "label": "Conciliación", "field": "match_status", "align": "left"},
     {"name": "severity", "label": "Severidad", "field": "severity", "align": "left"},
@@ -466,13 +466,43 @@ class ReconciliationPage:
         }
         self.test2_bot_select.update()
 
+    async def _symbol_in_use_by_bot(self, symbol: str) -> bool:
+        """
+        True (y avisa al usuario) si algún bot de Testnet está corriendo sobre `symbol`. Los tests
+        1 y 1b abren y cierran posiciones reales en la cuenta; con un bot activo en el mismo
+        símbolo, el bot ve esa posición en Binance, la ADOPTA como propia y luego registra un
+        trade que nunca operó (o interfiere con sus SL/TP). Por eso se bloquean.
+        """
+        target = symbol.replace('/', '').upper()
+        loop = asyncio.get_event_loop()
+        try:
+            bots = await loop.run_in_executor(None, bot_manager.get_all_bots)
+        except Exception as e:
+            ui.notify(f'No se pudo verificar si hay bots corriendo ({e}); el test se cancela por seguridad.', type='negative')
+            return True
+        running = [
+            b for b in bots
+            if b.is_running and getattr(b, 'use_testnet', True) and b.symbol.replace('/', '').upper() == target
+        ]
+        if running:
+            names = ', '.join(b.name for b in running)
+            ui.notify(
+                f'Test cancelado: {names} está corriendo en {target} y adoptaría la posición de prueba. '
+                f'Detén el bot o usa otro símbolo.',
+                type='warning', duration=10000,
+            )
+            return True
+        return False
+
     # ── Test 1: verificación de una orden ────────────────────────────────
 
     async def _run_verify_async(self):
+        symbol = (self.verify_symbol_input.value or 'BTC/USDT').strip()
+        if await self._symbol_in_use_by_bot(symbol):
+            return
         self.verify_btn.props('loading')
         self.verify_results_col.clear()
         try:
-            symbol = (self.verify_symbol_input.value or 'BTC/USDT').strip()
             qty = float(self.verify_qty_input.value or 0.001)
             side = self.verify_side_select.value or 'long'
             loop = asyncio.get_event_loop()
@@ -522,10 +552,12 @@ class ReconciliationPage:
     # ── Test 1b: ciclo completo inmediato (entrada + SL/TP + cierre) ─────
 
     async def _run_cycle_async(self):
+        symbol = (self.cycle_symbol_input.value or 'BTC/USDT').strip()
+        if await self._symbol_in_use_by_bot(symbol):
+            return
         self.cycle_btn.props('loading')
         self.cycle_results_col.clear()
         try:
-            symbol = (self.cycle_symbol_input.value or 'BTC/USDT').strip()
             qty = float(self.cycle_qty_input.value or 0.001)
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
