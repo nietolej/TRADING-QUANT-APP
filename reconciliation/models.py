@@ -57,8 +57,8 @@ class ReconciliationRecord(Base):
     app_order_ref = Column(String, nullable=True, index=True)
     binance_order_id = Column(String, nullable=True, index=True)
 
-    # MATCHED | PRICE_MISMATCH | QTY_MISMATCH | STATUS_MISMATCH | MISSING_ON_BINANCE |
-    # ORPHAN_ON_BINANCE | SLIPPAGE_EXCEEDED | ERROR
+    # MATCHED | CANCELED_AS_EXPECTED | PRICE_MISMATCH | QTY_MISMATCH | STATUS_MISMATCH |
+    # MISSING_ON_BINANCE | ORPHAN_ON_BINANCE | SLIPPAGE_EXCEEDED | ERROR
     match_status = Column(String, index=True)
     severity = Column(String)  # INFO | WARNING | CRITICAL
     details = Column(Text, nullable=True)

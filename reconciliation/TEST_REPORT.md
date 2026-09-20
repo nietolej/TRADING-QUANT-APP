@@ -350,3 +350,64 @@ controlados, igual que en la Actualización 1. Para un veredicto real sobre la c
 bot hace falta correr Test 1 y/o Test 3 repetidas veces en la instancia desplegada con
 credenciales de Binance Testnet configuradas, y luego abrir "Ver Informe de Confiabilidad" en
 la página de Conciliación.
+
+---
+
+## Actualización 3 — Corrección: TP/SL cancelados marcados como falla crítica
+
+**Fecha:** 2026-09-20 (UTC), misma sesión.
+
+### Qué se probó
+El usuario compartió una captura del Ledger de su instancia real en producción: **todas** las
+órdenes STOP_LOSS y TAKE_PROFIT (identificadas por IDs de 15 dígitos, ej. `100000021754333`,
+propios del espacio de "Algo Orders" de Binance Futures) aparecían con conciliación
+`STATUS_MISMATCH`, mientras que las órdenes OPEN/CLOSE (IDs de 11 dígitos, ej. `28592737130`)
+aparecían `MATCHED`. Se investigó si esto era un bug real del reconciliador o una falla real
+del bot.
+
+### Cómo se probó
+Se leyó `reconcile_order()` en `reconciliation/reconciler.py`: cualquier orden cuyo estado en
+Binance sea `CANCELED` cae en `FAILED_STATUSES` y se marca `STATUS_MISMATCH`/`CRITICAL`, sin
+distinguir el tipo de orden. Pero por diseño (ver `run_full_cycle_test` y
+`run_execution_verification_test`, y el cierre normal de posiciones), el propio ciclo del bot
+**cancela explícitamente** las órdenes condicionales TP/SL antes de cerrar la posición con una
+orden MARKET (`cancel_all_open_orders`) — y aunque no se cierre manualmente, Binance solo deja
+que **una** de las dos condicionales de un mismo par se dispare; la otra queda `CANCELED` por
+diseño del propio exchange (comportamiento tipo OCO). Es decir: un TP o SL en `CANCELED` es el
+resultado **esperado y correcto** la mayoría de las veces, no una discrepancia.
+
+Se reprodujo el patrón exacto de la captura con datos simulados: una orden OPEN (`FILLED`), un
+TAKE_PROFIT y un STOP_LOSS (ambos `CANCELED`, como en la captura) y una orden CLOSE (`FILLED`).
+
+### Resultado obtenido
+**Antes de la corrección:** el TP y el SL quedaban `STATUS_MISMATCH`/`CRITICAL` — dos "fallas
+críticas" de un ciclo que en realidad se ejecutó perfectamente, hundiendo artificialmente el
+`reliability_pct` del Informe de Confiabilidad (en este caso, de 100% real a 50%).
+
+**Después de la corrección** (`reconciler.py`: nuevo `match_status = "CANCELED_AS_EXPECTED"`,
+severidad `INFO`, aplicado solo cuando `action` es `TAKE_PROFIT`/`STOP_LOSS` y el estado en
+Binance es `CANCELED`; se agregó a `EFFECTIVE_STATUSES` para el cálculo de confiabilidad):
+```
+OPEN           MATCHED                Orden 28592735256 (BTCUSDT) confirmada en Binance con estado FILLED.
+TAKE_PROFIT    CANCELED_AS_EXPECTED   Orden TAKE_PROFIT 100000021752453 (BTCUSDT) cancelada en Binance — comportamiento esperado...
+STOP_LOSS      CANCELED_AS_EXPECTED   Orden STOP_LOSS 100000021752462 (BTCUSDT) cancelada en Binance — comportamiento esperado...
+CLOSE          MATCHED                Orden 28592734901 (BTCUSDT) confirmada en Binance con estado FILLED.
+
+reliability_pct: 100.0, reliability_label: "Alta", failed_count: 0
+```
+
+### Qué significa el resultado
+Este era un **falso positivo sistemático**: en la instancia real del usuario, absolutamente
+todas las órdenes TP/SL iban a aparecer como "falla crítica" sin importar qué tan bien
+operara el bot, porque es imposible que ambas condicionales de un mismo par terminen `FILLED`
+— siempre una de las dos (o ambas, si se cierra manualmente) termina `CANCELED`. Esto
+inflaba artificialmente el conteo de fallas y hundía el puntaje de confiabilidad, dando una
+impresión de inseguridad en la ejecución del bot que no correspondía con la realidad.
+`REJECTED` y `EXPIRED` (fallas reales: orden rechazada por el exchange, expirada, etc.) siguen
+tratándose como críticas para cualquier tipo de orden — solo `CANCELED` en TP/SL se reclasificó.
+
+**Conclusión:** corregido y validado con datos simulados que reproducen exactamente el patrón
+reportado. Se recomienda que el usuario vuelva a correr una conciliación ("Conciliar ahora",
+Test 1 o Test 3) sobre su instancia real una vez desplegado este cambio, para confirmar que
+los TP/SL de su ledger existente pasan a `CANCELED_AS_EXPECTED` en la próxima corrida (los
+registros históricos ya persistidos como `STATUS_MISMATCH` no se recalculan retroactivamente).
