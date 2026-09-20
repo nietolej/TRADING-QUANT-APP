@@ -274,31 +274,22 @@ class LiveMonitorPage:
             self._refresh_ui_elements(force_dom_rebuild=True)
 
     async def _close_selected_bot_binance_pos(self):
-        """Cierra inmediatamente la posición en Binance Futures y sincroniza el bot local."""
+        """Cierra al mercado la posición PROPIA del bot seleccionado (la ejecuta el daemon)."""
         bot = self._get_selected_bot()
-        if not bot or not bot._client:
-            ui.notify("Bot no seleccionado o cliente no disponible.", type='warning')
+        if not bot:
+            ui.notify("Selecciona un bot primero.", type='warning')
             return
-        
-        info = getattr(bot, 'binance_position_info', None)
-        amt = abs(float(info.get('amount', 0.0))) if info else (bot.position.quantity if bot.position else 0.0)
-        side = "long" if (info and float(info.get('amount', 0.0)) > 0) else ("short" if (info and float(info.get('amount', 0.0)) < 0) else (bot.position.side if bot.position else "long"))
-        
-        if amt <= 0:
-            ui.notify("No hay posición abierta en Binance para cerrar.", type='info')
+        if not bot.position:
+            ui.notify("El bot no tiene una posición abierta que cerrar.", type='info')
             return
-            
+
         ui.notify(f"Enviando orden de cierre a Binance Futures para {bot.symbol}...", type='info')
-        order, err = bot._client.close_futures_position(bot.symbol, side, amt, order_type="MARKET", verify_execution=True)
-        if order and not err:
-            ui.notify(f"✅ Posición cerrada en Binance Futures | ID: {order.get('orderId')} | Status: {order.get('status', 'FILLED')}", type='positive')
-            bot._client.cancel_all_open_orders(bot.symbol)
-            bot.binance_position_info = None
-            if bot.position:
-                bot._close_position(float(order.get('avgPrice', bot.current_bid)), datetime.now(), reason="MANUAL_BINANCE_CLOSE")
-            self._refresh_ui_elements(force_dom_rebuild=False)
+        ok, message = await run.io_bound(bot.close_position)
+        if ok:
+            ui.notify(f"✅ {message}", type='positive')
         else:
-            ui.notify(f"🚨 Error cerrando posición en Binance: {err}", type='negative', close_button=True, duration=8000)
+            ui.notify(f"🚨 {message}", type='negative', close_button=True, duration=8000)
+        self._refresh_ui_elements(force_dom_rebuild=False)
 
     async def _clean_orphan_orders(self):
         """Cancela todas las órdenes condicionales pendientes en Binance para el símbolo del bot."""
@@ -316,106 +307,14 @@ class LiveMonitorPage:
             ui.notify(f"⚠️ Error al cancelar órdenes: {err}", type='warning')
 
     async def _sync_exchange_positions(self, show_notify: bool = False):
-        """Sincroniza el estado real de posiciones y órdenes con Binance Futures para todos los bots (incluso si están detenidos)."""
-        if getattr(self, '_is_syncing_exchange', False):
-            return
-        self._is_syncing_exchange = True
-        try:
-            has_api_key = bool(os.getenv("BINANCE_API_KEY", "").strip())
-            if not has_api_key:
-                if show_notify:
-                    ui.notify("API Key de Binance no configurada en .env", type='warning')
-                return
-
-            loop = asyncio.get_event_loop()
-            open_positions = await loop.run_in_executor(
-                None, lambda: BinanceTestnetClient(use_testnet=True).get_open_positions()
-            )
-
-            # Mapear posiciones abiertas por símbolo Binance (ej: 'BTCUSDT')
-            open_by_symbol = {
-                str(p.get('symbol', '')).upper(): p 
-                for p in (open_positions or []) 
-                if float(p.get('positionAmt', 0.0)) != 0
-            }
-
-            bots = await loop.run_in_executor(None, bot_manager.get_all_bots)
-            changes_detected = False
-
-            for b in bots:
-                if not b.use_testnet:
-                    continue
-                binance_sym = b.symbol.replace('/', '').upper()
-                p_info = open_by_symbol.get(binance_sym)
-
-                if p_info:
-                    amt = float(p_info.get('positionAmt', 0.0))
-                    entry_p = float(p_info.get('entryPrice', 0.0))
-                    unrealized_pnl = float(p_info.get('unRealizedProfit', 0.0))
-                    mark_p = float(p_info.get('markPrice', 0.0))
-                    be_p = float(p_info.get('breakEvenPrice', 0.0) or entry_p)
-                    im = float(p_info.get('isolatedMargin', 0.0) or p_info.get('initialMargin', 0.0))
-                    leverage = int(p_info.get('leverage', 1))
-
-                    new_info = {
-                        "symbol": binance_sym,
-                        "amount": amt,
-                        "abs_amount": abs(amt),
-                        "entry_price": entry_p,
-                        "break_even_price": be_p,
-                        "mark_price": mark_p,
-                        "unrealized_pnl": unrealized_pnl,
-                        "initial_margin": im,
-                        "leverage": leverage,
-                        "margin_type": p_info.get('marginType', 'cross'),
-                    }
-                    if getattr(b, 'binance_position_info', None) != new_info:
-                        b.binance_position_info = new_info
-                        changes_detected = True
-
-                    if b.position:
-                        if entry_p > 0 and b.position.entry_price != entry_p:
-                            b.position.entry_price = entry_p
-                            changes_detected = True
-                        if b.position.quantity != abs(amt):
-                            b.position.quantity = abs(amt)
-                            changes_detected = True
-                else:
-                    # No hay posición abierta en Binance para este símbolo
-                    had_info = getattr(b, 'binance_position_info', None) is not None
-                    had_pos = b.position is not None
-
-                    if had_info or had_pos:
-                        b.binance_position_info = None
-                        if b.position:
-                            exit_p = b.position.entry_price
-                            if b.klines_df is not None and not b.klines_df.empty:
-                                exit_p = float(b.klines_df['close'].iloc[-1])
-                            b._close_position(exit_p, datetime.now(), reason="BINANCE_EXCHANGE_CLOSED")
-                            changes_detected = True
-
-                        # Limpiar órdenes condicionales huérfanas si existían
-                        try:
-                            if b._client:
-                                await loop.run_in_executor(None, lambda: b._client.cancel_all_open_orders(b.symbol))
-                        except Exception:
-                            pass
-                        changes_detected = True
-
-            if changes_detected:
-                self._last_trades_hash = None
-                self._refresh_ui_elements(force_dom_rebuild=False)
-
-            if show_notify:
-                count = len(open_by_symbol)
-                ui.notify(f"🔄 Sincronización completada con Binance: {count} posición(es) activa(s)", type='positive')
-
-        except Exception as e:
-            logger.warning(f"Error sincronizando posiciones con Binance: {e}")
-            if show_notify:
-                ui.notify(f"⚠️ Error al sincronizar con Binance: {e}", type='negative')
-        finally:
-            self._is_syncing_exchange = False
+        """
+        Obsoleto: esta función reescribía desde la interfaz la posición de cada bot (cantidad, precio,
+        cierres "por Binance" y cancelación masiva de órdenes) usando la posición NETA de la cuenta. Con
+        varios bots en un mismo símbolo eso pisaba las posiciones de unos con las de otros. Ahora cada bot
+        se sincroniza solo, dentro del daemon, con sus propias órdenes (PaperTrader._sync_own_position).
+        """
+        if show_notify:
+            ui.notify("Los bots se sincronizan solos con Binance dentro del daemon.", type='info')
 
     async def _start_all_bots(self):
         bots = [b for b in bot_manager.get_all_bots() if not b.is_running]
@@ -1239,6 +1138,11 @@ class LiveMonitorPage:
         """Ejecuta en un hilo aparte (run.io_bound) todas las llamadas de red bloqueantes
         que antes se hacian directamente en el hilo del event loop de NiceGUI."""
         bots = bot_manager.get_all_bots()
+        # Velas/bid-ask del bot seleccionado: se piden aquí (hilo) para que el dibujo posterior, que corre
+        # en el event loop, no haga peticiones HTTP.
+        selected = next((b for b in bots if b.bot_id == self.selected_bot_id), None)
+        if selected is not None and hasattr(selected, 'prefetch_market'):
+            selected.prefetch_market()
         summary = bot_manager.get_portfolio_summary()
         all_unexec = bot_manager.get_unexecuted_orders("all")
         is_online = daemon_client.is_daemon_online()

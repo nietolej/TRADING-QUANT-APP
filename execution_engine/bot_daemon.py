@@ -148,6 +148,51 @@ def get_bot_detail(bot_id: str):
     return bot.to_dict()
 
 
+@app.get("/api/bots/{bot_id}/market")
+def get_bot_market(bot_id: str, limit: int = 300):
+    """
+    Datos de mercado EN VIVO de un bot: últimas velas, mejor bid/ask y posición neta de la cuenta.
+    Viven en la memoria del bot (dentro del daemon), no en el estado persistido, y la interfaz web los
+    necesita para el gráfico en vivo y el ticker.
+    """
+    bot = bot_manager.get_bot(bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail=f"Bot '{bot_id}' no encontrado.")
+    n = max(1, min(int(limit), 1000))
+    rows = []
+    acquired = bot._lock.acquire(timeout=0.3)
+    try:
+        df = bot.klines_df
+        tail = df.iloc[-n:].copy() if df is not None and not df.empty else None
+    finally:
+        if acquired:
+            bot._lock.release()
+    if tail is not None:
+        rows = [
+            [int(ts.timestamp() * 1000), float(o), float(h), float(l), float(c), float(v)]
+            for ts, o, h, l, c, v in zip(tail.index, tail["open"], tail["high"], tail["low"], tail["close"], tail["volume"])
+        ]
+    return {
+        "klines": rows,
+        "current_bid": float(getattr(bot, "current_bid", 0.0) or 0.0),
+        "current_ask": float(getattr(bot, "current_ask", 0.0) or 0.0),
+        "current_bid_qty": float(getattr(bot, "current_bid_qty", 0.0) or 0.0),
+        "current_ask_qty": float(getattr(bot, "current_ask_qty", 0.0) or 0.0),
+        "binance_position_info": getattr(bot, "binance_position_info", None),
+    }
+
+
+@app.post("/api/bots/{bot_id}/close_position")
+def close_bot_position(bot_id: str):
+    """Cierra al mercado la posición propia del bot (acción manual desde la interfaz)."""
+    bot = bot_manager.get_bot(bot_id)
+    if not bot:
+        raise HTTPException(status_code=404, detail=f"Bot '{bot_id}' no encontrado.")
+    ok, message = bot.manual_close_position()
+    bot_manager.save_state_to_disk()
+    return {"success": ok, "message": message}
+
+
 @app.post("/api/bots")
 def create_bot(req: CreateBotRequest):
     """Crea un nuevo bot de trading en el daemon."""

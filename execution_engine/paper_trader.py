@@ -8,10 +8,11 @@ import threading
 import time
 import pandas as pd
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple
 
 from .binance_client import BinanceTestnetClient, format_binance_error
 from .market_stream import stream_hub
+from .trade_stats import compute_detailed_stats
 from strategy_engine.base_strategy import BaseStrategy
 from strategy_engine.conditions import ConditionEvaluator
 from data_layer.storage import SessionLocal, PaperTrade
@@ -1517,6 +1518,21 @@ class PaperTrader:
         signal = ConditionEvaluator.evaluate_conditions(self.klines_df.iloc[:-1], exit_cfg)
         return (not signal.empty) and bool(signal.iloc[-1])
 
+    def manual_close_position(self) -> Tuple[bool, str]:
+        """Cierra al mercado la posición PROPIA del bot (botón "Cerrar posición" de la interfaz)."""
+        with self._lock:
+            pos = self.position
+            if pos is None:
+                return False, "El bot no tiene una posición abierta."
+            price = self.current_bid if pos.side == "long" else self.current_ask
+            if not price or price <= 0:
+                price = float(self.klines_df["close"].iloc[-1]) if not self.klines_df.empty else pos.entry_price
+            self._close_position(price, datetime.now(timezone.utc), reason="MANUAL_BINANCE_CLOSE")
+            closed = self.position is None
+        if closed:
+            return True, f"Posición {pos.side.upper()} cerrada."
+        return False, "No se pudo cerrar la posición: revisa el log del bot (Binance pudo rechazar la orden)."
+
     def _find_real_exit_fill(self, pos: "Position"):
         """
         Busca en el historial de fills de Binance el cierre real de `pos`: los fills del lado
@@ -1802,55 +1818,7 @@ class PaperTrader:
 
     def get_detailed_stats(self) -> dict:
         """Calcula estadísticas cuantitativas avanzadas de los trades del bot."""
-        total_trades = len(self.trade_history)
-        if total_trades == 0:
-            return {
-                "total_trades": 0,
-                "wins": 0,
-                "losses": 0,
-                "win_rate": 0.0,
-                "total_pnl": 0.0,
-                "total_pnl_pct": 0.0,
-                "profit_factor": 0.0,
-                "avg_trade_pnl": 0.0,
-                "best_trade": 0.0,
-                "worst_trade": 0.0,
-                "gross_profit": 0.0,
-                "gross_loss": 0.0,
-            }
-
-        pnls = [t.get("pnl", 0.0) for t in self.trade_history]
-        wins = [p for p in pnls if p > 0]
-        losses = [p for p in pnls if p <= 0]
-
-        total_pnl = sum(pnls)
-        total_pnl_pct = (total_pnl / self.initial_balance * 100.0) if self.initial_balance > 0 else 0.0
-        gross_profit = sum(wins)
-        gross_loss = abs(sum(losses))
-        # Profit factor = ganancia bruta / perdida bruta. Sin perdidas, el ratio es matematicamente
-        # infinito (no el monto de ganancia bruta, que tiene otras unidades - USDT, no un ratio -
-        # y antes se mostraba tal cual en la UI como si fuera el profit factor, confundiendo al usuario).
-        if gross_loss > 0:
-            profit_factor = gross_profit / gross_loss
-        elif gross_profit > 0:
-            profit_factor = float('inf')
-        else:
-            profit_factor = 0.0
-
-        return {
-            "total_trades": total_trades,
-            "wins": len(wins),
-            "losses": len(losses),
-            "win_rate": (len(wins) / total_trades * 100.0),
-            "total_pnl": total_pnl,
-            "total_pnl_pct": total_pnl_pct,
-            "profit_factor": profit_factor,
-            "avg_trade_pnl": total_pnl / total_trades,
-            "best_trade": max(pnls) if pnls else 0.0,
-            "worst_trade": min(pnls) if pnls else 0.0,
-            "gross_profit": gross_profit,
-            "gross_loss": gross_loss,
-        }
+        return compute_detailed_stats(self.trade_history, self.initial_balance)
 
     # ──────────────────────────────────────────────────────────────
     # Persistencia

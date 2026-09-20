@@ -12,6 +12,11 @@ import time
 import logging
 import threading
 import requests
+import pandas as pd
+import yaml
+from types import SimpleNamespace
+
+from .trade_stats import compute_detailed_stats
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
@@ -72,8 +77,102 @@ class BotProxy:
 
         pos_raw = data.get("position")
         self.position: Optional[PositionProxy] = PositionProxy(pos_raw) if pos_raw else None
-        self.current_bid: float = float(self.position.entry_price) if self.position else 0.0
         self._cached_binance_client = None
+        # Datos de mercado en vivo (velas, bid/ask, posición neta): viven en el daemon y se piden bajo
+        # demanda UNA vez por proxy (los proxies se recrean en cada lectura de la lista de bots).
+        self._market: Optional[Dict[str, Any]] = None
+        self._klines_df: Optional[pd.DataFrame] = None
+        self._overrides: Dict[str, Any] = {}
+
+    def prefetch_market(self) -> None:
+        """Descarga los datos de mercado del daemon (llamar desde un hilo, no desde el event loop)."""
+        if self._market is None:
+            self._market = self._daemon_client.get_bot_market(self.bot_id) or {}
+
+    def _mkt(self, key: str, default=0.0):
+        if key in self._overrides:
+            return self._overrides[key]
+        self.prefetch_market()
+        value = (self._market or {}).get(key)
+        return default if value is None else value
+
+    @property
+    def klines_df(self) -> pd.DataFrame:
+        """Velas del bot (índice UTC, columnas open/high/low/close/volume), como PaperTrader.klines_df."""
+        if self._klines_df is None:
+            self.prefetch_market()
+            rows = (self._market or {}).get("klines") or []
+            if rows:
+                df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+                self._klines_df = df.set_index("timestamp")
+            else:
+                self._klines_df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        return self._klines_df
+
+    @property
+    def current_bid(self) -> float:
+        bid = float(self._mkt("current_bid", 0.0))
+        if bid > 0:
+            return bid
+        return float(self.position.entry_price) if self.position else 0.0
+
+    @current_bid.setter
+    def current_bid(self, value: float) -> None:
+        self._overrides["current_bid"] = value
+
+    @property
+    def current_ask(self) -> float:
+        return float(self._mkt("current_ask", 0.0))
+
+    @property
+    def current_bid_qty(self) -> float:
+        return float(self._mkt("current_bid_qty", 0.0))
+
+    @property
+    def current_ask_qty(self) -> float:
+        return float(self._mkt("current_ask_qty", 0.0))
+
+    @property
+    def binance_position_info(self) -> Optional[Dict[str, Any]]:
+        return self._mkt("binance_position_info", None)
+
+    @binance_position_info.setter
+    def binance_position_info(self, value: Optional[Dict[str, Any]]) -> None:
+        self._overrides["binance_position_info"] = value
+
+    def get_detailed_stats(self) -> Dict[str, Any]:
+        """Mismas estadísticas avanzadas que PaperTrader, calculadas sobre el historial recibido."""
+        return compute_detailed_stats(self.trade_history, self.initial_balance)
+
+    @property
+    def strategy(self):
+        """Definición de la estrategia (config YAML y parámetros efectivos) para el inspector de la interfaz."""
+        if getattr(self, "_strategy_cache", None) is None:
+            config: Dict[str, Any] = {}
+            path = self.strategy_yaml_path
+            if path and not os.path.isabs(path):
+                path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), path)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    config = yaml.safe_load(f) or {}
+            except Exception:
+                logger.warning("No se pudo leer la estrategia %s para el inspector", self.strategy_yaml_path, exc_info=True)
+            parameters = dict(config.get("parameters") or {})
+            parameters.update(self.custom_parameters or {})
+            self._strategy_cache = SimpleNamespace(config=config, parameters=parameters)
+        return self._strategy_cache
+
+    def close_position(self):
+        """Cierra al mercado la posición propia del bot (lo ejecuta el daemon). Devuelve (ok, mensaje)."""
+        return self._daemon_client.close_bot_position(self.bot_id)
+
+    # La interfaz llama a estos métodos en el bot; en el proxy solo se registran (el daemon tiene los suyos).
+    def _notify(self, message: str = "", *args, **kwargs) -> None:
+        logger.info("[BotProxy %s] %s", self.name, message)
+
+    def _trigger_critical_order_alert(self, title: str, details: Optional[dict] = None) -> None:
+        logger.error("[BotProxy %s] %s | %s", self.name, title, details)
 
     @property
     def _client(self):
@@ -264,6 +363,32 @@ class DaemonClient:
             except Exception as e:
                 logger.warning("Fallo al obtener el bot %s del daemon: %s", bot_id, e)
         return None
+
+    def get_bot_market(self, bot_id: str, limit: int = 300) -> Optional[Dict[str, Any]]:
+        """Velas, bid/ask y posición neta EN VIVO de un bot (None si el daemon no responde)."""
+        if not self.is_daemon_online():
+            return None
+        try:
+            res = requests.get(f"{self.base_url}/api/bots/{bot_id}/market", params={"limit": limit}, timeout=2.0)
+            if res.status_code == 200:
+                return res.json()
+        except Exception as e:
+            logger.warning("Fallo al obtener el mercado del bot %s: %s", bot_id, e)
+        return None
+
+    def close_bot_position(self, bot_id: str):
+        """Pide al daemon cerrar al mercado la posición propia del bot. Devuelve (ok, mensaje)."""
+        if not self.is_daemon_online():
+            return False, OFFLINE_HINT
+        try:
+            res = requests.post(f"{self.base_url}/api/bots/{bot_id}/close_position", timeout=30.0)
+            if res.status_code == 200:
+                body = res.json()
+                return bool(body.get("success")), str(body.get("message", ""))
+            return False, f"El daemon respondió HTTP {res.status_code}: {res.text[:200]}"
+        except Exception as e:
+            logger.error("Error cerrando la posición del bot %s: %s", bot_id, e)
+            return False, f"No se pudo contactar al daemon: {e}"
 
     def get_portfolio_summary(self) -> Dict[str, Any]:
         """Resumen agregado de la cartera (ceros si el daemon está apagado)."""
