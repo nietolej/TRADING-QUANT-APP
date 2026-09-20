@@ -130,7 +130,7 @@ class MLEThermometer:
             return cached
 
         url = "https://stablecoins.llama.fi/stablecoincharts/all"
-        resp = requests.get(url)
+        resp = requests.get(url, timeout=15)  # sin timeout una API colgada bloquea un hilo del pool para siempre
         if resp.status_code == 200:
             data = resp.json()
             df = pd.DataFrame(data)
@@ -152,7 +152,7 @@ class MLEThermometer:
             "interval": "1d",
             "limit": limit
         }
-        resp = requests.get(url, params=params)
+        resp = requests.get(url, params=params, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'])

@@ -9,12 +9,18 @@ import sys
 import time
 import logging
 import psutil
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 
+# Solo este proceso puede reanudar bots al arrancar (ver BotManager). Debe fijarse ANTES de importar bot_manager.
+os.environ.setdefault("TQA_PROCESS_ROLE", "daemon")
+
+from app_runtime.logging_setup import setup_logging
+from app_runtime.watchdog import LoopWatchdog
 from execution_engine.bot_manager import bot_manager, BotManager
 from execution_engine.security_manager import (
     is_real_trading_enabled,
@@ -24,18 +30,23 @@ from execution_engine.security_manager import (
 from notifications.telegram_bot import TelegramNotifier
 
 logger = logging.getLogger("TradingDaemon")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [Daemon:%(process)d] %(name)s: %(message)s"
-)
+setup_logging("daemon")
 
 START_TIME = time.time()
 PID = os.getpid()
 
+@asynccontextmanager
+async def lifespan(_app):
+    # Vigilante del event loop: si el daemon se congela, vuelca la pila de todos los hilos a logs/daemon.stall.log
+    await LoopWatchdog("daemon").start()
+    yield
+
+
 app = FastAPI(
     title="Trading Bot Daemon Core",
     description="Headless 24/7 Quantitative Trading Execution Engine",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Permitir CORS únicamente para peticiones locales del dashboard

@@ -1,11 +1,13 @@
 import os
 import time
+import copy
 import math
 import uuid
 import logging
 from typing import Dict, Any, Optional, List, Tuple
 from dotenv import load_dotenv
 from binance.client import Client
+from binance.exceptions import BinanceAPIException
 
 load_dotenv()
 logger = logging.getLogger("BinanceClient")
@@ -20,7 +22,14 @@ from execution_engine.security_manager import (
 )
 
 
-def _sync_timestamp_offset(client: Client, use_futures: bool = True) -> None:
+# El desfase de reloj es una propiedad de esta máquina, no de cada cliente: se reutiliza el
+# último valor medido durante TIME_OFFSET_TTL_S en vez de gastar un viaje de red (~0.5 s) en
+# CADA instanciación de BinanceTestnetClient (había 17 en las páginas y una por ciclo de conciliación).
+TIME_OFFSET_TTL_S = 300.0
+_TIME_OFFSET_CACHE: Dict[Tuple[bool, bool], Tuple[int, float]] = {}
+
+
+def _sync_timestamp_offset(client: Client, use_futures: bool = True, force: bool = False) -> None:
     """
     Corrige el desfase de reloj local frente al servidor de Binance (Error -1021).
 
@@ -31,12 +40,41 @@ def _sync_timestamp_offset(client: Client, use_futures: bool = True) -> None:
     server's time" y quedan silenciadas por los try/except del cliente,
     dando la falsa impresión de que la app "no sincroniza" con Binance.
     """
+    key = (bool(use_futures), bool(getattr(client, "testnet", False)))
+    cached = _TIME_OFFSET_CACHE.get(key)
+    if not force and cached and (time.monotonic() - cached[1]) < TIME_OFFSET_TTL_S:
+        client.timestamp_offset = cached[0]
+        return
     try:
         server_time = (client.futures_time() if use_futures else client.get_server_time()).get("serverTime")
         if server_time:
-            client.timestamp_offset = int(server_time) - int(time.time() * 1000)
+            offset = int(server_time) - int(time.time() * 1000)
+            client.timestamp_offset = offset
+            _TIME_OFFSET_CACHE[key] = (offset, time.monotonic())
     except Exception as e:
-        logger.debug("No se pudo sincronizar el offset de tiempo con Binance: %s", e)
+        logger.warning("No se pudo sincronizar el offset de tiempo con Binance: %s", e)
+
+
+class ResilientClient(Client):
+    """
+    Cliente de Binance que se autorrepara ante el desfase de reloj (error -1021).
+
+    El offset se medía una sola vez al crear el cliente, pero los clientes de los bots viven días:
+    al derivar el reloj, cada orden fallaba con "Timestamp ahead of the server's time" (173 de las
+    257 órdenes no ejecutadas del 6/9). Ahora, ante un -1021 en una petición firmada, se vuelve a
+    medir el offset y se reintenta UNA vez con timestamp nuevo.
+    """
+
+    def _request(self, method, uri: str, signed: bool, force_params: bool = False, **kwargs):
+        pristine = copy.deepcopy(kwargs) if signed else None  # python-binance escribe timestamp/firma en kwargs
+        try:
+            return super()._request(method, uri, signed, force_params, **kwargs)
+        except BinanceAPIException as e:
+            if not signed or e.code != -1021:
+                raise
+            logger.warning("Desfase de reloj (-1021) en %s: resincronizando y reintentando una vez", uri)
+            _sync_timestamp_offset(self, use_futures=True, force=True)
+            return super()._request(method, uri, signed, force_params, **pristine)
 
 
 def _fmt_ts(ms) -> str:
@@ -228,11 +266,11 @@ def verify_binance_credentials(
         }
 
     try:
-        client = Client(key, sec, testnet=use_testnet, ping=False, requests_params={'timeout': 8})
+        client = ResilientClient(key, sec, testnet=use_testnet, ping=False, requests_params={'timeout': 8})
         if use_testnet:
-            client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
+            client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
         else:
-            client.FUTURES_URL = 'https://fapi.binance.com/fapi/v1'
+            client.FUTURES_URL = 'https://fapi.binance.com/fapi'
         _sync_timestamp_offset(client, use_futures=True)
 
         # 1. Ping
@@ -293,7 +331,7 @@ class BinanceTestnetClient:
         # Inicialización segura de cliente Binance sin ping síncrono bloqueante
         self.client = None
         try:
-            self.client = Client(
+            self.client = ResilientClient(
                 self.api_key,
                 self.api_secret,
                 testnet=use_testnet,
@@ -301,9 +339,9 @@ class BinanceTestnetClient:
                 requests_params={'timeout': 10}
             )
             if use_testnet:
-                self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
+                self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
             else:
-                self.client.FUTURES_URL = 'https://fapi.binance.com/fapi/v1'
+                self.client.FUTURES_URL = 'https://fapi.binance.com/fapi'
             _sync_timestamp_offset(self.client, use_futures=True)
         except Exception as e:
             logger.warning("No se pudo inicializar Binance Client (restricción geográfica o red): %s", e)
@@ -834,6 +872,110 @@ class BinanceTestnetClient:
             logger.debug("Error obteniendo posiciones abiertas de Binance: %s", e)
             return []
 
+    # ── Órdenes propias de un bot (referencias) ─────────────────────────────
+    # Con varios bots operando el mismo símbolo, "todas las órdenes del símbolo" NO son del bot:
+    # cancelar en masa (cancel_all_open_orders) borraba el SL/TP de los demás. Cada bot conoce las
+    # referencias de SUS órdenes de protección y solo actúa sobre esas.
+
+    @staticmethod
+    def order_ref(order: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Referencia estable {'kind': 'algo'|'order', 'id': int} de una orden devuelta por Binance."""
+        if not order:
+            return None
+        if order.get("algoId"):
+            return {"kind": "algo", "id": int(order["algoId"])}
+        if order.get("orderId"):
+            return {"kind": "order", "id": int(order["orderId"])}
+        return None
+
+    def get_open_order_refs(self, symbol: str) -> Optional[set]:
+        """Conjunto {(kind, id)} de órdenes abiertas (estándar y condicionales) del símbolo.
+        None si no se pudo consultar (el llamador NO debe asumir que no hay órdenes)."""
+        if not self.client:
+            return None
+        binance_symbol = symbol.replace("/", "").upper()
+        try:
+            refs = {("order", int(o["orderId"])) for o in (self.client.futures_get_open_orders(symbol=binance_symbol) or [])}
+            refs |= {("algo", int(a["algoId"])) for a in (self.client.futures_get_open_algo_orders(symbol=binance_symbol) or [])}
+            return refs
+        except Exception as e:
+            logger.warning("No se pudieron listar las órdenes abiertas de %s: %s", binance_symbol, e)
+            return None
+
+    def get_order_ref_state(self, symbol: str, ref: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Estado normalizado de UNA orden propia. 'state' es uno de:
+        OPEN | FILLED | TRIGGERED (disparada, aún sin ejecutar) | CANCELED | EXPIRED | REJECTED | UNKNOWN.
+        Para condicionales disparadas se consulta la orden real que generaron (actualOrderId): la
+        respuesta de Algo Orders no trae cantidad ni precio ejecutados.
+        """
+        binance_symbol = symbol.replace("/", "").upper()
+        try:
+            if ref["kind"] == "algo":
+                algo = self.client.futures_get_algo_order(algoId=ref["id"])
+                status = str(algo.get("algoStatus") or "").upper()
+                if status in ("NEW", "WORKING"):
+                    return {"state": "OPEN"}
+                if status in ("CANCELED", "CANCELLED"):
+                    return {"state": "CANCELED"}
+                if status in ("EXPIRED", "REJECTED"):
+                    return {"state": status}
+                if status == "FINISHED":
+                    actual = algo.get("actualOrderId")
+                    if not actual:
+                        return {"state": "TRIGGERED"}
+                    order = self.client.futures_get_order(symbol=binance_symbol, orderId=int(actual))
+                    executed = float(order.get("executedQty") or 0.0)
+                    if executed > 0:
+                        return {
+                            "state": "FILLED", "executed_qty": executed,
+                            "avg_price": float(order.get("avgPrice") or algo.get("actualPrice") or 0.0),
+                            "actual_order_id": int(actual),
+                        }
+                    if str(order.get("status", "")).upper() in ("NEW", "PARTIALLY_FILLED"):
+                        return {"state": "TRIGGERED", "actual_order_id": int(actual)}
+                    return {"state": "CANCELED", "actual_order_id": int(actual)}
+                return {"state": "UNKNOWN", "raw_status": status}
+
+            order = self.client.futures_get_order(symbol=binance_symbol, orderId=ref["id"])
+            status = str(order.get("status", "")).upper()
+            executed = float(order.get("executedQty") or 0.0)
+            if status == "FILLED":
+                return {"state": "FILLED", "executed_qty": executed, "avg_price": float(order.get("avgPrice") or 0.0)}
+            if status in ("NEW", "PARTIALLY_FILLED"):
+                return {"state": "OPEN", "executed_qty": executed}
+            if status in ("CANCELED", "EXPIRED", "REJECTED"):
+                return {"state": status}
+            return {"state": "UNKNOWN", "raw_status": status}
+        except Exception as e:
+            return {"state": "UNKNOWN", "error": str(e)}
+
+    def cancel_order_refs(self, symbol: str, refs) -> Tuple[bool, List[str]]:
+        """Cancela SOLO las órdenes indicadas. Una orden que ya no existe cuenta como cancelada."""
+        # Mismo candado que cancel_all_open_orders: cancelar es una mutación autenticada.
+        if not self.use_testnet and not is_real_trading_enabled():
+            return False, ["⛔ BLOQUEO: la cuenta Real está en MODO SOLO LECTURA"]
+        if not self.client:
+            return False, ["Cliente de Binance no disponible"]
+        binance_symbol = symbol.replace("/", "").upper()
+        errors: List[str] = []
+        for ref in refs or []:
+            if not ref:
+                continue
+            try:
+                if ref["kind"] == "algo":
+                    self.client.futures_cancel_algo_order(algoId=ref["id"])
+                else:
+                    self.client.futures_cancel_order(symbol=binance_symbol, orderId=ref["id"])
+            except BinanceAPIException as e:
+                text = str(e).lower()
+                if e.code in (-2011, -2013) or "unknown order" in text or "does not exist" in text or "not found" in text:
+                    continue  # ya no existe / ya estaba cancelada
+                errors.append(f"{ref['kind']} {ref['id']}: {e}")
+            except Exception as e:
+                errors.append(f"{ref['kind']} {ref['id']}: {e}")
+        return (not errors), errors
+
     def cancel_all_open_orders(self, symbol: str) -> Tuple[bool, Optional[str]]:
         """Cancela todas las órdenes abiertas estándar y condicionales (algo SL/TP) pendientes en Binance Futures."""
         # ── CANDADO DE SEGURIDAD OPERATIVA ──
@@ -875,9 +1017,9 @@ class BinanceTestnetClient:
                             try:
                                 self.client.futures_cancel_order(symbol=binance_symbol, orderId=oid)
                             except Exception:
-                                pass
+                                logger.warning("No se pudo cancelar la orden estándar %s de %s", oid, binance_symbol, exc_info=True)
             except Exception:
-                pass
+                logger.warning("No se pudieron listar las órdenes abiertas de %s para cancelarlas", binance_symbol, exc_info=True)
 
             # 4. Verificación y cancelación individual de cualquier orden ALGO/CONDICIONAL residual
             try:
@@ -890,9 +1032,9 @@ class BinanceTestnetClient:
                                 try:
                                     self.client.futures_cancel_algo_order(algoId=algo_id)
                                 except Exception:
-                                    pass
+                                    logger.warning("No se pudo cancelar la orden algo %s de %s", algo_id, binance_symbol, exc_info=True)
             except Exception:
-                pass
+                logger.warning("No se pudieron listar las órdenes algo abiertas para cancelarlas", exc_info=True)
 
             # Verificación final: todos los pasos anteriores tragan sus propias excepciones
             # (para intentar el resto de vías de cancelación aunque una falle), asi que sin
@@ -921,7 +1063,7 @@ class BinanceTestnetClient:
         """Cancela todas las órdenes abiertas de un símbolo en Binance Futures (compatible con testnet y mainnet)."""
         if use_testnet is not None:
             self.use_testnet = use_testnet
-            self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1' if use_testnet else 'https://fapi.binance.com/fapi/v1'
+            self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi' if use_testnet else 'https://fapi.binance.com/fapi'
         return self.cancel_all_open_orders(symbol)
 
     def cancel_all_futures_orders_every_symbol(self, use_testnet: Optional[bool] = None) -> Tuple[bool, Optional[str]]:
@@ -930,7 +1072,7 @@ class BinanceTestnetClient:
         así que se detectan los símbolos con órdenes u posiciones abiertas y se cancela cada uno por separado."""
         if use_testnet is not None:
             self.use_testnet = use_testnet
-            self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1' if use_testnet else 'https://fapi.binance.com/fapi/v1'
+            self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi' if use_testnet else 'https://fapi.binance.com/fapi'
 
         if not self.client or not self.api_key or not self.api_secret:
             return False, "API Key o Secret no configuradas en .env"
@@ -1035,8 +1177,8 @@ class BinanceTestnetClient:
 
         try:
             # 1. Testnet Futures Client
-            test_client = Client(self.api_key, self.api_secret, testnet=True, ping=False, requests_params={'timeout': 10})
-            test_client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
+            test_client = ResilientClient(self.api_key, self.api_secret, testnet=True, ping=False, requests_params={'timeout': 10})
+            test_client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
             _sync_timestamp_offset(test_client, use_futures=True)
 
             # 2. Ping & Account query
@@ -1110,7 +1252,7 @@ class BinanceTestnetClient:
 
         try:
             # Cliente público / privado para Mainnet
-            main_client = Client(self.api_key, self.api_secret, testnet=False, ping=False, requests_params={'timeout': 8})
+            main_client = ResilientClient(self.api_key, self.api_secret, testnet=False, ping=False, requests_params={'timeout': 8})
 
             # 1. Ping
             main_client.ping()
@@ -1189,11 +1331,11 @@ class BinanceTestnetClient:
             return data
 
         try:
-            client = Client(api_k, api_s, testnet=use_testnet, ping=False, requests_params={'timeout': 10})
+            client = ResilientClient(api_k, api_s, testnet=use_testnet, ping=False, requests_params={'timeout': 10})
             if use_testnet:
-                client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
+                client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
             else:
-                client.FUTURES_URL = 'https://fapi.binance.com/fapi/v1'
+                client.FUTURES_URL = 'https://fapi.binance.com/fapi'
             _sync_timestamp_offset(client, use_futures=True)
 
             # 1. Información de la cuenta de Futuros
@@ -1209,7 +1351,7 @@ class BinanceTestnetClient:
                 btc_ticker = client.futures_symbol_ticker(symbol='BTCUSDT')
                 btc_price = float(btc_ticker.get('price', 80000.0))
             except Exception:
-                pass
+                logger.warning("No se pudo obtener el precio de BTCUSDT; se valora con el respaldo fijo de 80000", exc_info=True)
             data["btc_price"] = btc_price
 
             try:
@@ -1254,7 +1396,7 @@ class BinanceTestnetClient:
                     if s_sym:
                         pos_info_map[s_sym] = rpi
             except Exception:
-                pass
+                logger.warning("No se pudo leer la información de riesgo de posiciones (positionRisk)", exc_info=True)
 
             for p in acc.get('positions', []):
                 amt = float(p.get('positionAmt', 0.0))
@@ -1357,9 +1499,9 @@ class BinanceTestnetClient:
     def cancel_futures_order(self, symbol: str, order_id: int, use_testnet: bool = True) -> Tuple[bool, Optional[str]]:
         """Cancela una orden abierta en Binance Futures."""
         try:
-            client = Client(self.api_key, self.api_secret, testnet=use_testnet, ping=False, requests_params={'timeout': 10})
+            client = ResilientClient(self.api_key, self.api_secret, testnet=use_testnet, ping=False, requests_params={'timeout': 10})
             if use_testnet:
-                client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi/v1'
+                client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
             _sync_timestamp_offset(client, use_futures=True)
             binance_symbol = symbol.replace("/", "").upper()
             res = client.futures_cancel_order(symbol=binance_symbol, orderId=order_id)
@@ -1406,7 +1548,7 @@ class BinanceTestnetClient:
             return data
 
         try:
-            client = Client(api_k, api_s, testnet=use_testnet, ping=False, requests_params={'timeout': 10})
+            client = ResilientClient(api_k, api_s, testnet=use_testnet, ping=False, requests_params={'timeout': 10})
             _sync_timestamp_offset(client, use_futures=False)
 
             # 1. Obtener datos de la cuenta Spot
@@ -1523,7 +1665,7 @@ class BinanceTestnetClient:
     def cancel_spot_order(self, symbol: str, order_id: int, use_testnet: bool = False) -> Tuple[bool, Optional[str]]:
         """Cancela una orden abierta en Binance Spot."""
         try:
-            client = Client(self.api_key, self.api_secret, testnet=use_testnet, ping=False, requests_params={'timeout': 10})
+            client = ResilientClient(self.api_key, self.api_secret, testnet=use_testnet, ping=False, requests_params={'timeout': 10})
             _sync_timestamp_offset(client, use_futures=False)
             binance_symbol = symbol.replace("/", "").upper()
             client.cancel_order(symbol=binance_symbol, orderId=order_id)

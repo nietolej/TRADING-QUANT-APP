@@ -1,14 +1,17 @@
 import os
+import re
+import copy
 import json
 import logging
 import asyncio
 import threading
 import time
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Callable
 
 from .binance_client import BinanceTestnetClient, format_binance_error
+from .market_stream import stream_hub
 from strategy_engine.base_strategy import BaseStrategy
 from strategy_engine.conditions import ConditionEvaluator
 from data_layer.storage import SessionLocal, PaperTrade
@@ -26,6 +29,10 @@ class Position:
         self.entry_timestamp = timestamp
         self.sl_price: Optional[float] = None
         self.tp_price: Optional[float] = None
+        # Referencias {'kind': 'algo'|'order', 'id': int} a las órdenes SL/TP de ESTA posición en
+        # Binance: permiten cancelar/consultar solo las propias aunque otros bots operen el símbolo.
+        self.sl_ref: Optional[dict] = None
+        self.tp_ref: Optional[dict] = None
 
 
 class PaperTrader:
@@ -104,13 +111,19 @@ class PaperTrader:
         self.current_ask_qty = 0.0
         self.binance_position_info: Optional[dict] = None
         self._last_open_ts: float = 0.0
+        self._zero_pos_reads: int = 0
 
         self._client: Optional[BinanceTestnetClient] = None
         # RLock (no Lock simple) porque _save_state()/to_dict() puede invocarse desde
         # dentro de una sección ya protegida por este mismo lock (ver sync de posición
         # de Binance), y un Lock normal produciria un deadlock del hilo del bot.
         self._lock = threading.RLock()
+        self._last_snapshot = None
         self._polling_thread: Optional[threading.Thread] = None
+        self._sync_thread: Optional[threading.Thread] = None
+        # Cada start() abre una nueva generación: los hilos de una anterior salen solos (evita bucles
+        # duplicados si update_configuration hace stop()+start() y el hilo viejo aún no había despertado).
+        self._run_generation: int = 0
 
         # Notificador de Telegram — opcional; no rompe si no está configurado
         try:
@@ -247,174 +260,134 @@ class PaperTrader:
             self.is_running = False
             return
 
+        # Recuperar la posición propia (si el bot cayó con una abierta y no llegó a guardarla)
+        try:
+            self._recover_position_from_ledger()
+        except Exception:
+            logger.exception("[%s] No se pudo recuperar la posición desde el ledger", self.name)
+
         # Iniciar polling loop
-        self._polling_thread = threading.Thread(target=self._polling_loop, daemon=True)
+        self._run_generation += 1
+        generation = self._run_generation
+        self._polling_thread = threading.Thread(
+            target=self._polling_loop, args=(generation,), name=f"bot-market-{self.name}", daemon=True
+        )
+        self._sync_thread = threading.Thread(
+            target=self._exchange_sync_loop, args=(generation,), name=f"bot-sync-{self.name}", daemon=True
+        )
         self._polling_thread.start()
+        self._sync_thread.start()
 
-    def _polling_loop(self):
-        """Hilo de fondo que consulta el mercado cada 2 segundos y sincroniza con Binance Futures."""
+    # ──────────────────────────────────────────────────────────────
+    # Hilos de fondo: datos de mercado (WebSocket + respaldo REST) y sincronización con el exchange
+    # ──────────────────────────────────────────────────────────────
+
+    USE_WEBSOCKET = True          # datos por WebSocket; con False (o si se corta) se usa el polling REST
+    MIN_EVAL_INTERVAL_S = 0.25    # como mucho una evaluación de estrategia cada 250 ms
+    REST_POLL_S = 2.0             # cadencia del respaldo REST cuando el WebSocket no está disponible
+    WS_WARMUP_S = 3.0             # margen inicial para que el WebSocket conecte antes de usar REST
+    EXCHANGE_SYNC_S = 4.0
+    PROTECTION_CHECK_S = 30.0
+
+    def _alive(self, generation: int) -> bool:
+        """El hilo sigue vigente: el bot corre y no se reinició (start() tras stop()) mientras tanto."""
+        return self.is_running and self._run_generation == generation
+
+    def _sleep_while_alive(self, seconds: float, generation: int) -> None:
+        end = time.monotonic() + seconds
+        while self._alive(generation) and time.monotonic() < end:
+            time.sleep(min(0.25, max(0.0, end - time.monotonic())))
+
+    def _apply_book(self, bid: float, ask: float, bid_qty: float, ask_qty: float) -> None:
+        with self._lock:
+            self.current_bid, self.current_ask = bid, ask
+            self.current_bid_qty, self.current_ask_qty = bid_qty, ask_qty
+
+    def _poll_rest_once(self, binance_symbol: str) -> None:
+        """Respaldo REST (una iteración): ticker + vela en curso de FUTURES."""
+        # DEBE ser el endpoint de FUTURES: el de Spot devolvía el precio de Spot, no el de Futures
+        # donde realmente opera el bot, desincronizando el precio de señal.
+        ticker = self._client.client.futures_orderbook_ticker(symbol=binance_symbol)
+        self._apply_book(
+            float(ticker["bidPrice"]), float(ticker["askPrice"]), float(ticker["bidQty"]), float(ticker["askQty"])
+        )
+        raw_klines = self._client.client.futures_klines(symbol=binance_symbol, interval=self.timeframe, limit=2)
+        if raw_klines:
+            k = raw_klines[-1]
+            self._on_new_kline({
+                "timestamp": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                "low": float(k[3]), "close": float(k[4]), "volume": float(k[5]),
+            })
+
+    def _polling_loop(self, generation: int):
+        """
+        Hilo de mercado. Con el WebSocket sano el bot reacciona en milisegundos a cada cambio del
+        libro/vela (antes: REST cada 2 s con ~0.5 s por llamada => precio con ~3 s de retraso). Si el
+        flujo deja de llegar vuelve solo al polling REST y regresa al WebSocket cuando se recupera.
+        """
         binance_symbol = self.symbol.replace("/", "").upper()
-        loop_counter = 0
-        while self.is_running:
-            loop_counter += 1
+        sub = None
+        if self.USE_WEBSOCKET:
             try:
-                # 1. Obtener bid/ask actual (Orderbook ticker) — DEBE ser el endpoint de FUTURES
-                # (get_orderbook_ticker es Spot; usarlo aqui devolvia el precio de Spot, no el de
-                # Futures donde realmente opera el bot, desincronizando el ticker mostrado en vivo
-                # y el precio de senal usado para evaluar entry/exit conditions).
-                ticker = self._client.client.futures_orderbook_ticker(symbol=binance_symbol)
-                with self._lock:
-                    self.current_bid = float(ticker['bidPrice'])
-                    self.current_ask = float(ticker['askPrice'])
-                    self.current_bid_qty = float(ticker['bidQty'])
-                    self.current_ask_qty = float(ticker['askQty'])
-
-                # 2. Limit=2 para obtener la vela actual (en curso) — igualmente debe ser Futures,
-                # no Spot (get_klines), para que coincida con el mercado donde se ejecutan las ordenes.
-                raw_klines = self._client.client.futures_klines(
-                    symbol=binance_symbol, interval=self.timeframe, limit=2
-                )
-                if raw_klines:
-                    k = raw_klines[-1]
-                    kline_data = {
-                        "timestamp": int(k[0]),
-                        "open": float(k[1]),
-                        "high": float(k[2]),
-                        "low": float(k[3]),
-                        "close": float(k[4]),
-                        "volume": float(k[5]),
-                    }
-                    self._on_new_kline(kline_data)
-
-                # 3. Sincronización continua de la Posición en Binance Futures (cada 4 seg)
-                if self.use_testnet and self._client and self._client.api_key and (loop_counter % 2 == 0):
-                    try:
-                        pos_list = self._client.client.futures_position_information(symbol=binance_symbol)
-                        if pos_list:
-                            p_info = pos_list[0]
-                            pos_amt = float(p_info.get('positionAmt', 0.0))
-                            entry_p = float(p_info.get('entryPrice', 0.0))
-                            unrealized_pnl = float(p_info.get('unRealizedProfit', 0.0))
-                            mark_p = float(p_info.get('markPrice', 0.0))
-                            be_p = float(p_info.get('breakEvenPrice', 0.0) or entry_p)
-                            im = float(p_info.get('isolatedMargin', 0.0) or p_info.get('initialMargin', 0.0))
-                            leverage = int(p_info.get('leverage', 1))
-
-                            with self._lock:
-                                # Si hay posición abierta en Binance y el bot tiene posición interna, sincronizar
-                                if pos_amt != 0:
-                                    self.binance_position_info = {
-                                        "symbol": binance_symbol,
-                                        "amount": pos_amt,
-                                        "abs_amount": abs(pos_amt),
-                                        "entry_price": entry_p,
-                                        "break_even_price": be_p,
-                                        "mark_price": mark_p,
-                                        "unrealized_pnl": unrealized_pnl,
-                                        "initial_margin": im,
-                                        "leverage": leverage,
-                                        "margin_type": p_info.get('marginType', 'cross'),
-                                    }
-                                    self._had_open_binance_pos = True
-
-                                    if self.position:
-                                        # Sanity check: la cantidad/precio de una posicion ya abierta no deberia
-                                        # saltar de forma abrupta salvo por un fill parcial adicional legitimo.
-                                        # Sin este chequeo, un glitch puntual de Testnet en CUALQUIER poll (no solo
-                                        # al abrir) corrompe silenciosamente la posicion durante el resto del trade
-                                        # (mismo patron del bug ya corregido en _open_position con executedQty).
-                                        qty_ratio = abs(pos_amt) / self.position.quantity if self.position.quantity > 0 else 1.0
-                                        price_ratio = (entry_p / self.position.entry_price) if (entry_p > 0 and self.position.entry_price > 0) else 1.0
-                                        if 0.5 <= qty_ratio <= 2.0 and 0.5 <= price_ratio <= 2.0:
-                                            if entry_p > 0:
-                                                self.position.entry_price = entry_p
-                                            self.position.quantity = abs(pos_amt)
-                                        else:
-                                            self._trigger_critical_order_alert(
-                                                "Discrepancia de posición ignorada al sincronizar con Binance (posible glitch del exchange)",
-                                                {
-                                                    "Cantidad interna": f"{self.position.quantity:.6f}",
-                                                    "Cantidad reportada por Binance": f"{abs(pos_amt):.6f}",
-                                                    "Precio entrada interno": f"{self.position.entry_price:.4f}",
-                                                    "Precio entrada reportado": f"{entry_p:.4f}",
-                                                }
-                                            )
-                                    else:
-                                        # Binance tiene una posición abierta que el bot no conoce (crash tras
-                                        # ejecutar la orden y antes de guardar estado, orden manual en Binance,
-                                        # etc.). Sin adoptarla, el bot seguiria evaluando entry_conditions y
-                                        # podria abrir una SEGUNDA posición mientras ya hay una expuesta y sin
-                                        # que el SL/TP interno la vigile.
-                                        adopted_side = "long" if pos_amt > 0 else "short"
-                                        adopted_entry = entry_p if entry_p > 0 else mark_p
-                                        self.position = Position(adopted_side, adopted_entry, abs(pos_amt), datetime.now(timezone.utc))
-                                        try:
-                                            idx = len(self.klines_df) - 1
-                                            sl_p, tp_p = self.strategy.risk_manager.compute_sl_tp(self.klines_df, idx, adopted_side)
-                                            self.position.sl_price = sl_p
-                                            self.position.tp_price = tp_p
-                                        except Exception as e_sltp:
-                                            # Sin un fallback, la posicion huerfana quedaba adoptada SIN SL/TP
-                                            # (None/None) y sin que nadie se enterase: una posicion real
-                                            # desprotegida. Usar el mismo colchon de emergencia (2%/4%) que
-                                            # _open_position aplica cuando compute_sl_tp falla.
-                                            logger.warning(
-                                                "[%s] compute_sl_tp fallo al adoptar posicion huerfana: %s",
-                                                self.name, e_sltp,
-                                            )
-                                            self.position.sl_price = adopted_entry * (0.98 if adopted_side == "long" else 1.02)
-                                            self.position.tp_price = adopted_entry * (1.04 if adopted_side == "long" else 0.96)
-                                            self._notify(
-                                                "⚠️ No se pudo calcular SL/TP de estrategia para la posición huérfana "
-                                                "adoptada; se aplicó un SL/TP de emergencia (2%/4%)."
-                                            )
-                                        self._notify(
-                                            f"⚠️ Posición huérfana detectada en Binance ({adopted_side.upper()} "
-                                            f"{abs(pos_amt):.6f} @ {entry_p:.4f}) y adoptada por el bot para evitar duplicar exposición."
-                                        )
-                                        self._save_state()
-
-                                # Si se cerró en Binance (ej. TP/SL, liquidación o cierre manual en la web de Binance)
-                                elif pos_amt == 0:
-                                    self.binance_position_info = None
-                                    if self.position:
-                                        exit_p = mark_p if mark_p > 0 else (self.current_bid if self.position.side == 'long' else self.current_ask)
-                                        if exit_p <= 0:
-                                            exit_p = self.position.entry_price
-                                        self._close_position(exit_p, datetime.now(timezone.utc), reason="BINANCE_EXCHANGE_CLOSED")
-
-                                    # Cancelar cualquier orden condicional huérfana restante si no hay posición abierta en el exchange
-                                    if getattr(self, '_had_open_binance_pos', False) or (self.position is None and self.use_testnet and self._client):
-                                        try:
-                                            self._client.cancel_all_open_orders(binance_symbol)
-                                            if getattr(self, '_had_open_binance_pos', False):
-                                                self._notify("🧹 Posición cerrada en Binance. Órdenes condicionales (SL/TP) canceladas.")
-                                        except Exception:
-                                            pass
-                                        self._had_open_binance_pos = False
-
-                    except Exception as e_pos:
-                        # A nivel debug esto quedaba invisible en logs de produccion: una
-                        # desincronizacion persistente con Binance (posicion/SL/TP reales
-                        # desconocidos para el bot) pasaba desapercibida indefinidamente.
-                        self._sync_failure_count = getattr(self, '_sync_failure_count', 0) + 1
-                        logger.warning(
-                            "[%s] Error sync binance position (fallo consecutivo #%d): %s",
-                            self.name, self._sync_failure_count, e_pos,
-                        )
-                        if self._sync_failure_count == 5:
-                            self._notify(
-                                f"⚠️ Desincronización persistente con Binance detectada "
-                                f"({self._sync_failure_count} fallos consecutivos). "
-                                f"El bot puede no reflejar la posición real del exchange."
-                            )
+                sub = stream_hub.subscribe(self.symbol, self.timeframe, self.use_testnet)
+            except Exception:
+                logger.exception("[%s] No se pudo abrir el WebSocket de mercado; se usará REST", self.name)
+        mode = None
+        last_eval = 0.0
+        # Al arrancar se da unos segundos al WebSocket para que conecte antes de recurrir a REST.
+        warmup_until = time.monotonic() + self.WS_WARMUP_S
+        try:
+            while self._alive(generation):
+                used_stream = False
+                try:
+                    if sub is not None and sub.is_fresh():
+                        used_stream = True
+                        if mode != "ws":
+                            mode = "ws"
+                            logger.info("[%s] Datos de mercado por WebSocket (%s %s)", self.name, self.symbol, self.timeframe)
+                        kline, book = sub.latest()
+                        self._apply_book(book["bid"], book["ask"], book["bid_qty"], book["ask_qty"])
+                        now = time.monotonic()
+                        if sub.kline_changed() and (now - last_eval) >= self.MIN_EVAL_INTERVAL_S:
+                            last_eval = now
+                            self._on_new_kline({k: kline[k] for k in ("timestamp", "open", "high", "low", "close", "volume")})
                     else:
-                        self._sync_failure_count = 0
+                        if mode is None and sub is not None and time.monotonic() < warmup_until:
+                            sub.wait_for_update(0.25)
+                            continue
+                        if mode != "rest":
+                            if mode == "ws":
+                                logger.warning("[%s] WebSocket sin datos recientes: polling REST de respaldo", self.name)
+                                self._notify("⚠️ Flujo WebSocket interrumpido: usando polling REST de respaldo.")
+                            mode = "rest"
+                        self._poll_rest_once(binance_symbol)
+                except Exception:
+                    logger.exception("[%s] Error obteniendo datos de mercado", self.name)
 
-            except Exception as e:
-                logger.error(f"[{self.name}] Error polling klines: {e}")
-            
-            time.sleep(2)
+                if used_stream:
+                    sub.wait_for_update(0.25)
+                else:
+                    self._sleep_while_alive(self.REST_POLL_S, generation)
+        finally:
+            stream_hub.release(sub)
+
+    def _exchange_sync_loop(self, generation: int):
+        """Hilo de sincronización con Binance (posición propia, SL/TP). Va aparte del de mercado: las
+        consultas REST de sincronización (~1.5 s) no deben retrasar la evaluación de la estrategia."""
+        if not (self.use_testnet and self._client and self._client.api_key):
+            return
+        binance_symbol = self.symbol.replace("/", "").upper()
+        next_protect = time.monotonic() + self.PROTECTION_CHECK_S
+        while self._alive(generation):
+            try:
+                self._sync_with_exchange(binance_symbol)
+                now = time.monotonic()
+                if self.position and now >= next_protect:
+                    next_protect = now + self.PROTECTION_CHECK_S
+                    self._ensure_exchange_sl_tp()
+            except Exception:
+                logger.exception("[%s] Error en la sincronización con el exchange", self.name)
+            self._sleep_while_alive(self.EXCHANGE_SYNC_S, generation)
 
     def update_configuration(
         self,
@@ -468,7 +441,7 @@ class PaperTrader:
                 self.position.sl_price = sl_price
                 self.position.tp_price = tp_price
             except Exception:
-                pass
+                logger.warning("[%s] No se pudo recalcular SL/TP tras cambiar la configuración", self.name, exc_info=True)
 
         if was_running and reconnect_needed:
             self.stop()
@@ -484,11 +457,13 @@ class PaperTrader:
         self.status_message = "Detenido"
         if self._client:
             try:
-                if self.use_testnet:
-                    self._client.cancel_all_open_orders(self.symbol)
+                # Con posición abierta su SL/TP se conserva (detener el bot no debe dejarla desprotegida y
+                # al reanudar se recupera). Sin posición se limpian solo las referencias propias sobrantes.
+                if self.use_testnet and self.position is None:
+                    self._cancel_own_protection(self.position)
                 self._client.stop()
             except Exception:
-                pass
+                logger.warning("[%s] Error al limpiar/cerrar el cliente de Binance en stop()", self.name, exc_info=True)
         self._save_state()
         self._notify(
             f"🛑 Bot '{self.name}' detenido. Balance final: {self.current_balance:,.2f} {self.currency}"
@@ -535,7 +510,29 @@ class PaperTrader:
             except Exception as e:
                 logger.warning("Error guardando estado del bot %s: %s", self.name, e)
 
+    # Máximo que to_dict() espera por el lock del bot antes de devolver la última foto conocida.
+    SNAPSHOT_LOCK_TIMEOUT_S = 0.3
+
     def to_dict(self) -> dict:
+        """
+        Foto del estado del bot para la API/UI/persistencia. Mientras el hilo del bot sostiene su
+        lock (evaluando la estrategia o esperando respuestas de Binance al enviar una orden, varios
+        segundos) NO se espera indefinidamente: tras SNAPSHOT_LOCK_TIMEOUT_S se devuelve la última
+        foto guardada, para que la interfaz y el daemon no se congelen detrás de una orden lenta.
+        """
+        if not self._lock.acquire(timeout=self.SNAPSHOT_LOCK_TIMEOUT_S):
+            snapshot = self._last_snapshot
+            if snapshot is not None:
+                return snapshot
+            self._lock.acquire()  # aún no hay foto previa: única vez que se espera sin límite
+        try:
+            data = self._to_dict_impl()
+            self._last_snapshot = data
+            return data
+        finally:
+            self._lock.release()
+
+    def _to_dict_impl(self) -> dict:
         """Serializa el estado completo del bot a un diccionario JSON-friendly.
 
         Protegido por self._lock (RLock): sin esto, el hilo de polling puede estar
@@ -553,6 +550,8 @@ class PaperTrader:
                     "entry_timestamp": str(self.position.entry_timestamp),
                     "sl_price": float(self.position.sl_price) if self.position.sl_price is not None else None,
                     "tp_price": float(self.position.tp_price) if self.position.tp_price is not None else None,
+                    "sl_ref": self.position.sl_ref,
+                    "tp_ref": self.position.tp_ref,
                 }
 
             # Serializar historial de trades asegurando tipos estándar
@@ -659,6 +658,8 @@ class PaperTrader:
             )
             pos.sl_price = float(pos_data.get("sl_price")) if pos_data.get("sl_price") is not None else None
             pos.tp_price = float(pos_data.get("tp_price")) if pos_data.get("tp_price") is not None else None
+            pos.sl_ref = pos_data.get("sl_ref")
+            pos.tp_ref = pos_data.get("tp_ref")
             self.position = pos
         else:
             self.position = None
@@ -735,6 +736,18 @@ class PaperTrader:
                     return
             except Exception as exc:
                 logger.warning("Error evaluando exit_conditions: %s", exc)
+
+            # ── Salida por estado (vela cerrada) ─────────────────
+            # La regla de salida de la estrategia es un CRUCE (evento de un instante): si el
+            # precio ya estaba del lado contrario al entrar, o el cruce ocurrió mientras la
+            # posición no estaba registrada, ese evento nunca llega y la posición queda abierta
+            # hasta el SL/TP. Se confirma también el ESTADO al cierre de cada vela.
+            try:
+                if self._exit_state_confirmed():
+                    self._close_position(current_price, current_ts, "EXIT_SIGNAL")
+                    return
+            except Exception as exc:
+                logger.warning("Error evaluando la salida por estado: %s", exc)
 
         else:
             # ── Condición de entrada ─────────────────────────────
@@ -912,6 +925,8 @@ class PaperTrader:
         sl_type = self.order_types.get("stop_loss", "LIMIT").upper()
         tp_type = self.order_types.get("take_profit", "LIMIT").upper()
 
+        own_sl_ref = own_tp_ref = None
+
         # Envío y comprobación activa de ejecución en Binance Futures si está configurado
         if self.use_testnet:
             if not self._client:
@@ -931,8 +946,8 @@ class PaperTrader:
                 )
                 return
 
-            # Cancelar previamente cualquier orden residual antes de abrir una nueva
-            self._client.cancel_all_open_orders(self.symbol)
+            # (Antes se cancelaban TODAS las órdenes abiertas del símbolo antes de abrir: con varios bots
+            # eso borraba el SL/TP de los demás. Cada bot solo gestiona las referencias de sus órdenes.)
 
             ext_order, err = self._client.place_futures_order(
                 self.symbol, side, quantity, order_type=entry_type, price=price, verify_execution=True
@@ -1002,6 +1017,10 @@ class PaperTrader:
             if real_fill_price > 0:
                 price_deviation = abs(real_fill_price - price) / price if price > 0 else 0.0
                 if price_deviation <= 0.15:
+                    # SL/TP se calcularon sobre el precio de la señal: se reanclan al precio real
+                    # de ejecución para que las distancias configuradas se midan desde donde el
+                    # bot realmente entró (con deslizamiento, la señal y el fill difieren).
+                    sl_price, tp_price = self._anchor_sl_tp(sl_price, tp_price, price, real_fill_price)
                     price = real_fill_price
                 else:
                     self._trigger_critical_order_alert(
@@ -1043,6 +1062,8 @@ class PaperTrader:
                 sl_price=sl_price, tp_price=tp_price,
                 sl_order_type=sl_type, tp_order_type=tp_type
             )
+            own_sl_ref = self._client.order_ref(sl_tp_res.get("sl_order"))
+            own_tp_ref = self._client.order_ref(sl_tp_res.get("tp_order"))
             if sl_tp_res.get("tp_order"):
                 tp_ref = sl_tp_res['tp_order'].get('orderId') or sl_tp_res['tp_order'].get('algoId')
                 self._notify(f"🎯 ORDEN TP ({tp_type}) COLOCADA @ {tp_price:.4f} | ID: {tp_ref}")
@@ -1069,6 +1090,8 @@ class PaperTrader:
         self.position = Position(side, price, quantity, ts)
         self.position.sl_price = sl_price
         self.position.tp_price = tp_price
+        self.position.sl_ref = own_sl_ref
+        self.position.tp_ref = own_tp_ref
         self._last_open_ts = time.time()
 
         self._notify(
@@ -1077,6 +1100,422 @@ class PaperTrader:
             f"Qty: {quantity:.6f} {base_asset}"
         )
         self._save_state()
+
+    # ──────────────────────────────────────────────────────────────
+    # Posición PROPIA del bot (varios bots pueden operar el mismo símbolo)
+    # ──────────────────────────────────────────────────────────────
+    # Binance mantiene una única posición NETA por símbolo. Antes cada bot la trataba como suya:
+    # adoptaba la de otro bot, la cerraba "por sincronización" y cancelaba en masa el SL/TP de los
+    # demás. Ahora cada bot es dueño de SU posición: la deduce de SUS órdenes (entrada, SL y TP,
+    # registradas con su bot_id) y solo cancela/repone las referencias de esas órdenes.
+
+    OPEN_SYNC_GRACE_S = 30.0          # tras abrir no se repone protección (las órdenes recién colocadas)
+    OWN_SYNC_MIN_AGE_S = 5.0          # ni se resuelve el estado de las patas SL/TP
+    ZERO_READS_TO_CONFIRM = 2         # lecturas seguidas de posición neta 0 para dar un cierre externo
+    RECOVERY_LOOKBACK_DAYS = 7
+
+    @staticmethod
+    def _naive_utc(ts) -> datetime:
+        stamp = pd.Timestamp(ts)
+        stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+        return stamp.tz_localize(None).to_pydatetime()
+
+    @staticmethod
+    def _anchor_sl_tp(sl_price, tp_price, signal_price: float, entry_price: float):
+        """
+        Traslada SL/TP (calculados sobre `signal_price`) para que se midan desde `entry_price`,
+        el precio de entrada real. Es un desplazamiento aditivo: exacto para SL/TP en puntos o
+        ATR y con un error despreciable (fracción del % configurado) para SL/TP porcentuales.
+        """
+        if not signal_price or not entry_price or signal_price == entry_price:
+            return sl_price, tp_price
+        delta = entry_price - signal_price
+        return (
+            sl_price + delta if sl_price is not None else None,
+            tp_price + delta if tp_price is not None else None,
+        )
+
+    def _net_position_amount(self) -> Optional[float]:
+        """Cantidad NETA de la cuenta en el símbolo (None si no se pudo consultar)."""
+        try:
+            info = self._client.client.futures_position_information(symbol=self.symbol.replace("/", "").upper())
+            return float(info[0].get("positionAmt", 0.0)) if info else 0.0
+        except Exception as e:
+            logger.warning("[%s] No se pudo consultar la posición neta: %s", self.name, e)
+            return None
+
+    def _refs_from_ledger(self, since: datetime) -> dict:
+        """Últimas órdenes SL/TP registradas por ESTE bot en el ledger desde `since` (naive UTC)."""
+        from reconciliation.models import AppOrderRecord
+
+        out = {"sl": None, "tp": None}
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(AppOrderRecord)
+                .filter(
+                    AppOrderRecord.bot_id == self.bot_id,
+                    AppOrderRecord.use_testnet == True,  # noqa: E712
+                    AppOrderRecord.status == "SENT_OK",
+                    AppOrderRecord.action.in_(("STOP_LOSS", "TAKE_PROFIT")),
+                    AppOrderRecord.created_at >= since,
+                )
+                .order_by(AppOrderRecord.created_at.desc())
+                .all()
+            )
+            for r in rows:
+                leg = "sl" if r.action == "STOP_LOSS" else "tp"
+                if out[leg] is None and r.binance_order_id:
+                    oid = int(r.binance_order_id)
+                    # Los ids de Algo Orders (condicionales) son enormes (>1e15); los de órdenes estándar no.
+                    out[leg] = {"kind": "algo" if oid >= 10 ** 15 else "order", "id": oid}
+        finally:
+            db.close()
+        return out
+
+    def _attach_refs_from_ledger(self, pos: "Position") -> None:
+        """Posiciones restauradas de un estado anterior no traen referencias: se recuperan del ledger."""
+        try:
+            refs = self._refs_from_ledger(self._naive_utc(pos.entry_timestamp) - timedelta(minutes=5))
+        except Exception:
+            logger.exception("[%s] No se pudieron leer las referencias SL/TP del ledger", self.name)
+            return
+        if pos.sl_ref is None:
+            pos.sl_ref = refs["sl"]
+        if pos.tp_ref is None:
+            pos.tp_ref = refs["tp"]
+
+    def _cancel_own_protection(self, pos: Optional["Position"] = None) -> None:
+        """Cancela SOLO el SL/TP de este bot (nunca el de otros bots del mismo símbolo)."""
+        pos = pos or self.position
+        if pos is None or not (self.use_testnet and self._client and self._client.api_key):
+            return
+        if pos.sl_ref is None and pos.tp_ref is None:
+            self._attach_refs_from_ledger(pos)
+        refs = [r for r in (pos.sl_ref, pos.tp_ref) if r]
+        if not refs:
+            return
+        ok, errors = self._client.cancel_order_refs(self.symbol, refs)
+        if not ok:
+            logger.warning("[%s] No se pudo cancelar el SL/TP propio: %s", self.name, "; ".join(errors))
+
+    def _resolve_own_exchange_close(self, pos: "Position"):
+        """
+        ¿Cerró el exchange la posición de ESTE bot ejecutando su SL o su TP?
+        Devuelve ("FOUND", precio_medio) | ("NONE", None) si ninguna pata se ejecutó |
+        ("UNKNOWN", None) si no se pudo determinar.
+        """
+        refs = [r for r in (pos.sl_ref, pos.tp_ref) if r]
+        if not refs:
+            return "UNKNOWN", None
+        states = [self._client.get_order_ref_state(self.symbol, r) for r in refs]
+        for st in states:
+            if st["state"] == "FILLED" and st.get("avg_price"):
+                return "FOUND", float(st["avg_price"])
+        if all(st["state"] in ("CANCELED", "EXPIRED", "REJECTED") for st in states):
+            return "NONE", None
+        return "UNKNOWN", None
+
+    def _sync_with_exchange(self, binance_symbol: str) -> None:
+        """Sincronización periódica (~4 s) con Binance: posición neta (informativa) + posición propia."""
+        try:
+            pos_list = self._client.client.futures_position_information(symbol=binance_symbol)
+            net_amt, mark_p = 0.0, 0.0
+            if pos_list:
+                p_info = pos_list[0]
+                net_amt = float(p_info.get("positionAmt", 0.0))
+                mark_p = float(p_info.get("markPrice", 0.0))
+                entry_p = float(p_info.get("entryPrice", 0.0))
+                info = None
+                if net_amt != 0:
+                    info = {
+                        # Posición NETA de la cuenta en este símbolo (suma de todos los bots y de
+                        # cualquier orden manual): es informativa, NO la posición de este bot.
+                        "scope": "account_net",
+                        "symbol": binance_symbol,
+                        "amount": net_amt,
+                        "abs_amount": abs(net_amt),
+                        "entry_price": entry_p,
+                        "break_even_price": float(p_info.get("breakEvenPrice", 0.0) or entry_p),
+                        "mark_price": mark_p,
+                        "unrealized_pnl": float(p_info.get("unRealizedProfit", 0.0)),
+                        "initial_margin": float(p_info.get("isolatedMargin", 0.0) or p_info.get("initialMargin", 0.0)),
+                        "leverage": int(p_info.get("leverage", 1)),
+                        "margin_type": p_info.get("marginType", "cross"),
+                    }
+                with self._lock:
+                    self.binance_position_info = info
+            self._sync_own_position(net_amt, mark_p)
+        except Exception as e_pos:
+            # Un fallo aquí deja al bot sin saber el estado real de su posición: se cuenta y se avisa.
+            self._sync_failure_count = getattr(self, "_sync_failure_count", 0) + 1
+            logger.warning(
+                "[%s] Error sync binance position (fallo consecutivo #%d): %s",
+                self.name, self._sync_failure_count, e_pos, exc_info=self._sync_failure_count == 1,
+            )
+            if self._sync_failure_count == 5:
+                self._notify(
+                    f"⚠️ Desincronización persistente con Binance detectada "
+                    f"({self._sync_failure_count} fallos consecutivos). "
+                    f"El bot puede no reflejar la posición real del exchange."
+                )
+        else:
+            self._sync_failure_count = 0
+
+    def _sync_own_position(self, net_amt: float, mark_p: float) -> None:
+        """Resuelve el estado de la posición de ESTE bot a partir de SUS órdenes SL/TP."""
+        pos = self.position
+        if pos is None:
+            self._zero_pos_reads = 0
+            return
+        if time.time() - getattr(self, "_last_open_ts", 0.0) < self.OWN_SYNC_MIN_AGE_S:
+            return
+        if pos.sl_ref is None and pos.tp_ref is None:
+            self._attach_refs_from_ledger(pos)
+        refs = [(leg, getattr(pos, f"{leg}_ref")) for leg in ("sl", "tp") if getattr(pos, f"{leg}_ref")]
+
+        dead_legs = []
+        if refs:
+            open_refs = self._client.get_open_order_refs(self.symbol)
+            if open_refs is None:
+                return  # no se pudo consultar: no se decide nada con datos incompletos
+            for leg, ref in refs:
+                if (ref["kind"], ref["id"]) in open_refs:
+                    continue
+                state = self._client.get_order_ref_state(self.symbol, ref)
+                if state["state"] == "FILLED":
+                    price = float(state.get("avg_price") or 0.0) or (pos.sl_price if leg == "sl" else pos.tp_price) or mark_p
+                    with self._lock:
+                        if self.position is pos:
+                            self._zero_pos_reads = 0
+                            self._close_position(
+                                price, datetime.now(timezone.utc), reason=leg.upper(), already_closed_on_exchange=True
+                            )
+                    return
+                if state["state"] == "TRIGGERED":
+                    return  # disparada pero aún sin ejecutar: se espera al siguiente ciclo
+                if state["state"] in ("CANCELED", "EXPIRED", "REJECTED"):
+                    dead_legs.append(leg)
+                # UNKNOWN: incierto, no se toma ninguna decisión en este ciclo
+
+        # Invariante: si la posición NETA de la cuenta es 0, ningún bot puede tener una posición abierta en
+        # el símbolo. Se exigen 2 lecturas seguidas (Testnet a veces devuelve lecturas viejas justo tras
+        # operar). Cubre el cierre manual en Binance y las posiciones "fantasma" heredadas de un estado
+        # anterior (sin referencias SL/TP), que de otro modo nadie resolvería.
+        if abs(net_amt) < 1e-9:
+            self._zero_pos_reads += 1
+            if self._zero_pos_reads >= self.ZERO_READS_TO_CONFIRM:
+                exit_p = mark_p if mark_p > 0 else pos.entry_price
+                with self._lock:
+                    if self.position is pos:
+                        self._zero_pos_reads = 0
+                        self._close_position(
+                            exit_p, datetime.now(timezone.utc), reason="BINANCE_EXCHANGE_CLOSED",
+                            already_closed_on_exchange=True,
+                        )
+            return
+
+        self._zero_pos_reads = 0
+        if not refs or (dead_legs and len(dead_legs) == len(refs)):
+            self._ensure_exchange_sl_tp()   # posición viva pero sin protección conocida/viva: reponer
+
+    def _ensure_exchange_sl_tp(self) -> None:
+        """
+        Repone en Binance las patas SL/TP de ESTE bot que no estén vivas. Antes de colocar nada
+        comprueba que la posición siga existiendo (una orden reduceOnly sobre una posición que ya
+        no existe, o que es de otro bot, sería un error).
+        """
+        pos = self.position
+        if pos is None or not self.use_testnet or not self._client or not self._client.api_key:
+            return
+        if pos.sl_price is None and pos.tp_price is None:
+            return
+        if time.time() - getattr(self, "_last_open_ts", 0.0) < self.OPEN_SYNC_GRACE_S:
+            return
+        if pos.sl_ref is None and pos.tp_ref is None:
+            self._attach_refs_from_ledger(pos)
+
+        open_refs = self._client.get_open_order_refs(self.symbol)
+        if open_refs is None:
+            return
+        missing = []
+        for leg, price in (("sl", pos.sl_price), ("tp", pos.tp_price)):
+            if price is None:
+                continue
+            ref = getattr(pos, f"{leg}_ref")
+            if ref and (ref["kind"], ref["id"]) in open_refs:
+                continue
+            if ref:
+                state = self._client.get_order_ref_state(self.symbol, ref)["state"]
+                if state in ("FILLED", "TRIGGERED", "UNKNOWN"):
+                    return  # la sincronización resuelve el cierre; o hay incertidumbre: no colocar nada
+            missing.append(leg)
+        if not missing:
+            return
+
+        with self._lock:
+            if self.position is not pos:
+                return  # se cerró (o cambió) mientras se consultaba el exchange
+            self._place_missing_protection(pos, missing)
+
+    def _place_missing_protection(self, pos: "Position", missing: list) -> None:
+        """Coloca las patas SL/TP indicadas si la cuenta tiene una posición que las respalde. Con el lock del bot."""
+        net = self._net_position_amount()
+        direction = 1.0 if pos.side == "long" else -1.0
+        if net is None or net * direction < pos.quantity - 1e-9:
+            return  # la cuenta no tiene (todavía/ya) una posición que respalde la de este bot
+
+        sl_type = self.order_types.get("stop_loss", "LIMIT").upper()
+        tp_type = self.order_types.get("take_profit", "LIMIT").upper()
+        self._notify(
+            f"🛡️ La posición {pos.side.upper()} {pos.quantity:.6f} no tiene su "
+            f"{' y '.join(l.upper() for l in missing)} en Binance. Reponiendo."
+        )
+        res = self._client.place_futures_sl_tp(
+            self.symbol, pos.side, pos.quantity,
+            sl_price=pos.sl_price if "sl" in missing else None,
+            tp_price=pos.tp_price if "tp" in missing else None,
+            sl_order_type=sl_type, tp_order_type=tp_type,
+        )
+        if res.get("sl_order"):
+            pos.sl_ref = self._client.order_ref(res["sl_order"])
+            self._notify(f"🛡️ ORDEN SL ({sl_type}) REPUESTA @ {pos.sl_price:.4f}")
+        if res.get("tp_order"):
+            pos.tp_ref = self._client.order_ref(res["tp_order"])
+            self._notify(f"🎯 ORDEN TP ({tp_type}) REPUESTA @ {pos.tp_price:.4f}")
+        if res.get("sl_order") or res.get("tp_order"):
+            self._save_state()
+        if res.get("errors") or res.get("error"):
+            self._trigger_critical_order_alert(
+                "No se pudo reponer el SL/TP en Binance — la posición sigue sin protección en el exchange",
+                {
+                    "Símbolo": self.symbol,
+                    "Lado": pos.side.upper(),
+                    "Errores": ", ".join(res.get("errors") or [str(res.get("error"))]),
+                },
+            )
+
+    def _recover_position_from_ledger(self) -> None:
+        """
+        Recupera, tras un reinicio o una caída, la posición ABIERTA de este bot a partir de SUS
+        órdenes en el ledger (sustituye a "adoptar la posición neta de la cuenta", que le robaba
+        a un bot la posición de otro). Solo se recupera si hay una entrada sin cierre posterior,
+        ninguna pata SL/TP ejecutada y una posición neta que la respalde.
+        """
+        if self.position is not None or not (self.use_testnet and self._client and self._client.api_key):
+            return
+        from reconciliation.models import AppOrderRecord
+
+        since = datetime.utcnow() - timedelta(days=self.RECOVERY_LOOKBACK_DAYS)
+        db = SessionLocal()
+        try:
+            base = db.query(AppOrderRecord).filter(
+                AppOrderRecord.bot_id == self.bot_id,
+                AppOrderRecord.use_testnet == True,  # noqa: E712
+                AppOrderRecord.status == "SENT_OK",
+                AppOrderRecord.created_at >= since,
+            )
+            last_open = base.filter(AppOrderRecord.action == "OPEN").order_by(AppOrderRecord.created_at.desc()).first()
+            if last_open is None:
+                return
+            closed_after = base.filter(
+                AppOrderRecord.action == "CLOSE", AppOrderRecord.created_at > last_open.created_at
+            ).count()
+            if closed_after:
+                return
+            open_time, open_side, open_order_id = last_open.created_at, last_open.side, last_open.binance_order_id
+            qty = float(last_open.executed_qty or last_open.requested_qty or 0.0)
+        finally:
+            db.close()
+
+        refs = self._refs_from_ledger(open_time - timedelta(minutes=1))
+        for ref in (refs["sl"], refs["tp"]):
+            if ref and self._client.get_order_ref_state(self.symbol, ref)["state"] in ("FILLED", "TRIGGERED"):
+                return  # el exchange ya cerró esta posición con su SL/TP
+
+        side = "long" if str(open_side).upper() == "BUY" else "short"
+        net = self._net_position_amount()
+        direction = 1.0 if side == "long" else -1.0
+        if net is None or net * direction < qty - 1e-9 or qty <= 0:
+            return  # la cuenta no tiene una posición que respalde la que el ledger dice abierta
+
+        try:
+            order = self._client.client.futures_get_order(
+                symbol=self.symbol.replace("/", "").upper(), orderId=int(open_order_id)
+            )
+            entry_price = float(order.get("avgPrice") or 0.0)
+        except Exception:
+            entry_price = 0.0
+        if entry_price <= 0:
+            entry_price = float(self.klines_df["close"].iloc[-1]) if not self.klines_df.empty else 0.0
+        if entry_price <= 0:
+            return
+
+        pos = Position(side, entry_price, qty, pd.Timestamp(open_time, tz="UTC"))
+        try:
+            idx = len(self.klines_df) - 1
+            sl_p, tp_p = self.strategy.risk_manager.compute_sl_tp(self.klines_df, idx, side)
+            sl_p, tp_p = self._anchor_sl_tp(sl_p, tp_p, float(self.klines_df["close"].iloc[idx]), entry_price)
+        except Exception:
+            logger.exception("[%s] compute_sl_tp falló al recuperar la posición; se usa SL/TP de emergencia", self.name)
+            sl_p = entry_price * (0.98 if side == "long" else 1.02)
+            tp_p = entry_price * (1.04 if side == "long" else 0.96)
+        pos.sl_price, pos.tp_price = sl_p, tp_p
+        pos.sl_ref, pos.tp_ref = refs["sl"], refs["tp"]
+        with self._lock:
+            self.position = pos
+        self._notify(
+            f"♻️ Posición propia recuperada del ledger tras reinicio: {side.upper()} {qty:.6f} @ {entry_price:.4f}"
+        )
+        self._save_state()
+
+    # Operadores de "cruce" (evento) -> su equivalente de "estado" para la salida por estado.
+    _STATE_OPERATOR = {"crosses_below": "is_below", "crosses_above": "is_above"}
+
+    @staticmethod
+    def _timeframe_delta(timeframe: str) -> Optional[pd.Timedelta]:
+        # Sensible a mayúsculas a propósito: en Binance "1m" es un minuto y "1M" un mes (no soportado).
+        match = re.fullmatch(r"(\d+)([mhdw])", str(timeframe).strip())
+        if not match:
+            return None
+        minutes = {"m": 1, "h": 60, "d": 1440, "w": 10080}[match.group(2)]
+        return pd.Timedelta(minutes=int(match.group(1)) * minutes)
+
+    def _exit_state_confirmed(self) -> bool:
+        """
+        True si, al CIERRE de la última vela completada tras la entrada, la condición de salida
+        se cumple como ESTADO (p. ej. EMA rápida por debajo de la lenta) aunque el cruce en sí
+        no se haya detectado como evento. Solo cuenta velas cerradas después de abrir la
+        posición, para no salir por el estado previo a una entrada intra-vela.
+        """
+        pos = self.position
+        if pos is None or len(self.klines_df) < 3:
+            return False
+        delta = self._timeframe_delta(self.timeframe)
+        if delta is None:
+            return False
+
+        entry_ts = pd.Timestamp(pos.entry_timestamp)
+        entry_ts = entry_ts.tz_localize("UTC") if entry_ts.tzinfo is None else entry_ts.tz_convert("UTC")
+        last_closed_open = self.klines_df.index[-2]
+        if last_closed_open + delta <= entry_ts:
+            return False  # esa vela cerró antes de que se abriera la posición
+
+        exit_cfg = copy.deepcopy(self.strategy.config.get("exit_conditions", {}) or {})
+        rules = exit_cfg.get("rules", []) or []
+        state_rules = []
+        for rule in rules:
+            if rule.get("type") == "technical_indicator" and rule.get("operator") in self._STATE_OPERATOR:
+                rule["operator"] = self._STATE_OPERATOR[rule["operator"]]
+                state_rules.append(rule)
+        if not state_rules:
+            return False
+        if len(state_rules) != len(rules) and str(exit_cfg.get("logic", "OR")).upper() != "OR":
+            return False  # con AND no se puede evaluar solo una parte de las reglas
+        exit_cfg["rules"] = state_rules
+
+        signal = ConditionEvaluator.evaluate_conditions(self.klines_df.iloc[:-1], exit_cfg)
+        return (not signal.empty) and bool(signal.iloc[-1])
 
     def _find_real_exit_fill(self, pos: "Position"):
         """
@@ -1108,8 +1547,11 @@ class PaperTrader:
             logger.warning("[%s] No se pudo consultar el fill de cierre real en Binance: %s", self.name, e)
             return "ERROR", None
 
-    def _close_position(self, price: float, ts, reason: str):
-        """Cierra la posición abierta, calcula PNL y persiste el trade, verificando ejecución en el exchange."""
+    def _close_position(self, price: float, ts, reason: str, already_closed_on_exchange: bool = False):
+        """Cierra la posición abierta, calcula PNL y persiste el trade, verificando ejecución en el exchange.
+
+        already_closed_on_exchange=True: el propio exchange ya la cerró (SL/TP ejecutado, cierre externo);
+        solo se contabiliza y se limpian las órdenes propias sobrantes, sin enviar otra orden de cierre."""
         pos = self.position
         if not pos:
             return
@@ -1126,7 +1568,7 @@ class PaperTrader:
                 # cierre (como se hacía antes): si el intento de cierre fallaba por una razón genuina
                 # (red, rate limit, etc.) la posición quedaba desprotegida en el exchange sin que el
                 # bot lo supiera. Ahora solo se cancelan una vez confirmado que la posición ya no existe.
-                if reason != "BINANCE_EXCHANGE_CLOSED":
+                if reason != "BINANCE_EXCHANGE_CLOSED" and not already_closed_on_exchange:
                     close_order, err = self._client.close_futures_position(
                         self.symbol, pos.side, pos.quantity, order_type=exit_type, price=price, verify_execution=True
                     )
@@ -1164,15 +1606,19 @@ class PaperTrader:
                             f"⚡ CIERRE ({exit_type}) EJECUTADO en Binance | "
                             f"Precio Fill: {price:.2f} | ID: {close_order.get('orderId')} | Status: {close_order.get('status')}"
                         )
-                        self._client.cancel_all_open_orders(self.symbol)
+                        self._cancel_own_protection(pos)
                     elif reduce_only_rejected:
                         # Antes se cerraba internamente al precio de la señal SIN verificar que la
                         # posición hubiera existido: una posición adoptada que ya no estaba en
                         # Binance (ej. la de un test ejecutado en el mismo símbolo) se registraba
                         # como un trade con PNL inventado. Ahora se busca el cierre real en el
                         # historial de fills de Binance.
-                        fill_status, real_exit_price = self._find_real_exit_fill(pos)
-                        self._client.cancel_all_open_orders(self.symbol)
+                        # Primero por las órdenes PROPIAS (SL/TP de este bot); si no concluyen, por el
+                        # historial de fills de la cuenta.
+                        fill_status, real_exit_price = self._resolve_own_exchange_close(pos)
+                        if fill_status != "FOUND":
+                            fill_status, real_exit_price = self._find_real_exit_fill(pos)
+                        self._cancel_own_protection(pos)
                         if fill_status == "NONE":
                             self._notify(
                                 f"⚠️ Posición {pos.side.upper()} {pos.quantity:.6f} @ {pos.entry_price:.4f} descartada: "
@@ -1223,10 +1669,9 @@ class PaperTrader:
                         # siguiente ciclo de evaluacion de la estrategia.
                         return
                 else:
-                    # BINANCE_EXCHANGE_CLOSED: el propio polling loop ya detecto que la posicion
-                    # se cerro en el exchange (SL/TP, liquidacion, cierre manual); solo queda
-                    # limpiar cualquier orden condicional residual.
-                    self._client.cancel_all_open_orders(self.symbol)
+                    # Cerrada ya en el exchange (SL/TP ejecutado, liquidación, cierre manual): solo
+                    # queda limpiar las órdenes condicionales PROPIAS que hayan quedado vivas.
+                    self._cancel_own_protection(pos)
             else:
                 err_msg = "Modo Binance activo pero sin cliente conectado al cerrar"
                 self.record_unexecuted_order(
@@ -1475,7 +1920,7 @@ class PaperTrader:
                 try:
                     self.telegram.send_message(f"<b>[PaperTrader - {self.name}]</b>\n{message}")
                 except Exception:
-                    pass
+                    logger.warning("[%s] No se pudo enviar el mensaje a Telegram", self.name, exc_info=True)
 
         # Callback a la UI — debe ser thread-safe
         if self.update_callback:

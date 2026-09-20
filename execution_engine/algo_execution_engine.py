@@ -114,7 +114,7 @@ class AlgoExecutionEngine:
                 if price and price > 0:
                     return price
         except Exception:
-            pass
+            logger.debug("No se pudo obtener el precio del cliente Testnet; se usará el siguiente respaldo", exc_info=True)
 
         try:
             resp = requests.get(
@@ -253,7 +253,7 @@ class AlgoExecutionEngine:
                 try:
                     task.status_callback(task)
                 except Exception:
-                    pass
+                    logger.exception("status_callback de la tarea algo falló")
 
             if remaining_qty <= 0.0001:
                 break
@@ -282,7 +282,7 @@ class AlgoExecutionEngine:
             try:
                 task.status_callback(task)
             except Exception:
-                pass
+                logger.exception("status_callback de la tarea algo falló")
 
 
 # Instancia singleton del motor algorítmico

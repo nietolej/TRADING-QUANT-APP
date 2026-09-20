@@ -3,7 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.routes import backtest_router, data_router
 from data_layer.storage import init_db
 from reconciliation.api import router as reconciliation_router
+from app_runtime.logging_setup import setup_logging
 
+setup_logging("web")
 init_db()
 
 app = FastAPI(

@@ -194,6 +194,17 @@ class OrderReconciler:
             raw_status = str(exchange_order.get("algoStatus") or exchange_order.get("status") or "").upper()
             exec_qty = float(exchange_order.get("executedQty") or exchange_order.get("executedAmt") or 0.0)
             avg_price = float(exchange_order.get("avgPrice") or exchange_order.get("avgFillPrice") or 0.0)
+            # La respuesta de una Algo Order disparada (FINISHED) NO trae cantidad ni precio ejecutados:
+            # están en la orden real que generó (actualOrderId). Sin consultarla, exec_qty quedaba en 0 y
+            # todo SL/TP ejecutado se marcaba QTY_MISMATCH.
+            actual_order_id = exchange_order.get("actualOrderId")
+            if actual_order_id and raw_status == "FINISHED":
+                try:
+                    real = self.client.client.futures_get_order(symbol=record.symbol, orderId=int(actual_order_id))
+                    exec_qty = float(real.get("executedQty") or exec_qty)
+                    avg_price = float(real.get("avgPrice") or avg_price)
+                except Exception as e:
+                    logger.warning("No se pudo consultar la orden real %s del algo %s: %s", actual_order_id, record.binance_order_id, e)
             if not raw_status:
                 return _result(
                     "MATCHED", "INFO",
@@ -570,7 +581,7 @@ class OrderReconciler:
                 self.client.cancel_all_open_orders(symbol)
                 self.client.close_futures_position(symbol=symbol, side="long", quantity=quantity, order_type="MARKET", verify_execution=False)
             except Exception:
-                pass
+                logger.warning("No se pudo limpiar la posición de prueba de Testnet: puede haber quedado abierta", exc_info=True)
 
         # 6. Reconciliar de inmediato las órdenes que este mismo test acaba de generar,
         # probando también el módulo de reconciliación como parte del ciclo.

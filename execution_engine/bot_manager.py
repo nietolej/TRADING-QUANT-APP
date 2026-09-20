@@ -1,5 +1,7 @@
 import os
 import json
+import atexit
+import time
 import logging
 import threading
 from typing import Dict, List, Optional, Any
@@ -8,7 +10,8 @@ from .paper_trader import PaperTrader
 logger = logging.getLogger(__name__)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
-BOTS_STATE_FILE = os.path.join(DATA_DIR, "bots_state.json")
+# TQA_BOTS_STATE_FILE permite ejecutar un daemon aislado (pruebas) sin tocar el estado real de los bots.
+BOTS_STATE_FILE = os.getenv("TQA_BOTS_STATE_FILE") or os.path.join(DATA_DIR, "bots_state.json")
 
 
 class BotManager:
@@ -17,41 +20,93 @@ class BotManager:
     Permite crear, arrancar, detener, persistir en disco y monitorear múltiples bots concurrentemente.
     """
 
-    def __init__(self, persistence_file: str = BOTS_STATE_FILE):
+    # Agrupa ráfagas de cambios de estado en una sola escritura a disco.
+    SAVE_DEBOUNCE_S = 0.5
+
+    def __init__(self, persistence_file: str = BOTS_STATE_FILE, auto_start_running_bots: Optional[bool] = None):
         self._bots: Dict[str, PaperTrader] = {}
+        # Protege SOLO el diccionario de bots y se mantiene por instantes: nunca se toma otro lock
+        # (el de un bot, el de disco) mientras se sostiene, para que no pueda haber interbloqueos.
         self._lock = threading.RLock()
+        self._io_lock = threading.Lock()  # serializa las escrituras del archivo de estado
+        self._dirty = threading.Event()
+        self._stop_writer = threading.Event()
+        self._writer_thread: Optional[threading.Thread] = None
+        self._unexec_cache: tuple = (None, [])  # (mtime del archivo global, contenido)
         self.persistence_file = persistence_file
         os.makedirs(os.path.dirname(self.persistence_file), exist_ok=True)
+
+        # Solo el proceso del daemon reanuda bots al arrancar: si otro proceso (servidor web,
+        # scripts de prueba) importara este módulo y los reanudara, habría dos procesos operando
+        # los mismos bots (órdenes duplicadas) y cada guardado de código reiniciaría los bots.
+        if auto_start_running_bots is None:
+            auto_start_running_bots = os.getenv("TQA_PROCESS_ROLE", "") == "daemon"
+            if not auto_start_running_bots:
+                logger.warning(
+                    "BotManager creado fuera del daemon (TQA_PROCESS_ROLE!=daemon): los bots marcados como "
+                    "corriendo NO se reanudan en este proceso. Los bots viven en el Trading Daemon (puerto 8001)."
+                )
+        self._start_writer()
+        atexit.register(self._flush_on_exit)
         # Cargar bots guardados previamente en disco
-        self.load_state_from_disk(auto_start_running_bots=True)
+        self.load_state_from_disk(auto_start_running_bots=auto_start_running_bots)
+
+    # ── Persistencia ────────────────────────────────────────────────────────
+
+    def _start_writer(self):
+        self._writer_thread = threading.Thread(target=self._writer_loop, name="bot-state-writer", daemon=True)
+        self._writer_thread.start()
+
+    def _writer_loop(self):
+        while not self._stop_writer.is_set():
+            self._dirty.wait()
+            if self._stop_writer.is_set():
+                break
+            time.sleep(self.SAVE_DEBOUNCE_S)
+            self._dirty.clear()
+            try:
+                self._persist()
+            except Exception:
+                logger.exception("Error en el hilo de persistencia del estado de bots")
+
+    def _flush_on_exit(self):
+        self._stop_writer.set()
+        self._dirty.set()
+        try:
+            self._persist()
+        except Exception:
+            logger.exception("No se pudo guardar el estado de bots al salir")
 
     def _on_bot_state_changed(self, bot: PaperTrader):
-        """Callback invocado por cualquier PaperTrader cuando cambia su estado."""
-        self.save_state_to_disk()
+        """Callback de cada PaperTrader al cambiar su estado. Se invoca con el lock del propio
+        bot tomado, así que NO puede tocar ningún otro lock: solo marca el estado como sucio y
+        el hilo de persistencia guarda fuera de cualquier lock de bot."""
+        self._dirty.set()
 
     def save_state_to_disk(self):
-        """Guarda de forma atómica el estado de todos los bots en archivo JSON."""
-        with self._lock:
-            try:
-                bots_payload = {}
-                for bot_id, bot in self._bots.items():
-                    bots_payload[bot_id] = bot.to_dict()
+        """Guarda ya (síncrono) el estado de todos los bots. Solo para llamadores que no
+        sostienen el lock de un bot (endpoints del daemon, acciones de gestión)."""
+        self._persist()
 
+    def _persist(self):
+        """Serializa todos los bots y reemplaza el archivo de estado de forma atómica."""
+        with self._lock:
+            bots = list(self._bots.items())  # copia instantánea; el lock se suelta ya
+        try:
+            # Cada to_dict() toma únicamente el lock de su bot, sin ningún otro lock en la mano.
+            bots_payload = {bot_id: bot.to_dict() for bot_id, bot in bots}
+            with self._io_lock:
                 temp_file = f"{self.persistence_file}.tmp"
                 with open(temp_file, "w", encoding="utf-8") as f:
                     json.dump(bots_payload, f, indent=2, ensure_ascii=False)
-                
-                # Reemplazo atómico para evitar corrupción
-                if os.path.exists(self.persistence_file):
-                    os.replace(temp_file, self.persistence_file)
-                else:
-                    os.rename(temp_file, self.persistence_file)
-                logger.debug("Estado de %d bots guardado exitosamente en %s", len(bots_payload), self.persistence_file)
-            except Exception as e:
-                logger.error("Error al guardar estado de los bots en disco: %s", e)
+                os.replace(temp_file, self.persistence_file)  # reemplazo atómico
+            logger.debug("Estado de %d bots guardado en %s", len(bots_payload), self.persistence_file)
+        except Exception:
+            logger.exception("Error al guardar estado de los bots en disco")
 
     def load_state_from_disk(self, auto_start_running_bots: bool = True):
         """Carga y restaura las instancias de bots desde el archivo JSON persistente."""
+        to_resume: List[PaperTrader] = []
         with self._lock:
             if not os.path.exists(self.persistence_file):
                 return
@@ -93,13 +148,20 @@ class BotManager:
                     self._bots[bot_id] = bot
                     logger.info("Bot restaurado desde disco: %s (ID: %s, Estado: %s)", bot.name, bot_id, bot.status)
 
-                    # Si estaba operando al momento del guardado, reanudar
+                    # Si estaba operando al momento del guardado, se reanuda (fuera del lock, abajo)
                     if auto_start_running_bots and bot_dict.get("is_running") is True:
-                        logger.info("Reanudando ejecución automática del bot %s tras reinicio/recarga...", bot.name)
-                        bot.start(reset_started_at=False)
+                        to_resume.append(bot)
 
-            except Exception as e:
-                logger.error("Error al cargar estado de bots desde disco: %s", e)
+            except Exception:
+                logger.exception("Error al cargar estado de bots desde disco")
+
+        # bot.start() descarga histórico por red: no debe hacerse con el lock del manager tomado.
+        for bot in to_resume:
+            logger.info("Reanudando ejecución automática del bot %s tras reinicio/recarga...", bot.name)
+            try:
+                bot.start(reset_started_at=False)
+            except Exception:
+                logger.exception("No se pudo reanudar el bot %s", bot.name)
 
     def create_bot(
         self,
@@ -130,9 +192,9 @@ class BotManager:
                 save_callback=self._on_bot_state_changed,
             )
             self._bots[bot.bot_id] = bot
-            self.save_state_to_disk()
-            logger.info("Bot creado y registrado: %s (ID: %s)", bot.name, bot.bot_id)
-            return bot
+        self.save_state_to_disk()
+        logger.info("Bot creado y registrado: %s (ID: %s)", bot.name, bot.bot_id)
+        return bot
 
     def get_bot(self, bot_id: str) -> Optional[PaperTrader]:
         """Obtiene un bot por su ID."""
@@ -161,31 +223,28 @@ class BotManager:
     def delete_bot(self, bot_id: str) -> bool:
         """Detiene y elimina un bot del gestor."""
         with self._lock:
-            bot = self._bots.get(bot_id)
-            if bot:
-                if bot.is_running:
-                    bot.stop()
-                del self._bots[bot_id]
-                self.save_state_to_disk()
-                logger.info("Bot eliminado: %s (ID: %s)", bot.name, bot_id)
-                return True
+            bot = self._bots.pop(bot_id, None)
+        if not bot:
             return False
+        if bot.is_running:
+            bot.stop()
+        self.save_state_to_disk()
+        logger.info("Bot eliminado: %s (ID: %s)", bot.name, bot_id)
+        return True
 
     def start_all(self):
         """Inicia todos los bots registrados que estén detenidos."""
-        with self._lock:
-            for bot in self._bots.values():
-                if not bot.is_running:
-                    bot.start()
-            self.save_state_to_disk()
+        for bot in self.get_all_bots():
+            if not bot.is_running:
+                bot.start()
+        self.save_state_to_disk()
 
     def stop_all(self):
         """Detiene todos los bots que estén corriendo."""
-        with self._lock:
-            for bot in self._bots.values():
-                if bot.is_running:
-                    bot.stop()
-            self.save_state_to_disk()
+        for bot in self.get_all_bots():
+            if bot.is_running:
+                bot.stop()
+        self.save_state_to_disk()
 
     def get_portfolio_summary(self) -> dict:
         """Calcula el resumen agregado de todos los bots activos agrupando por moneda."""
@@ -258,6 +317,27 @@ class BotManager:
                 "win_rate": win_rate,
             }
 
+    def _read_global_unexecuted(self) -> List[dict]:
+        """Histórico global de órdenes no ejecutadas, con caché por fecha de modificación: el
+        monitor en vivo lo pide cada 1.5 s y el archivo pesa cientos de KB."""
+        audit_path = os.path.join(DATA_DIR, "unexecuted_orders_history.json")
+        try:
+            mtime = os.path.getmtime(audit_path)
+        except OSError:
+            return []
+        cached_mtime, cached = self._unexec_cache
+        if cached_mtime == mtime:
+            return cached
+        try:
+            with open(audit_path, "r", encoding="utf-8") as f:
+                hist = json.load(f)
+        except Exception:
+            logger.warning("No se pudo leer %s (¿archivo corrupto?)", audit_path, exc_info=True)
+            return cached if cached_mtime is not None else []
+        hist = hist if isinstance(hist, list) else []
+        self._unexec_cache = (mtime, hist)
+        return hist
+
     def get_unexecuted_orders(self, bot_id: Optional[str] = None) -> List[dict]:
         """
         Retorna el historial de órdenes no ejecutadas / rechazadas.
@@ -270,37 +350,25 @@ class BotManager:
                 if bot and hasattr(bot, 'unexecuted_orders'):
                     return list(reversed(bot.unexecuted_orders))
                 return []
+            per_bot = [list(b.unexecuted_orders) for b in self._bots.values() if hasattr(b, 'unexecuted_orders')]
 
-            # Cartera completa: agregar de todos los bots + archivo global si existe
-            all_orders = []
-            seen_ids = set()
+        # Cartera completa: agregar de todos los bots + archivo global (leído fuera del lock)
+        all_orders: List[dict] = []
+        seen_ids = set()
+        for orders in per_bot:
+            for ord_item in orders:
+                oid = ord_item.get('order_id')
+                if oid and oid not in seen_ids:
+                    seen_ids.add(oid)
+                    all_orders.append(ord_item)
+        for ord_item in self._read_global_unexecuted():
+            oid = ord_item.get('order_id')
+            if oid and oid not in seen_ids:
+                seen_ids.add(oid)
+                all_orders.append(ord_item)
 
-            for b in self._bots.values():
-                if hasattr(b, 'unexecuted_orders'):
-                    for ord_item in b.unexecuted_orders:
-                        oid = ord_item.get('order_id')
-                        if oid and oid not in seen_ids:
-                            seen_ids.add(oid)
-                            all_orders.append(ord_item)
-
-            # Cargar del archivo global si hay registros adicionales
-            audit_path = os.path.join(DATA_DIR, "unexecuted_orders_history.json")
-            if os.path.exists(audit_path):
-                try:
-                    with open(audit_path, "r", encoding="utf-8") as f:
-                        hist = json.load(f)
-                    if isinstance(hist, list):
-                        for ord_item in hist:
-                            oid = ord_item.get('order_id')
-                            if oid and oid not in seen_ids:
-                                seen_ids.add(oid)
-                                all_orders.append(ord_item)
-                except Exception:
-                    pass
-
-            # Ordenar por timestamp descendente
-            all_orders.sort(key=lambda x: str(x.get('timestamp', '')), reverse=True)
-            return all_orders
+        all_orders.sort(key=lambda x: str(x.get('timestamp', '')), reverse=True)
+        return all_orders
 
     def clear_unexecuted_orders(self, bot_id: Optional[str] = None):
         """Limpia el historial de órdenes no ejecutadas."""
@@ -321,7 +389,7 @@ class BotManager:
                         with open(audit_path, "w", encoding="utf-8") as f:
                             json.dump([], f)
                     except Exception:
-                        pass
+                        logger.warning("No se pudo vaciar el histórico global de órdenes no ejecutadas", exc_info=True)
 
 
 # Instancia singleton compartida en toda la aplicación

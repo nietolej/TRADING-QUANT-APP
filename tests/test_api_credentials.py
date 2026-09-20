@@ -46,7 +46,7 @@ class TestApiCredentialsManager(unittest.TestCase):
         # Retrocompatibilidad
         self.assertEqual(os.environ.get("BINANCE_API_KEY"), "new_real_key")
 
-    @patch("execution_engine.binance_client.Client")
+    @patch("execution_engine.binance_client.ResilientClient")
     def test_verify_binance_credentials_success(self, mock_client_cls):
         mock_instance = MagicMock()
         mock_instance.futures_ping.return_value = {}

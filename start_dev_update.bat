@@ -16,6 +16,7 @@ if errorlevel 1 (
     pause
 )
 
+call ensure_daemon.bat
 echo Iniciando en MODO DESARROLLADOR (Auto-recarga activada)...
 if exist ".\venv\Scripts\python.exe" (
     .\venv\Scripts\python.exe run_server.py

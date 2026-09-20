@@ -110,7 +110,7 @@ def log_app_order(
         try:
             db.rollback()
         except Exception:
-            pass
+            logger.debug("Rollback del ledger falló", exc_info=True)
         return None
     finally:
         db.close()
