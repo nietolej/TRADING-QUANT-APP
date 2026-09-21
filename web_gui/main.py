@@ -518,5 +518,8 @@ def create_gui(app):
         app,
         title='Trading Quant',
         favicon='📈',
+        # Con el valor por defecto (3 s) un corte breve del WebSocket (pestaña en segundo plano, hipo de red)
+        # borra el cliente y todos sus timers: el Test 2 de conciliación se detenía solo y en silencio.
+        reconnect_timeout=120.0,
         # El puerto se manejará desde Uvicorn en start.bat
     )

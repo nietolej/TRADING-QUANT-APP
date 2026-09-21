@@ -762,7 +762,8 @@ class ReconciliationPage:
                 self._set_test2_status(
                     session,
                     f"{'✅' if not report['failed_count'] else '🚨'} {total} orden(es), {report['failed_count']} con "
-                    f"discrepancia — confiabilidad {pct:.1f}% ({report['reliability_label']}). Desde las {since} UTC."
+                    f"discrepancia — confiabilidad {f'{pct:.1f}%' if pct is not None else 'sin datos'} "
+                    f"({report['reliability_label']}). Desde las {since} UTC."
                 )
         finally:
             session["busy"] = False

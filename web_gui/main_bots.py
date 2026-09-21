@@ -315,4 +315,6 @@ def create_gui_bots(app):
         app,
         title='Trading Quant Bots',
         favicon='🤖',
+        # Con el valor por defecto (3 s) un corte breve del WebSocket borra el cliente y todos sus timers.
+        reconnect_timeout=120.0,
     )
