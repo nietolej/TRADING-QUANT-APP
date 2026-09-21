@@ -44,6 +44,52 @@ def _reliability_label(reliability_pct: Optional[float]) -> str:
     return "Baja"
 
 
+# Ciclos completos mínimos para poder llamar "Alta" a la confiabilidad de un bot: con menos, un 100 % no distingue
+# a un bot fiable de uno con suerte (14/14 ciclos solo garantiza ~78 % con 95 % de confianza).
+MIN_CYCLES_FOR_HIGH_RELIABILITY = 30
+
+
+def _wilson_lower_pct(successes: int, n: int, z: float = 1.96) -> Optional[float]:
+    """Límite inferior (95 %) del intervalo de Wilson de una proporción, en %."""
+    if n <= 0:
+        return None
+    p = successes / n
+    denom = 1 + z * z / n
+    centre = p + z * z / (2 * n)
+    margin = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n)
+    return round(max(0.0, (centre - margin) / denom) * 100.0, 2)
+
+
+def _assess_reliability(
+    reliability_pct: Optional[float], completed: int, effective: int, slippage_failed: int
+) -> tuple:
+    """
+    (etiqueta, límite inferior 95 %, notas). La etiqueta parte del % de ciclos efectivos, pero no puede ser "Alta"
+    si la muestra es pequeña o si hubo órdenes con deslizamiento fuera de tolerancia (que el % no penaliza).
+    """
+    label = _reliability_label(reliability_pct)
+    lower = _wilson_lower_pct(effective, completed)
+    notes: List[str] = []
+    if reliability_pct is None:
+        return label, lower, notes
+    capped = False
+    if completed < MIN_CYCLES_FOR_HIGH_RELIABILITY:
+        notes.append(
+            f"Muestra pequeña: {completed} ciclo(s) completos (se piden {MIN_CYCLES_FOR_HIGH_RELIABILITY} para 'Alta'); "
+            f"con esta muestra la confiabilidad es al menos {lower:.1f} % con 95 % de confianza."
+        )
+        capped = True
+    if slippage_failed:
+        notes.append(f"{slippage_failed} orden(es) con deslizamiento sobre la tolerancia (no cuentan como fallo del ciclo).")
+        capped = True
+    if capped and label == "Alta":
+        label = "Media"
+    return label, lower, notes
+
+
+_SEVERITY_RANK = {"OK": 0, "UNKNOWN": 1, "WARNING": 2, "CRITICAL": 3}
+
+
 def _position_side(action: Optional[str], side: Optional[str]) -> Optional[str]:
     """
     Traduce (acción de la app, lado enviado a Binance) a la dirección de la posición que
@@ -1072,6 +1118,96 @@ class OrderReconciler:
         c["status"] = "COMPLETO" if closed else ("EN CURSO" if is_last else "SIN SALIDA")
         c["effective"] = closed and not issues
 
+    # ── Exposición de la cuenta: lo que los tests por orden no ven ───────────────
+
+    def check_account_exposure(self, symbol: str, bot_positions: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+        """
+        Compara lo que Binance tiene REALMENTE en `symbol` con lo que esperan los bots:
+          - posición neta de la cuenta vs. la suma de las posiciones de los bots (long +, short −). Una diferencia
+            es exposición sin dueño: cada orden puede conciliar bien y la cuenta seguir con una posición sobrante;
+          - órdenes condicionales/pendientes vivas que no están en el ledger, o cuyo bot ya no tiene posición
+            (un SL/TP viejo que puede abrir una posición nueva al dispararse).
+
+        `bot_positions`: [{"bot_id", "name", "side": "long"|"short", "quantity"}] de TODOS los bots de ese símbolo y
+        red, con las posiciones que tengan abiertas (vacía = todos planos); None si no se pudo saber (daemon
+        apagado): entonces solo se revisan las órdenes vivas sin registro. No modifica nada en Binance.
+        Devuelve {severity: OK|UNKNOWN|WARNING|CRITICAL, issues, binance_net, expected_net, difference, conditionals}.
+        """
+        binance_symbol = symbol.replace("/", "").upper()
+        result: Dict[str, Any] = {
+            "symbol": binance_symbol, "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "severity": "OK", "issues": [], "binance_net": None, "expected_net": None, "difference": None,
+            "conditionals": [],
+        }
+
+        def flag(severity: str, text: str) -> None:
+            result["issues"].append({"severity": severity, "text": text})
+            if _SEVERITY_RANK[severity] > _SEVERITY_RANK[result["severity"]]:
+                result["severity"] = severity
+
+        api = getattr(self.client, "client", None)
+        if api is None:
+            flag("UNKNOWN", "Sin cliente de Binance: no se pudo revisar la exposición de la cuenta.")
+            return result
+
+        try:
+            positions = api.futures_position_information(symbol=binance_symbol)
+            live: List[Dict[str, Any]] = []
+            for a in api.futures_get_open_algo_orders(symbol=binance_symbol) or []:
+                live.append({"id": str(a["algoId"]), "kind": "algo", "side": a.get("side"),
+                             "type": a.get("orderType"), "qty": a.get("quantity"), "trigger": a.get("triggerPrice")})
+            for o in api.futures_get_open_orders(symbol=binance_symbol) or []:
+                live.append({"id": str(o["orderId"]), "kind": "order", "side": o.get("side"), "type": o.get("type"),
+                             "qty": o.get("origQty"), "trigger": o.get("stopPrice") or o.get("price")})
+        except Exception as e:
+            flag("UNKNOWN", f"No se pudo consultar Binance: {format_binance_error(e)}")
+            return result
+
+        binance_net = round(sum(float(p.get("positionAmt") or 0.0) for p in positions), 8)
+        result["binance_net"] = binance_net
+
+        owner_by_order: Dict[str, Optional[str]] = {}
+        if live:
+            db = SessionLocal()
+            try:
+                rows = db.query(AppOrderRecord.binance_order_id, AppOrderRecord.bot_id).filter(
+                    AppOrderRecord.binance_order_id.in_([c["id"] for c in live]),
+                    AppOrderRecord.use_testnet == self.use_testnet,
+                ).all()
+            finally:
+                db.close()
+            owner_by_order = {str(order_id): bot_id for order_id, bot_id in rows}
+
+        holding = {p["bot_id"] for p in (bot_positions or []) if float(p.get("quantity") or 0.0) > 0}
+        for c in live:
+            desc = f"{c['type']} {c['side']} {c['qty']} @ {c['trigger']} (id {c['id']})"
+            if c["id"] not in owner_by_order:
+                flag("WARNING", f"Orden viva sin registro en el ledger de la app: {desc}. Si se dispara abre/modifica "
+                                f"posición sin que ningún bot la gestione.")
+                c["state"] = "SIN_REGISTRO"
+            elif bot_positions is not None and owner_by_order[c["id"]] not in holding:
+                flag("WARNING", f"Orden viva de un bot que ya no tiene posición: {desc}. Posible SL/TP huérfano.")
+                c["state"] = "HUERFANA"
+            else:
+                c["state"] = "OK"
+            result["conditionals"].append(c)
+
+        if bot_positions is None:
+            flag("UNKNOWN", "No se conocen las posiciones de los bots (daemon apagado): no se puede comparar la "
+                            "posición neta de la cuenta.")
+            return result
+
+        expected = round(sum(
+            float(p["quantity"]) * (1.0 if str(p.get("side")).lower() == "long" else -1.0)
+            for p in bot_positions if float(p.get("quantity") or 0.0) > 0
+        ), 8)
+        difference = round(binance_net - expected, 8)
+        result["expected_net"], result["difference"] = expected, difference
+        if abs(difference) > max(1e-9, 1e-4 * max(abs(binance_net), abs(expected))):
+            flag("CRITICAL", f"Posición sin dueño: Binance tiene {binance_net:+g} y los bots suman {expected:+g} "
+                             f"(diferencia {difference:+g}).")
+        return result
+
     # ── Test 2: informe de conciliación de una sesión de monitoreo de un bot ─────
 
     def build_session_report(
@@ -1082,6 +1218,7 @@ class OrderReconciler:
         symbol: str,
         started_at: datetime,
         outcome_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+        exposure: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Concilia contra Binance TODAS las órdenes que `bot_id` envió desde `started_at` (naive
@@ -1175,6 +1312,10 @@ class OrderReconciler:
         # Confiabilidad del bot = % de CICLOS completos (entrada → SL/TP → salida) que cumplieron todo, no de
         # órdenes sueltas: cada orden de un ciclo solo tiene sentido dentro de él.
         reliability_pct = round(cycles_effective / len(completed) * 100.0, 2) if completed else None
+        slippage_failed = sum(1 for o in orders if o["match_status"] == "SLIPPAGE_EXCEEDED")
+        reliability_label, reliability_lower, reliability_notes = _assess_reliability(
+            reliability_pct, len(completed), cycles_effective, slippage_failed
+        )
         return {
             "session_id": session_id,
             "bot_id": bot_id,
@@ -1188,15 +1329,20 @@ class OrderReconciler:
             "executed_count": sum(1 for o in orders if o["executed_in_binance"]),
             "effective_count": effective,
             "failed_count": total - effective,
-            "slippage_failed_count": sum(1 for o in orders if o["match_status"] == "SLIPPAGE_EXCEEDED"),
-            "long_count": sum(1 for o in orders if o["position_side"] == "LONG"),
-            "short_count": sum(1 for o in orders if o["position_side"] == "SHORT"),
+            "slippage_failed_count": slippage_failed,
+            # Posiciones abiertas por lado (una por ciclo): contar también las salidas duplicaba cada operación.
+            "long_count": sum(1 for o in orders if o["action"] == "OPEN" and o["position_side"] == "LONG"),
+            "short_count": sum(1 for o in orders if o["action"] == "OPEN" and o["position_side"] == "SHORT"),
             "slippage_avg_pct": slippage_avg,
             "slippage_max_pct": slippage_max,
             "slippage_p95_pct": slippage_p95,
             "slippage_tolerance_pct": self.slippage_tolerance_pct,
             "reliability_pct": reliability_pct,
-            "reliability_label": _reliability_label(reliability_pct),
+            "reliability_label": reliability_label,
+            "reliability_lower_pct": reliability_lower,
+            "reliability_note": " ".join(reliability_notes) or None,
+            "exposure": exposure,
+            "exposure_severity": exposure["severity"] if exposure else None,
             "cycles_total": len(cycles),
             "cycles_completed": len(completed),
             "cycles_effective": cycles_effective,

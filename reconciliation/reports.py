@@ -24,7 +24,7 @@ _SCALAR_FIELDS = (
     "total_orders", "created_count", "sent_count", "executed_count", "effective_count",
     "failed_count", "slippage_failed_count", "long_count", "short_count",
     "slippage_avg_pct", "slippage_max_pct", "slippage_p95_pct", "slippage_tolerance_pct",
-    "reliability_pct", "reliability_label",
+    "reliability_pct", "reliability_label", "reliability_lower_pct", "reliability_note", "exposure_severity",
     "cycles_total", "cycles_completed", "cycles_effective", "cycles_failed", "cycles_in_progress",
 )
 
@@ -53,14 +53,38 @@ def save_session_report(report: Dict[str, Any], finished: bool = False) -> bool:
             setattr(row, field, report.get(field))
         row.orders_json = json.dumps(report.get("orders", []), default=str)
         row.cycles_json = json.dumps(report.get("cycles", []), default=str)
+        if report.get("exposure") is not None:
+            row.exposure_json = json.dumps(report["exposure"], default=str)
         row.updated_at = now
         row.status = "FINISHED" if finished else "RUNNING"
-        if finished:
-            row.ended_at = now
+        # Una sesión reanudada vuelve a estar en curso: sin fecha de fin hasta que se detenga de nuevo.
+        row.ended_at = now if finished else None
         db.commit()
         return True
     except Exception as e:
         logger.warning("No se pudo guardar el informe de conciliación: %s", e)
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+def finalize_session_report(session_id: str) -> bool:
+    """
+    Cierra una sesión abandonada (INTERRUMPIDA) sin reanudarla: queda FINISHED con `ended_at` en su última
+    actualización, que es hasta donde llegan sus datos. Solo actúa sobre sesiones que siguen como RUNNING.
+    """
+    db = SessionLocal()
+    try:
+        row = db.query(ReconciliationReport).filter(ReconciliationReport.session_id == session_id).first()
+        if row is None or row.status != "RUNNING":
+            return False
+        row.status = "FINISHED"
+        row.ended_at = row.updated_at or _utcnow()
+        db.commit()
+        return True
+    except Exception as e:
+        logger.warning("No se pudo finalizar la sesión %s: %s", session_id, e)
         db.rollback()
         return False
     finally:
@@ -96,6 +120,10 @@ def _row_to_dict(row: ReconciliationReport, include_orders: bool) -> Dict[str, A
             data["cycles"] = json.loads(row.cycles_json) if row.cycles_json else []
         except ValueError:
             data["cycles"] = []
+        try:
+            data["exposure"] = json.loads(row.exposure_json) if row.exposure_json else None
+        except ValueError:
+            data["exposure"] = None
     return data
 
 

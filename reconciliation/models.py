@@ -125,6 +125,14 @@ class ReconciliationReport(Base):
     slippage_tolerance_pct = Column(Float, nullable=True)
     reliability_pct = Column(Float, nullable=True)
     reliability_label = Column(String, nullable=True)
+    # Límite inferior (95 %) de la confiabilidad y las razones por las que la etiqueta se limitó (muestra pequeña,
+    # deslizamiento fuera de tolerancia): un 100 % sobre pocos ciclos no equivale a "Alta".
+    reliability_lower_pct = Column(Float, nullable=True)
+    reliability_note = Column(Text, nullable=True)
+
+    # Exposición de la CUENTA en el símbolo (posición neta y condicionales vivas contra lo que esperan los bots).
+    exposure_severity = Column(String, nullable=True)   # OK | WARNING | CRITICAL | UNKNOWN
+    exposure_json = Column(Text, nullable=True)
 
     # Ciclos (entrada → SL/TP → salida) del bot en la sesión: la confiabilidad se mide sobre ellos.
     cycles_total = Column(Integer, default=0)

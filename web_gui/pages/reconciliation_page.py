@@ -24,7 +24,9 @@ from data_layer.storage import SessionLocal
 from execution_engine.daemon_client import daemon_client as bot_manager
 from reconciliation.models import AppOrderRecord, ReconciliationRecord
 from reconciliation.reconciler import OrderReconciler
-from reconciliation.reports import get_session_report, list_session_reports, save_session_report
+from reconciliation.reports import (
+    finalize_session_report, get_session_report, list_session_reports, save_session_report,
+)
 from app_runtime.async_utils import spawn
 
 logger = logging.getLogger("ReconciliationPage")
@@ -99,7 +101,12 @@ SESSION_COLUMNS = [
     {"name": "reliability", "label": "Confiabilidad", "field": "reliability", "align": "left"},
     {"name": "slippage_avg", "label": "Desliz. prom.", "field": "slippage_avg", "align": "right"},
     {"name": "slippage_max", "label": "Desliz. máx.", "field": "slippage_max", "align": "right"},
+    {"name": "exposure", "label": "Exposición cuenta", "field": "exposure", "align": "left"},
+    {"name": "actions", "label": "", "field": "actions", "align": "right"},
 ]
+
+EXPOSURE_LABEL = {"OK": "OK", "WARNING": "⚠ Aviso", "CRITICAL": "🚨 Crítica", "UNKNOWN": "? Sin datos"}
+EXPOSURE_COLOR = {"OK": "emerald-400", "WARNING": "amber-400", "CRITICAL": "red-400", "UNKNOWN": "gray-400"}
 
 ROLE_BY_ACTION = {
     "OPEN": "Entrada",
@@ -267,11 +274,24 @@ class ReconciliationPage:
             self.sessions_table.on('rowClick', self._on_session_click)
             self.sessions_table.add_slot('body-cell-status', '''
                 <q-td :props="props">
-                    <q-badge :color="props.value === 'FINISHED' ? 'green' : (props.value === 'RUNNING' ? 'blue' : 'grey')">
+                    <q-badge :color="props.value === 'FINISHED' ? 'green' : (props.value === 'RUNNING' ? 'blue' : 'orange')">
                         {{ props.value }}
                     </q-badge>
                 </q-td>
             ''')
+            # Una sesión INTERRUMPIDA (la página o el PC se cerraron a mitad del test) se puede retomar o cerrar.
+            self.sessions_table.add_slot('body-cell-actions', '''
+                <q-td :props="props">
+                    <template v-if="props.row.status === 'INTERRUMPIDA'">
+                        <q-btn dense flat size="sm" color="emerald" icon="play_arrow" label="Reanudar"
+                               @click.stop="() => $parent.$emit('resume', props.row)" />
+                        <q-btn dense flat size="sm" color="grey" icon="stop" label="Finalizar"
+                               @click.stop="() => $parent.$emit('finalize', props.row)" />
+                    </template>
+                </q-td>
+            ''')
+            self.sessions_table.on('resume', self._on_resume_session)
+            self.sessions_table.on('finalize', self._on_finalize_session)
 
             self.detail_title = ui.label('Selecciona una sesión para ver su informe.').classes('text-sm text-gray-400')
             with ui.row().classes('w-full gap-4 flex-wrap') as self.detail_cards_row:
@@ -334,13 +354,13 @@ class ReconciliationPage:
             ReconciliationPage._stat_card("Órdenes", report.get("total_orders", "-"), "receipt_long", "cyan-400")
             ReconciliationPage._stat_card("Creadas en la app", report.get("created_count", "-"), "note_add", "cyan-400", 170)
             ReconciliationPage._stat_card("Enviadas a Binance", report.get("sent_count", "-"), "send", "sky-400", 170)
-            ReconciliationPage._stat_card("Ejecutadas en Binance", report.get("executed_count", "-"), "bolt", "violet-400", 190)
+            ReconciliationPage._stat_card("Fills en Binance", report.get("executed_count", "-"), "bolt", "violet-400", 190)
             ReconciliationPage._stat_card("Conciliadas OK", report.get("effective_count", "-"), "verified", "emerald-400", 170)
             ReconciliationPage._stat_card("Fallidas", report.get("failed_count", "-"), "cancel", "red-400")
             ReconciliationPage._stat_card("Desliz. promedio", _fmt_pct(report.get("slippage_avg_pct"), 4), "trending_flat", "amber-400", 170)
             ReconciliationPage._stat_card("Desliz. máximo", _fmt_pct(slip_max, 4), "trending_up", slip_max_color, 170)
             ReconciliationPage._stat_card("Desliz. p95", _fmt_pct(report.get("slippage_p95_pct"), 4), "show_chart", "amber-400", 170)
-            ReconciliationPage._stat_card("Long / Short", long_short, "swap_vert", "sky-400")
+            ReconciliationPage._stat_card("Entradas Long / Short", long_short, "swap_vert", "sky-400", 190)
 
             reliability_pct = report.get("reliability_pct")
             reliability_label = report.get("reliability_label", "Sin datos")
@@ -351,6 +371,28 @@ class ReconciliationPage:
                     ui.icon('shield', size='18px', color=color)
                     ui.label('Confiabilidad del bot').classes('text-xs text-gray-400 font-semibold uppercase tracking-wide')
                 ui.label(value).classes(f'text-2xl font-extrabold text-{color} font-mono')
+                lower = report.get("reliability_lower_pct")
+                if lower is not None:
+                    ui.label(f"Mínimo con 95 % de confianza: {lower:.1f}%").classes('text-xs text-gray-400 font-mono')
+                if report.get("reliability_note"):
+                    ui.label(report["reliability_note"]).classes('text-xs text-amber-400 max-w-[300px]')
+
+            exposure = report.get("exposure")
+            if exposure:
+                sev = exposure.get("severity", "UNKNOWN")
+                ex_color = EXPOSURE_COLOR.get(sev, "gray-400")
+                with ui.column().classes(f'bg-[#111827] border-2 border-{ex_color} rounded-xl px-4 py-3 min-w-[260px] max-w-[420px] gap-1'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('account_balance_wallet', size='18px', color=ex_color)
+                        ui.label('Exposición de la cuenta').classes('text-xs text-gray-400 font-semibold uppercase tracking-wide')
+                    ui.label(EXPOSURE_LABEL.get(sev, sev)).classes(f'text-2xl font-extrabold text-{ex_color} font-mono')
+                    if exposure.get("binance_net") is not None:
+                        expected = exposure.get("expected_net")
+                        ui.label(
+                            f"Binance {exposure['binance_net']:+g} · bots {f'{expected:+g}' if expected is not None else '?'}"
+                        ).classes('text-xs text-gray-300 font-mono')
+                    for issue in exposure.get("issues", []):
+                        ui.label(issue.get("text", "")).classes(f'text-xs text-{EXPOSURE_COLOR.get(issue.get("severity"), "gray-400")}')
 
     def _switch_network(self, use_testnet: bool):
         self.use_testnet = use_testnet
@@ -641,6 +683,36 @@ class ReconciliationPage:
     def _set_test2_status(self, session: Dict[str, Any], text: str):
         session["ui"]["status"].set_text(text)
 
+    def _launch_test2_session(self, bot_id: str, bot_name: Optional[str], session_id: str,
+                              started_at: datetime, interval: float, resumed: bool = False):
+        """Crea el panel y el timer de una sesión (nueva o retomada) y lanza su primer ciclo."""
+        session = {
+            "session_id": session_id,
+            "bot_id": bot_id,
+            "bot_name": bot_name,
+            "symbol": None,
+            "started_at": started_at,
+            "interval": interval,
+            "busy": False,
+            "stopping": False,
+            "finished": False,
+            "cache": {},   # resultados definitivos de órdenes ya cerradas en Binance: no se vuelven a consultar
+        }
+        self.test2_sessions[bot_id] = session
+        self._make_test2_panel(session)
+        since = started_at.strftime('%H:%M:%S')
+        self._set_test2_status(
+            session,
+            f"Sesión reanudada: se concilia todo lo enviado desde las {since} UTC, incluido lo ocurrido mientras estuvo interrumpida."
+            if resumed else f"Sesión iniciada a las {since} UTC. Esperando órdenes del bot..."
+        )
+
+        async def _tick(s=session):
+            await self._run_test2_tick(s)
+
+        session["timer"] = ui.timer(interval, _tick)
+        spawn(self._run_test2_tick(session))
+
     def _start_test2_sessions(self):
         bot_ids = list(self.test2_bot_select.value or [])
         if not bot_ids:
@@ -660,50 +732,93 @@ class ReconciliationPage:
             # instante (naive UTC, igual que `created_at` en el ledger), no todo su historial.
             options = self.test2_bot_select.options
             label = options.get(bot_id, bot_id) if isinstance(options, dict) else bot_id
-            session = {
-                "session_id": str(uuid.uuid4()),
-                "bot_id": bot_id,
-                "bot_name": str(label).replace(' 🟡 Testnet', '').replace(' 🌐 Real', '') if label != bot_id else None,
-                "symbol": None,
-                "started_at": datetime.now(timezone.utc).replace(tzinfo=None),
-                "interval": interval,
-                "busy": False,
-                "stopping": False,
-                "finished": False,
-                "cache": {},   # resultados definitivos de órdenes ya cerradas en Binance: no se vuelven a consultar
-            }
-            self.test2_sessions[bot_id] = session
-            self._make_test2_panel(session)
-            self._set_test2_status(
-                session,
-                f"Sesión iniciada a las {session['started_at'].strftime('%H:%M:%S')} UTC. Esperando órdenes del bot..."
+            name = str(label).replace(' 🟡 Testnet', '').replace(' 🌐 Real', '') if label != bot_id else None
+            self._launch_test2_session(
+                bot_id, name, str(uuid.uuid4()), datetime.now(timezone.utc).replace(tzinfo=None), interval
             )
-
-            async def _tick(s=session):
-                await self._run_test2_tick(s)
-
-            session["timer"] = ui.timer(interval, _tick)
-            spawn(self._run_test2_tick(session))
             started.append(bot_id)
 
         if not started:
             ui.notify('Los bots elegidos ya tienen una sesión en curso.', type='info')
         self._update_test2_summary()
 
+    @staticmethod
+    def _bot_positions(symbol: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        Posiciones abiertas de los bots de Testnet en `symbol`, para comparar con la cuenta. None si no se pudo
+        saber: con el daemon caído `get_all_bots` devuelve [], y eso NO significa que todos estén planos.
+        """
+        bots = bot_manager.get_all_bots()
+        if not bots:
+            return None
+        target = symbol.replace('/', '').upper()
+        return [
+            {"bot_id": b.bot_id, "name": b.name, "side": b.position.side, "quantity": b.position.quantity}
+            for b in bots
+            if getattr(b, 'use_testnet', True) and b.symbol.replace('/', '').upper() == target and b.position
+        ]
+
+    async def _on_resume_session(self, e):
+        """Retoma una sesión INTERRUMPIDA con su mismo informe: se reconstruye desde el ledger desde su inicio."""
+        try:
+            session_id = e.args["session_id"]
+        except (KeyError, TypeError):
+            return
+        loop = asyncio.get_event_loop()
+        report = await loop.run_in_executor(None, lambda: get_session_report(session_id))
+        if report is None or report["status"] != "INTERRUMPIDA":
+            ui.notify('Esa sesión ya no está interrumpida.', type='info')
+            await self._refresh_sessions_async()
+            return
+        bot_id = report["bot_id"]
+        previous = self.test2_sessions.get(bot_id)
+        if previous is not None and not previous["finished"]:
+            ui.notify('Ese bot ya tiene una sesión en curso en esta página.', type='warning')
+            return
+        if previous is not None:
+            previous["ui"]["card"].delete()
+        self._launch_test2_session(
+            bot_id, report["bot_name"], session_id, report["started_at"],
+            max(5.0, float(self.test2_interval_input.value or 15)), resumed=True,
+        )
+        self._update_test2_summary()
+        ui.notify(f"Sesión de {report['bot_name'] or bot_id} reanudada.", type='positive')
+
+    async def _on_finalize_session(self, e):
+        """Cierra una sesión INTERRUMPIDA sin retomarla (queda FINISHED hasta donde llegaron sus datos)."""
+        try:
+            session_id = e.args["session_id"]
+        except (KeyError, TypeError):
+            return
+        loop = asyncio.get_event_loop()
+        ok = await loop.run_in_executor(None, lambda: finalize_session_report(session_id))
+        ui.notify('Sesión finalizada.' if ok else 'No se pudo finalizar: ya no está en curso.',
+                  type='positive' if ok else 'warning')
+        await self._refresh_sessions_async()
+
     async def _build_and_render_test2(self, session: Dict[str, Any], finished: bool) -> Optional[Dict[str, Any]]:
         """Concilia la sesión, guarda el informe en BD (en curso o finalizado) y refresca su panel."""
         loop = asyncio.get_event_loop()
-        report = await loop.run_in_executor(
-            None,
-            lambda: OrderReconciler(use_testnet=True, notify=False).build_session_report(
+
+        def _reconcile() -> Dict[str, Any]:
+            reconciler = OrderReconciler(use_testnet=True, notify=False)
+            # Posición neta y órdenes vivas de la cuenta: lo que la conciliación orden por orden no ve.
+            try:
+                exposure = reconciler.check_account_exposure(session["symbol"], self._bot_positions(session["symbol"]))
+            except Exception:
+                logger.exception("No se pudo revisar la exposición de la cuenta en %s", session["symbol"])
+                exposure = None
+            return reconciler.build_session_report(
                 session_id=session["session_id"],
                 bot_id=session["bot_id"],
                 bot_name=session["bot_name"],
                 symbol=session["symbol"],
                 started_at=session["started_at"],
                 outcome_cache=session["cache"],
+                exposure=exposure,
             )
-        )
+
+        report = await loop.run_in_executor(None, _reconcile)
         # Un ciclo en curso que termina DESPUÉS de detener la sesión no debe volver a guardarla
         # como RUNNING encima del informe ya marcado FINISHED.
         if finished or not session["finished"]:
@@ -838,6 +953,7 @@ class ReconciliationPage:
                 ),
                 "slippage_avg": _fmt_pct(s["slippage_avg_pct"], 4),
                 "slippage_max": _fmt_pct(s["slippage_max_pct"], 4),
+                "exposure": EXPOSURE_LABEL.get(s.get("exposure_severity"), '-'),
             }
             for s in sessions
         ]
