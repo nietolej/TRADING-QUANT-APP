@@ -1391,6 +1391,26 @@ class PaperTrader:
             return "TRIGGERED", None, None
         return ("UNKNOWN", None, None) if unknown else ("OPEN", None, None)
 
+    def _own_protection_alive(self, pos: "Position") -> bool:
+        """
+        True si Binance confirma que al menos una pata SL/TP de ESTE bot sigue viva (abierta y sin ejecutar).
+        Es prueba directa de que su posición existe: si hubiera cerrado, el SL/TP propio se habría ejecutado.
+        A diferencia de la posición NETA de la cuenta, no depende de lo que hagan los demás bots en el símbolo
+        ni de exposición ajena a ellos (que la neta mezcla y hacía parecer 'cerrada' una posición abierta).
+        """
+        if pos.sl_ref is None and pos.tp_ref is None:
+            self._attach_refs_from_ledger(pos)
+        legs = [r for r in (pos.sl_ref, pos.tp_ref) if r]
+        if not legs:
+            return False
+        open_refs = self._client.get_open_order_refs(self.symbol)
+        if open_refs is None:
+            return False
+        for ref in legs:
+            if (ref["kind"], ref["id"]) in open_refs and self._client.get_order_ref_state(self.symbol, ref).get("state") == "OPEN":
+                return True
+        return False
+
     def _sync_with_exchange(self, binance_symbol: str) -> None:
         """Sincronización periódica (~4 s) con Binance: posición neta (informativa) + posición propia."""
         try:
@@ -1803,8 +1823,14 @@ class PaperTrader:
                 # NETA real de Binance que la posición de este bot siga existiendo. Si ya no está (su SL/TP la
                 # cerró, o un cierre externo), la orden de cierre abriría una posición contraria (incidente del
                 # 21/09 08:50: SL ejecutado + cierre MARKET = short fantasma de 0.0011).
+                #
+                # Excepción: si el SL/TP propio sigue vivo en Binance, la posición existe con certeza y la neta
+                # no tiene voto. Con dos bots espejo (uno sale mientras el otro entra) o con exposición ajena en
+                # la cuenta, la neta puede coincidir por casualidad con "solo los otros bots" y el cierre se
+                # omitía: el bot lo contabilizaba pero la posición seguía abierta en Binance (Test 2, 21/09).
                 close_qty = pos.quantity
-                if reason != "BINANCE_EXCHANGE_CLOSED" and not already_closed_on_exchange:
+                if (reason != "BINANCE_EXCHANGE_CLOSED" and not already_closed_on_exchange
+                        and not self._own_protection_alive(pos)):
                     verdict, net_amt, others = self._exchange_position_verdict(pos)
                     sign = 1.0 if pos.side == "long" else -1.0
                     if verdict == "UNREADABLE":

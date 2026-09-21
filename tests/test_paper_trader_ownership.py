@@ -462,22 +462,69 @@ def test_uncertain_state_after_timeout_closes_when_the_position_really_exists():
 
 
 def test_close_is_deferred_when_the_exchange_position_cannot_be_read():
+    """Sin SL/TP propio vivo que pruebe la posición, y sin poder leer la neta, no se envía nada."""
     client = FakeClient(net=0.0009)
     client.client.futures_position_information = lambda symbol=None: (_ for _ in ()).throw(RuntimeError("red"))
-    client.open = {("algo", SL_ID), ("algo", TP_ID)}
-    client.states[("algo", SL_ID)] = client.states[("algo", TP_ID)] = {"state": "OPEN"}
+    client.states[("algo", SL_ID)] = client.states[("algo", TP_ID)] = {"state": "CANCELED"}
     bot = _fast(make_bot(client))
     bot._close_position(80600.0, datetime.now(timezone.utc), reason="EXIT_SIGNAL")
     assert bot.position is not None and ("close_order",) not in client.calls
 
 
 def test_close_quantity_is_capped_to_what_the_exchange_holds_so_it_never_flips():
+    """Sin evidencia propia de que la posición siga viva (SL/TP ya no están), manda la posición real de Binance."""
     client = FakeClient(net=0.0003)          # Binance solo tiene 0.0003 de los 0.0009 del bot
-    client.open = {("algo", SL_ID), ("algo", TP_ID)}
-    client.states[("algo", SL_ID)] = client.states[("algo", TP_ID)] = {"state": "OPEN"}
+    client.states[("algo", SL_ID)] = client.states[("algo", TP_ID)] = {"state": "CANCELED"}
     bot = _fast(make_bot(client))
     bot._close_position(80600.0, datetime.now(timezone.utc), reason="EXIT_SIGNAL")
     assert client.close_args[2] == pytest.approx(0.0003)
+
+
+# ── Bots espejo en el mismo símbolo: uno sale mientras el otro entra (Test 2, 21/09) ─────────────────────────
+
+def _own_legs_alive(client):
+    client.open = {("algo", SL_ID), ("algo", TP_ID)}
+    client.states[("algo", SL_ID)] = client.states[("algo", TP_ID)] = {"state": "OPEN"}
+
+
+def test_exit_is_sent_when_net_equals_only_the_other_bots_position_but_own_protection_is_alive():
+    """
+    Largo de A (+0.0009) y corto de B (-0.0009) con una posición ajena de -0.0009 en la cuenta: neta -0.0009 = "solo B".
+    La neta hacía parecer cerrada la posición de A y su salida se omitía, dejándola abierta en Binance. Su SL/TP sigue
+    vivo, así que la posición existe y A debe enviar su propia orden de cierre.
+    """
+    client = FakeClient(net=-0.0009)
+    _own_legs_alive(client)
+    a = make_bot(client, "bot_a")
+    b = make_bot(FakeClient(), "bot_b", side="short")
+    a._close_position(80600.0, datetime.now(timezone.utc), reason="EXIT_SIGNAL")
+    assert ("close_order",) in client.calls and a.position is None
+    assert client.close_args[2] == pytest.approx(0.0009), "cierra SU cantidad exacta, no la neta"
+    assert a.trade_history[-1]["reason"] == "EXIT_SIGNAL"
+    assert b.position is not None
+
+
+def test_exit_does_not_wait_for_the_net_position_when_own_protection_is_alive():
+    """Con el SL/TP propio vivo no se lee la neta (evita el 'no se pudo confirmar' cuando el otro bot opera a la vez)."""
+    client = FakeClient(net=0.0)
+    _own_legs_alive(client)
+    client.client.futures_position_information = lambda symbol=None: (_ for _ in ()).throw(RuntimeError("lectura inestable"))
+    bot = make_bot(client)
+    bot._close_position(80600.0, datetime.now(timezone.utc), reason="EXIT_SIGNAL")
+    assert ("close_order",) in client.calls and bot.position is None
+
+
+def test_exit_signal_with_own_take_profit_filled_still_sends_no_second_exit_with_mirror_bot():
+    """La salida por señal sigue sin duplicarse cuando el TP propio ya cerró la posición, aunque el otro bot opere."""
+    client = FakeClient(net=-0.0009)
+    client.open = {("algo", SL_ID)}
+    client.states[("algo", TP_ID)] = {"state": "FILLED", "avg_price": 81300.0, "executed_qty": 0.0009}
+    client.states[("algo", SL_ID)] = {"state": "OPEN"}
+    a = make_bot(client, "bot_a")
+    make_bot(FakeClient(), "bot_b", side="short")
+    a._close_position(80600.0, datetime.now(timezone.utc), reason="EXIT_SIGNAL")
+    assert ("close_order",) not in client.calls
+    assert a.trade_history[-1]["reason"] == "TP"
 
 
 def test_close_is_sent_when_an_opposite_bot_offsets_the_net_position():
