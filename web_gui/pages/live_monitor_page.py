@@ -371,6 +371,28 @@ class LiveMonitorPage:
     # Diálogo de Creación de Nuevo Bot
     # ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _existing_bot_names() -> set:
+        return {(b.name or '').strip().lower() for b in bot_manager.get_all_bots()}
+
+    def _next_default_bot_name(self) -> str:
+        """Primer 'Bot N (BTC/USDT)' libre; contar bots no sirve tras borrar alguno (repetiría nombre)."""
+        taken = self._existing_bot_names()
+        n = 1
+        while f"bot {n} (btc/usdt)" in taken:
+            n += 1
+        return f"Bot {n} (BTC/USDT)"
+
+    def _unique_bot_name(self, name: str) -> str:
+        """Evita dos bots con el mismo nombre: añade ' (2)', ' (3)'... si ya existe."""
+        taken = self._existing_bot_names()
+        if name.lower() not in taken:
+            return name
+        n = 2
+        while f"{name} ({n})".lower() in taken:
+            n += 1
+        return f"{name} ({n})"
+
     def _open_new_bot_dialog(self):
         strategies = self._get_available_strategies()
         default_strat = strategies[0] if strategies else ""
@@ -389,7 +411,7 @@ class LiveMonitorPage:
 
             name_input = ui.input(
                 label='Nombre del Bot',
-                value=f"Bot {len(bot_manager.get_all_bots()) + 1} (BTC/USDT)"
+                value=self._next_default_bot_name()
             ).classes('w-full mb-3')
 
             strat_select = ui.select(
@@ -431,7 +453,7 @@ class LiveMonitorPage:
             network_select = ui.select(
                 ['Binance Real (Mainnet)', 'Binance Testnet'],
                 label='Red de Datos',
-                value='Binance Real (Mainnet)'
+                value='Binance Testnet'
             ).classes('w-full mb-3')
 
             # Sección de Tipos de Órdenes de Ejecución
@@ -508,7 +530,7 @@ class LiveMonitorPage:
                     except Exception:
                         collected_params[k] = val
 
-                bot_name = name_input.value.strip() or f"Bot {len(bot_manager.get_all_bots()) + 1}"
+                bot_name = self._unique_bot_name(name_input.value.strip() or self._next_default_bot_name())
                 sym = symbol_input.value.strip().upper()
                 tf = tf_select.value
                 bal = float(balance_input.value) if balance_input.value else 10000.0
