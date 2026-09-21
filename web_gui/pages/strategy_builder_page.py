@@ -39,7 +39,13 @@ def _validate_strategy_config(state: dict) -> str:
     if not state.get('entry_rules'):
         return "La estrategia necesita al menos una condición de entrada (pestaña 'Rules')."
 
+    param_defaults = {p['name']: p.get('value') for p in state.get('parameters', []) if p.get('name')}
+
     def _positive_float(value, field_label):
+        # Un nombre de parámetro (p. ej. 'TP') es válido: el YAML lo referencia y se resuelve al
+        # crear el bot; en ese caso se valida el valor por defecto del parámetro.
+        if isinstance(value, str) and value.strip() in param_defaults:
+            value = param_defaults[value.strip()]
         try:
             if float(value) <= 0:
                 return f"El valor de '{field_label}' debe ser mayor a 0 (actual: {value})."
@@ -425,6 +431,24 @@ def render_strategy_builder():
                         
                         params_list_container = ui.column().classes('w-full gap-3')
                         
+                        _RISK_PARAM_KEYS = (
+                            'tp_value', 'tp_rr_ratio', 'tp_atr_mult', 'sl_value', 'sl_trailing_pct',
+                            'sl_be_trigger', 'sl_atr_mult',
+                        )
+
+                        def _rename_param_refs(old, new):
+                            for key in _RISK_PARAM_KEYS:
+                                if state.get(key) == old:
+                                    state[key] = new
+                            for rules in (state['entry_rules'], state['exit_rules']):
+                                for rule in rules:
+                                    for k, v in rule.items():
+                                        if k != 'name' and v == old:
+                                            rule[k] = new
+                            update_risk_options()
+                            for table in (entry_table, exit_table):
+                                table.update()
+
                         def render_params():
                             params_list_container.clear()
                             with params_list_container:
@@ -432,7 +456,18 @@ def render_strategy_builder():
                                     with ui.card().classes('w-full flex-row items-center justify-between shadow-lg border border-slate-700/50 rounded-lg p-2 bg-slate-800/50'):
                                         with ui.row().classes('items-center gap-4 flex-1'):
                                             def mk_name_handler(item=p):
-                                                def _on_chg(e): item['name'] = e.value or ''
+                                                last_name = {'v': item['name']}
+
+                                                def _on_chg(e):
+                                                    new_name = e.value or ''
+                                                    item['name'] = new_name
+                                                    # Al renombrar, los campos de riesgo y las reglas que usaban el nombre
+                                                    # anterior pasan a usar el nuevo (si no, quedan apuntando a un
+                                                    # parámetro que ya no existe y el guardado los rechaza).
+                                                    if new_name and last_name['v'] and new_name != last_name['v']:
+                                                        _rename_param_refs(last_name['v'], new_name)
+                                                    if new_name:
+                                                        last_name['v'] = new_name
                                                 return _on_chg
                                             def mk_type_handler(item=p):
                                                 def _on_chg(e): item['type'] = e.value or 'Decimal'
