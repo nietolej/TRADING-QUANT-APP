@@ -34,11 +34,13 @@ class FakeClient:
         self.open = set()
         self.states = {}
         self.calls = []
+        self.trades = []            # fills de la cuenta (futures_account_trades)
         self.client = SimpleNamespace(
             futures_position_information=lambda symbol=None: [
                 {"positionAmt": str(self.net), "markPrice": "80000", "entryPrice": "80000"}
             ],
             futures_get_order=lambda **k: {"avgPrice": "80100.0"},
+            futures_account_trades=lambda **k: list(self.trades),
         )
 
     @staticmethod
@@ -71,7 +73,7 @@ class FakeClient:
         }
 
     def close_futures_position(self, *a, **k):
-        self.close_kwargs = k
+        self.close_args, self.close_kwargs = a, k
         self.calls.append(("close_order",))
         return {"orderId": 1, "avgPrice": "80000", "status": "FILLED"}, None
 
@@ -92,6 +94,14 @@ def make_bot(client, bot_id="bot_a", side="long", qty=0.0009, entry=80500.0):
     pos.sl_ref, pos.tp_ref = dict(SL_REF), dict(TP_REF)
     bot.position = pos
     return bot
+
+
+@pytest.fixture(autouse=True)
+def _fresh_bot_registry():
+    """Cada test parte de un registro de bots vacío: la posición de un bot de otro test no cuenta como 'ajena'."""
+    pt.PaperTrader._ALL_BOTS.clear()
+    yield
+    pt.PaperTrader._ALL_BOTS.clear()
 
 
 # ── Un bot no toca las órdenes de otro ─────────────────────────────────────────
@@ -410,3 +420,88 @@ def test_no_alert_when_own_protection_is_gone_after_exit():
     _alerts(bot)
     bot._cancel_own_protection()
     assert bot.alerts == []
+
+
+# ── Salida doble (incidente 21/09 08:50: SL ejecutado + cierre MARKET = short fantasma) ──────────────────────
+
+def _fast(bot):
+    bot.NET_READ_CONFIRM_DELAY_S = 0.0
+    return bot
+
+
+def test_uncertain_own_state_never_forces_a_close_by_repeated_ticks():
+    """_close_position se llama en cada tick de precio: contar intentos agotaba la espera en ~2 s y se cerraba a ciegas."""
+    client = FakeClient(net=0.0009)          # la posición existe; el estado de sus SL/TP es desconocido
+    bot = _fast(make_bot(client))
+    for _ in range(10):
+        bot._close_position(80600.0, datetime.now(timezone.utc), reason="SL")
+    assert bot.position is not None and ("close_order",) not in client.calls
+
+
+def test_stop_loss_already_filled_with_uncertain_state_does_not_send_a_second_exit():
+    """El SL ya cerró la posición (neta 0) pero su estado no se pudo leer: vencida la espera NO se envía el cierre."""
+    client = FakeClient(net=0.0)
+    client.trades = [
+        {"time": 1, "side": "BUY", "qty": "0.0009", "price": "80500"},
+        {"time": 2, "side": "SELL", "qty": "0.0009", "price": "80100"},
+    ]
+    bot = _fast(make_bot(client))
+    bot._close_uncertain_since = time.monotonic() - 3600
+    bot._close_position(80100.0, datetime.now(timezone.utc), reason="SL")
+    assert ("close_order",) not in client.calls, "enviar un cierre sobre una posición ya cerrada abre una contraria"
+    assert bot.position is None
+    assert bot.trade_history[-1]["exit_price"] == 80100.0
+
+
+def test_uncertain_state_after_timeout_closes_when_the_position_really_exists():
+    client = FakeClient(net=0.0009)
+    bot = _fast(make_bot(client))
+    bot._close_uncertain_since = time.monotonic() - 3600
+    bot._close_position(80600.0, datetime.now(timezone.utc), reason="EXIT_SIGNAL")
+    assert ("close_order",) in client.calls and bot.position is None
+
+
+def test_close_is_deferred_when_the_exchange_position_cannot_be_read():
+    client = FakeClient(net=0.0009)
+    client.client.futures_position_information = lambda symbol=None: (_ for _ in ()).throw(RuntimeError("red"))
+    client.open = {("algo", SL_ID), ("algo", TP_ID)}
+    client.states[("algo", SL_ID)] = client.states[("algo", TP_ID)] = {"state": "OPEN"}
+    bot = _fast(make_bot(client))
+    bot._close_position(80600.0, datetime.now(timezone.utc), reason="EXIT_SIGNAL")
+    assert bot.position is not None and ("close_order",) not in client.calls
+
+
+def test_close_quantity_is_capped_to_what_the_exchange_holds_so_it_never_flips():
+    client = FakeClient(net=0.0003)          # Binance solo tiene 0.0003 de los 0.0009 del bot
+    client.open = {("algo", SL_ID), ("algo", TP_ID)}
+    client.states[("algo", SL_ID)] = client.states[("algo", TP_ID)] = {"state": "OPEN"}
+    bot = _fast(make_bot(client))
+    bot._close_position(80600.0, datetime.now(timezone.utc), reason="EXIT_SIGNAL")
+    assert client.close_args[2] == pytest.approx(0.0003)
+
+
+def test_close_is_sent_when_an_opposite_bot_offsets_the_net_position():
+    """Largo de A (0.0009) y corto de B (0.0009): neta 0. La posición de A existe y su cierre es legítimo."""
+    client = FakeClient(net=0.0)
+    client.open = {("algo", SL_ID), ("algo", TP_ID)}
+    client.states[("algo", SL_ID)] = client.states[("algo", TP_ID)] = {"state": "OPEN"}
+    a = _fast(make_bot(client, "bot_a"))
+    b = make_bot(FakeClient(), "bot_b", side="short")
+    a._close_position(80600.0, datetime.now(timezone.utc), reason="EXIT_SIGNAL")
+    assert ("close_order",) in client.calls and a.position is None
+    assert b.position is not None
+
+
+def test_close_is_not_sent_when_only_the_other_bots_position_remains():
+    """Neta = solo la corta de B: la larga de A ya no está en Binance, cerrarla abriría otra corta."""
+    client = FakeClient(net=-0.0009)
+    client.trades = [
+        {"time": 1, "side": "BUY", "qty": "0.0009", "price": "80500"},
+        {"time": 2, "side": "SELL", "qty": "0.0009", "price": "80100"},
+    ]
+    a = _fast(make_bot(client, "bot_a"))
+    b = make_bot(FakeClient(), "bot_b", side="short")
+    a._close_uncertain_since = time.monotonic() - 3600
+    a._close_position(80100.0, datetime.now(timezone.utc), reason="SL")
+    assert ("close_order",) not in client.calls and a.position is None
+    assert b.position is not None

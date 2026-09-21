@@ -419,6 +419,8 @@ class BinanceTestnetClient:
         binance_symbol = symbol.replace("/", "").upper()
         if not hasattr(self, '_symbol_precision_cache'):
             self._symbol_precision_cache = {}
+        if not hasattr(self, '_min_notional_cache'):
+            self._min_notional_cache = {}
 
         if binance_symbol in self._symbol_precision_cache:
             return self._symbol_precision_cache[binance_symbol]
@@ -452,6 +454,8 @@ class BinanceTestnetClient:
                                 tick_size = f.get("tickSize", "0.01")
                                 if "." in tick_size:
                                     p_p = len(tick_size.rstrip("0").split(".")[1])
+                            elif f.get("filterType") == "MIN_NOTIONAL":
+                                self._min_notional_cache[sym_name] = float(f.get("notional") or f.get("minNotional") or 0.0)
                         self._symbol_precision_cache[sym_name] = (q_p, p_p, m_q, s_size)
                 if binance_symbol in self._symbol_precision_cache:
                     return self._symbol_precision_cache[binance_symbol]
@@ -473,6 +477,11 @@ class BinanceTestnetClient:
 
         self._symbol_precision_cache[binance_symbol] = (qty_prec, price_prec, min_qty, step_size_val)
         return (qty_prec, price_prec, min_qty, step_size_val)
+
+    def get_min_notional(self, symbol: str) -> float:
+        """Valor mínimo por orden (cantidad × precio, en USDT) que exige Binance para el símbolo; 0.0 si se desconoce."""
+        self.get_symbol_precisions(symbol)
+        return float(getattr(self, '_min_notional_cache', {}).get(symbol.replace("/", "").upper(), 0.0))
 
     def format_quantity(self, symbol: str, quantity: float) -> float:
         """Ajusta la cantidad al STEP SIZE real del exchange (no solo redondea decimales):
@@ -935,7 +944,9 @@ class BinanceTestnetClient:
                     return {"state": "CANCELED"}
                 if status in ("EXPIRED", "REJECTED"):
                     return {"state": status}
-                if status == "FINISHED":
+                # TRIGGERING/TRIGGERED: disparada, la orden real se está creando; se trata igual que FINISHED
+                # (antes caían en UNKNOWN y el bot no sabía que el SL/TP acababa de ejecutarse).
+                if status in ("FINISHED", "TRIGGERING", "TRIGGERED"):
                     actual = algo.get("actualOrderId")
                     if not actual:
                         return {"state": "TRIGGERED"}
@@ -950,6 +961,7 @@ class BinanceTestnetClient:
                     if str(order.get("status", "")).upper() in ("NEW", "PARTIALLY_FILLED"):
                         return {"state": "TRIGGERED", "actual_order_id": int(actual)}
                     return {"state": "CANCELED", "actual_order_id": int(actual)}
+                logger.warning("Estado de la condicional %s no reconocido: %r", ref["id"], status)
                 return {"state": "UNKNOWN", "raw_status": status}
 
             order = self.client.futures_get_order(symbol=binance_symbol, orderId=ref["id"])
@@ -963,6 +975,7 @@ class BinanceTestnetClient:
                 return {"state": status}
             return {"state": "UNKNOWN", "raw_status": status}
         except Exception as e:
+            logger.warning("No se pudo consultar el estado de la orden %s (%s): %s", ref.get("id"), ref.get("kind"), e)
             return {"state": "UNKNOWN", "error": str(e)}
 
     def cancel_order_refs(self, symbol: str, refs) -> Tuple[bool, List[str]]:

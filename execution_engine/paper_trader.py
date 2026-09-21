@@ -6,6 +6,7 @@ import logging
 import asyncio
 import threading
 import time
+import weakref
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Callable, Tuple
@@ -71,6 +72,7 @@ class PaperTrader:
         self.strategy_name = self.strategy.config.get("strategy_name", os.path.splitext(os.path.basename(strategy_yaml_path))[0])
 
         self.bot_id = bot_id if bot_id else f"bot_{int(time.time() * 1000)}"
+        PaperTrader._ALL_BOTS[self.bot_id] = self
         self.name = name if name else f"{self.symbol} ({self.strategy_name})"
         self.currency = currency
 
@@ -996,6 +998,21 @@ class PaperTrader:
             # (Antes se cancelaban TODAS las órdenes abiertas del símbolo antes de abrir: con varios bots
             # eso borraba el SL/TP de los demás. Cada bot solo gestiona las referencias de sus órdenes.)
 
+            # Tamaño mínimo por orden de Binance (cantidad × precio): con un saldo pequeño la orden sale por debajo y
+            # Binance la rechaza (-4164). Se detecta antes de enviar, con un mensaje que dice qué corregir.
+            min_notional = self._client.get_min_notional(self.symbol)
+            if min_notional and quantity * price < min_notional:
+                err_msg = (
+                    f"Tamaño insuficiente: {quantity:.6f} × {price:.2f} = {quantity * price:.2f} {self.symbol.split('/')[-1]} "
+                    f"< mínimo {min_notional:.0f} por orden de Binance. Sube el saldo del bot o su % de capital."
+                )
+                self.record_unexecuted_order(
+                    action="ENTRY", side=side, order_type=entry_type, price=price, quantity=quantity, reason=err_msg,
+                    details={"Cantidad": f"{quantity:.6f}", "Precio Señal": f"{price:.2f}", "Mínimo": f"{min_notional:.0f}"},
+                )
+                self._notify(f"⚠️ {err_msg}")
+                return
+
             ext_order, err = self._client.place_futures_order(
                 self.symbol, side, quantity, order_type=entry_type, price=price, verify_execution=True
             )
@@ -1160,6 +1177,57 @@ class PaperTrader:
     # Bots en ejecución, por bot_id (compartido por todas las instancias del proceso). Permite saber si OTRO
     # bot opera el mismo símbolo en la misma red: en ese caso la posición NETA de Binance mezcla a ambos.
     _ACTIVE_BOTS: "dict[str, PaperTrader]" = {}
+    # Todos los bots vivos del proceso (también los detenidos): su posición cuenta en la posición NETA de Binance.
+    _ALL_BOTS: "weakref.WeakValueDictionary[str, PaperTrader]" = weakref.WeakValueDictionary()
+
+    UNCERTAIN_CLOSE_TIMEOUT_S = 20.0   # cuánto se espera un estado incierto del SL/TP propio antes de decidir el cierre
+    NET_READ_CONFIRM_DELAY_S = 0.6     # pausa entre las dos lecturas de posición que deben coincidir antes de cerrar
+
+    def _others_signed_position(self) -> float:
+        """Suma con signo (long +, short -) de las posiciones de los OTROS bots en el mismo símbolo y red."""
+        me = self.symbol.replace("/", "").upper()
+        total = 0.0
+        for other in list(PaperTrader._ALL_BOTS.values()):
+            if other is self or other.use_testnet != self.use_testnet or other.symbol.replace("/", "").upper() != me:
+                continue
+            pos = other.position
+            if pos is not None:
+                total += pos.quantity if pos.side == "long" else -pos.quantity
+        return total
+
+    def _exchange_position_verdict(self, pos: "Position") -> Tuple[str, Optional[float], float]:
+        """
+        Contrasta la posición de ESTE bot con la posición NETA real de Binance antes de enviar una orden de cierre.
+        Devuelve (veredicto, neta, otros):
+          OPEN       la neta = la de los otros bots + la de este: la posición existe y se puede cerrar.
+          GONE       la neta = solo la de los otros bots: la posición de este bot ya no está en Binance (p. ej. su
+                     SL/TP ya la cerró). Enviar otra orden de cierre abriría una posición contraria.
+          AMBIGUOUS  ninguna de las dos: no se puede atribuir la posición; se cierra como mucho lo que hay.
+          UNREADABLE no se pudo leer, o dos lecturas seguidas discreparon (Testnet devuelve a veces lecturas viejas
+                     justo tras operar): no se decide nada y se reintenta.
+        """
+        tol = 1e-6
+        mine = pos.quantity if pos.side == "long" else -pos.quantity
+        others = self._others_signed_position()
+
+        def read() -> Tuple[str, Optional[float]]:
+            net = self._net_position_amount()
+            if net is None:
+                return "UNREADABLE", None
+            if abs(net - (others + mine)) <= tol:
+                return "OPEN", net
+            if abs(net - others) <= tol:
+                return "GONE", net
+            return "AMBIGUOUS", net
+
+        first, net_a = read()
+        if first == "UNREADABLE":
+            return "UNREADABLE", None, others
+        time.sleep(self.NET_READ_CONFIRM_DELAY_S)
+        second, net_b = read()
+        if second != first or net_a != net_b:
+            return "UNREADABLE", None, others
+        return first, net_b, others
 
     def _shares_symbol(self) -> bool:
         """True si otro bot en ejecución opera el mismo símbolo y la misma red (posición neta compartida)."""
@@ -1713,16 +1781,78 @@ class PaperTrader:
                         )
                         already_closed_on_exchange, price, reason = True, exit_px, exit_leg.upper()
                     elif exit_state in ("TRIGGERED", "UNKNOWN"):
-                        # Disparada sin ejecutar aún, o estado no consultable: se reintenta en el siguiente ciclo
-                        # (la posición sigue protegida). Tras 3 intentos inciertos se cierra igualmente.
-                        self._close_uncertain_count = getattr(self, "_close_uncertain_count", 0) + 1
-                        if self._close_uncertain_count < 3:
+                        # Disparada sin ejecutar aún, o estado no consultable: la posición sigue protegida, así que
+                        # se espera. La espera es por TIEMPO (esta función se llama en cada tick de precio, varias
+                        # veces por segundo: contar intentos la agotaba en un par de segundos y se cerraba a ciegas,
+                        # duplicando la salida de un SL ya ejecutado). Vencido el plazo no se cierra "por defecto":
+                        # se contrasta con la posición real de Binance más abajo.
+                        now = time.monotonic()
+                        since = getattr(self, "_close_uncertain_since", None)
+                        if since is None:
+                            self._close_uncertain_since = now
+                            logger.warning(
+                                "[%s] Estado %s del SL/TP propio al cerrar por %s: se espera hasta %.0f s antes de decidir.",
+                                self.name, exit_state, reason, self.UNCERTAIN_CLOSE_TIMEOUT_S,
+                            )
                             return
-                    self._close_uncertain_count = 0
+                        if now - since < self.UNCERTAIN_CLOSE_TIMEOUT_S:
+                            return
+                    self._close_uncertain_since = None
+
+                # Última barrera antes de enviar una orden de cierre sin reduceOnly: contrastar con la posición
+                # NETA real de Binance que la posición de este bot siga existiendo. Si ya no está (su SL/TP la
+                # cerró, o un cierre externo), la orden de cierre abriría una posición contraria (incidente del
+                # 21/09 08:50: SL ejecutado + cierre MARKET = short fantasma de 0.0011).
+                close_qty = pos.quantity
+                if reason != "BINANCE_EXCHANGE_CLOSED" and not already_closed_on_exchange:
+                    verdict, net_amt, others = self._exchange_position_verdict(pos)
+                    sign = 1.0 if pos.side == "long" else -1.0
+                    if verdict == "UNREADABLE":
+                        logger.warning(
+                            "[%s] No se pudo confirmar la posición real en Binance antes de cerrar (%s): "
+                            "se reintenta en el siguiente ciclo sin enviar nada.", self.name, reason,
+                        )
+                        return
+                    available = (net_amt - others) * sign if net_amt is not None else 0.0
+                    if verdict == "AMBIGUOUS" and available > 1e-6:
+                        # La posición neta no cuadra con lo que se esperaba (p. ej. hay algo ajeno a los bots): como
+                        # mucho se cierra lo que Binance tiene en el lado de este bot, nunca más (no invertir).
+                        close_qty = min(pos.quantity, available)
+                        logger.warning(
+                            "[%s] Posición neta de Binance (%.6f) no cuadra con la esperada (%.6f): se cierra solo %.6f.",
+                            self.name, net_amt, others + sign * pos.quantity, close_qty,
+                        )
+                        self._trigger_critical_order_alert(
+                            "Posición neta de Binance distinta de la esperada al cerrar",
+                            {"Neta en Binance": f"{net_amt:.6f}", "Esperada": f"{others + sign * pos.quantity:.6f}",
+                             "Se cierra": f"{close_qty:.6f}"},
+                        )
+                    elif verdict in ("GONE", "AMBIGUOUS"):
+                        # Sin posición de este bot en Binance: no se envía nada; se contabiliza el cierre real.
+                        fill_status, real_exit_price = self._resolve_own_exchange_close(pos)
+                        if fill_status != "FOUND":
+                            fill_status, real_exit_price = self._find_real_exit_fill(pos)
+                        if fill_status == "NONE":
+                            self._cancel_own_protection(pos)
+                            self._notify(
+                                f"⚠️ Posición {pos.side.upper()} {pos.quantity:.6f} @ {pos.entry_price:.4f} descartada: "
+                                f"Binance no la tiene y no hay ningún fill de cierre desde su apertura. "
+                                f"No se registra ningún trade (no existió en el exchange)."
+                            )
+                            self.position = None
+                            self._save_state()
+                            return
+                        if fill_status == "FOUND":
+                            price = real_exit_price
+                        self._notify(
+                            f"ℹ️ La posición de este bot ya no está en Binance (neta {net_amt:.6f}): no se envía "
+                            f"otra orden de cierre. Cierre registrado a {price:.2f}."
+                        )
+                        already_closed_on_exchange, reason = True, "BINANCE_EXCHANGE_CLOSED"
 
                 if reason != "BINANCE_EXCHANGE_CLOSED" and not already_closed_on_exchange:
                     close_order, err = self._client.close_futures_position(
-                        self.symbol, pos.side, pos.quantity, order_type=exit_type, price=price, verify_execution=True,
+                        self.symbol, pos.side, close_qty, order_type=exit_type, price=price, verify_execution=True,
                         reduce_only=False,
                     )
 

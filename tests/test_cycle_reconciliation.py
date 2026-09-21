@@ -97,3 +97,22 @@ def test_open_position_with_cancelled_protection_is_flagged_but_in_progress():
 def test_session_started_mid_position_is_partial_not_counted():
     (cycle,) = evaluate([order("CLOSE", "SELL")])
     assert cycle["status"] == "PARCIAL" and not cycle["effective"]
+
+
+def test_stop_loss_fill_plus_market_close_is_a_duplicate_exit():
+    """El incidente del 21/09 08:50: el SL ya había cerrado la posición y además se envió un cierre MARKET, que
+    abrió un short. Cada orden por separado parecía correcta; solo la suma de salidas (0.0022 vs 0.0011) lo delata."""
+    orders = [order("OPEN", "BUY", 0.0011), protection("TAKE_PROFIT", qty=0.0011),
+              protection("STOP_LOSS", b_status="FILLED", qty=0.0011, exec_qty=0.0011),
+              order("CLOSE", "SELL", 0.0011)]
+    (cycle,) = evaluate(orders)
+    assert not cycle["effective"]
+    assert any("SALIDA DUPLICADA" in i for i in cycle["issues"])
+    assert orders[3]["match_status"] == "DUPLICATE_EXIT" and not orders[3]["effective"]
+
+
+def test_single_exit_is_not_flagged_as_duplicate():
+    orders = [order("OPEN", "BUY", 0.0011), protection("TAKE_PROFIT", qty=0.0011),
+              protection("STOP_LOSS", b_status="FILLED", qty=0.0011, exec_qty=0.0011)]
+    (cycle,) = evaluate(orders)
+    assert cycle["effective"] and not any("DUPLICADA" in i for i in cycle["issues"])

@@ -221,11 +221,19 @@ class BotManager:
             self.save_state_to_disk()
 
     def delete_bot(self, bot_id: str) -> bool:
-        """Detiene y elimina un bot del gestor."""
+        """Detiene y elimina un bot del gestor. Se rechaza si tiene una posición abierta: eliminarlo dejaría esa
+        posición sin gestor y su SL/TP vivo en Binance (huérfanos que luego abren posiciones al dispararse)."""
         with self._lock:
-            bot = self._bots.pop(bot_id, None)
-        if not bot:
-            return False
+            bot = self._bots.get(bot_id)
+            if bot is None:
+                return False
+            if bot.position is not None:
+                logger.warning(
+                    "Bot '%s' (ID: %s) NO eliminado: tiene una posición abierta. Ciérrala antes de eliminarlo.",
+                    bot.name, bot_id,
+                )
+                return False
+            self._bots.pop(bot_id, None)
         if bot.is_running:
             bot.stop()
         self.save_state_to_disk()

@@ -349,6 +349,13 @@ class LiveMonitorPage:
     def _delete_bot(self, bot_id: str):
         bot = bot_manager.get_bot(bot_id)
         bot_name = bot.name if bot else bot_id
+        if bot is not None and bot.position is not None:
+            ui.notify(
+                f"'{bot_name}' tiene una posición abierta: ciérrala antes de eliminarlo "
+                f"(si no, su SL/TP quedaría vivo en Binance sin ningún bot que lo gestione).",
+                type='warning', close_button=True,
+            )
+            return
         success = bot_manager.delete_bot(bot_id)
         if success:
             ui.notify(f"Bot '{bot_name}' eliminado.", type='positive')
@@ -357,6 +364,8 @@ class LiveMonitorPage:
                 self.selected_bot_id = bots[0].bot_id if bots else None
             self._update_bot_select_options()
             self._refresh_ui_elements(force_dom_rebuild=True)
+        else:
+            ui.notify(f"No se pudo eliminar '{bot_name}' (¿daemon apagado o posición abierta?).", type='negative')
 
     # ──────────────────────────────────────────────────────────────
     # Diálogo de Creación de Nuevo Bot

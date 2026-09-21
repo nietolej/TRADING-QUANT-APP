@@ -1030,6 +1030,22 @@ class OrderReconciler:
         elif closed and entry_qty and not self._qty_exact(entry_qty, exit_order["executed_qty"]):
             fail(exit_order, f"El {exit_order['action']} ejecutó {exit_order['executed_qty']} de {entry_qty}.",
                  "QTY_MISMATCH", "WARNING")
+        # 3b. La suma de TODAS las salidas ejecutadas (SL/TP ejecutado + órdenes de cierre) no puede superar la
+        # entrada: si un SL/TP ya cerró la posición y además se envió una orden de cierre, esta última abre una
+        # posición contraria en Binance. Cada orden por separado parece correcta; solo la suma lo delata.
+        executed_exits = [o for o in protections if sent(o) and o.get("binance_status") == "FILLED"] + [
+            o for o in closes if sent(o) and (o.get("executed_qty") or 0) > 0
+        ]
+        total_exit = sum(float(o.get("executed_qty") or 0.0) for o in executed_exits)
+        if entry_qty and len(executed_exits) > 1 and total_exit > float(entry_qty) and not self._qty_exact(entry_qty, total_exit):
+            for o in executed_exits:
+                if o in closes:
+                    fail(o, f"SALIDA DUPLICADA: entre las salidas ejecutadas ({len(executed_exits)}) salieron "
+                            f"{total_exit:g} de los {entry_qty:g} de la posición; el exceso abrió una posición contraria "
+                            f"en Binance.", "DUPLICATE_EXIT")
+            if not any(o in closes for o in executed_exits):
+                fail(executed_exits[-1], f"SALIDA DUPLICADA: salieron {total_exit:g} de los {entry_qty:g} de la posición.",
+                     "DUPLICATE_EXIT")
         # Intentos de salida que no llegaron a Binance: quedan como fallidos aunque luego se reintente.
         for o in closes:
             if o is not exit_order and not sent(o):
