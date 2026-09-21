@@ -1,11 +1,11 @@
 strategy_name: EMA SHORT
-description: EMA SHORT
+description: EMASHORT
 trade_direction: Short
 parameters:
-  LENTA: 30
-  RAPIDA: 16
-  TP: 50.0
-  SL: 5.0
+  FAST: 1
+  LOW: 10
+  SL: 0.5
+  TP: 1.0
 risk_management:
   take_profit:
     type: percentage
@@ -13,25 +13,40 @@ risk_management:
   stop_loss:
     type: percentage
     value: SL
+execution:
+  entry_order_type: MARKET
+  exit_order_type: MARKET
+  stop_loss_order_type: LIMIT
+  take_profit_order_type: LIMIT
 entry_conditions:
   logic: AND
   rules:
-  - name: rule_1784835407023
+  - name: Rule_1
     type: technical_indicator
-    indicator1: EMA
-    period1: RAPIDA
+    indicator_1:
+      name: EMA
+      period: FAST
     operator: crosses_below
-    indicator2: EMA
-    period2: LENTA
-    details: EMA(RAPIDA) crosses_below EMA(LENTA)
+    indicator_2:
+      name: EMA
+      period: LOW
+      value: 0
+    details: EMA(FAST) crosses_below EMA(LOW)
 exit_conditions:
   logic: OR
   rules:
-  - name: rule_1784835417447
+  - name: Rule_2
     type: technical_indicator
-    indicator1: EMA
-    period1: RAPIDA
+    indicator_1:
+      name: EMA
+      period: FAST
     operator: crosses_above
-    indicator2: EMA
-    period2: LENTA
-    details: EMA(RAPIDA) crosses_above EMA(LENTA)
+    indicator_2:
+      name: EMA
+      period: LOW
+      value: 0
+    details: EMA(FAST) crosses_above EMA(LOW)
+equity_curve_management:
+  enabled: false
+  start_trading_at_dd_pct: 30
+  stop_trading_at_dd_pct: 0
