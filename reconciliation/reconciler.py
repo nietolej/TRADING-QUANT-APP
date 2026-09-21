@@ -392,12 +392,52 @@ class OrderReconciler:
 
     # ── Detección de huérfanos (ejecutado en Binance, ausente del ledger local) ─
 
+    @staticmethod
+    def _orphan_result(
+        binance_symbol: str, order_id: str, side: str, order_type: Optional[str],
+        exec_qty: Optional[float], avg_price: Optional[float], source: str,
+    ) -> Dict[str, Any]:
+        return {
+            "symbol": binance_symbol,
+            "app_order_ref": None,
+            "binance_order_id": order_id,
+            "position_side": _position_side("OPEN", side) if side else None,
+            "side": side or None,
+            "action": None,
+            "order_type": order_type,
+            "requested_qty": None,
+            "executed_qty": exec_qty,
+            "requested_price": None,
+            "avg_price": avg_price,
+            "reference_price": None,
+            "slippage_pct": None,
+            "checks": {
+                "created_in_app": False,
+                "sent_to_binance": True,
+                "executed_in_binance": True,
+            },
+            "match_status": "ORPHAN_ON_BINANCE",
+            "severity": "CRITICAL",
+            "details": (
+                f"{source} {order_id} ({binance_symbol}, {side} {exec_qty} @ {avg_price}) ejecutada en "
+                f"Binance con etiqueta de la app pero sin registro en el ledger local."
+            ),
+        }
+
     def find_orphan_trades(self, symbol: str, lookback_hours: float = 24.0) -> List[Dict[str, Any]]:
         """
         Recorre el historial real de órdenes de Binance para `symbol` y marca como huérfanas
-        las que llevan la etiqueta de esta app (clientOrderId con prefijo QTAPP_) pero no
-        tienen un registro correspondiente en el ledger local — típicamente SL/TP disparados
-        sin que el proceso lo capturara, o un crash justo tras enviar la orden.
+        las que llevan la etiqueta de esta app (prefijo QTAPP_) pero no tienen un registro
+        correspondiente en el ledger local — típicamente SL/TP disparados sin que el proceso lo
+        capturara, o un crash justo tras enviar la orden.
+
+        Recorre DOS historiales por separado, porque los SL/TP de esta app se enrutan como Algo
+        Orders (ver comentario en reconcile_order sobre algoId) y NO aparecen en
+        futures_get_all_orders con la etiqueta de la app: cuando un algo order se dispara, la
+        orden real resultante que Binance ejecuta lleva un clientOrderId propio del motor de
+        Binance, no el QTAPP_... de la app (solo el algoId/clientAlgoId original la identifica).
+        Antes de este cambio, un SL/TP disparado que por un crash nunca quedó en el ledger local
+        era invisible para esta detección de huérfanos.
         """
         binance_symbol = symbol.replace("/", "").upper()
         if not self.client.client:
@@ -409,26 +449,51 @@ class OrderReconciler:
             }]
 
         start_time_ms = int((datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).timestamp() * 1000)
+        errors: List[Dict[str, Any]] = []
 
         try:
             orders = self.client.client.futures_get_all_orders(
                 symbol=binance_symbol, startTime=start_time_ms, limit=500
             )
         except Exception as e:
-            return [{
+            orders = []
+            errors.append({
                 "symbol": binance_symbol,
                 "match_status": "ERROR",
                 "severity": "WARNING",
                 "details": f"No se pudo consultar el historial de órdenes de Binance: {format_binance_error(e)}",
-            }]
+            })
+
+        try:
+            algo_orders = self.client.client.futures_get_all_algo_orders(
+                symbol=binance_symbol, startTime=start_time_ms, limit=100
+            ) or []
+        except Exception as e:
+            algo_orders = []
+            errors.append({
+                "symbol": binance_symbol,
+                "match_status": "ERROR",
+                "severity": "WARNING",
+                "details": f"No se pudo consultar el historial de Algo Orders (SL/TP) de Binance: {format_binance_error(e)}",
+            })
 
         app_tagged = [
             o for o in orders
             if str(o.get("clientOrderId", "")).startswith(APP_ORDER_TAG_PREFIX)
             and str(o.get("status", "")).upper() in FILLED_STATUSES
         ]
-        if not app_tagged:
-            return []
+        # Solo las algo orders que Binance realmente disparó (FINISHED) cuentan como "trade
+        # ejecutado" — WORKING/CANCELLED/REJECTED/EXPIRED no representan una ejecución huérfana.
+        app_tagged_algo = [
+            o for o in algo_orders
+            if (
+                str(o.get("clientAlgoId", "")).startswith(APP_ORDER_TAG_PREFIX)
+                or str(o.get("clientOrderId", "")).startswith(APP_ORDER_TAG_PREFIX)
+            )
+            and str(o.get("algoStatus", "")).upper() == "FINISHED"
+        ]
+        if not app_tagged and not app_tagged_algo:
+            return errors
 
         db = SessionLocal()
         try:
@@ -442,43 +507,38 @@ class OrderReconciler:
         finally:
             db.close()
 
-        results: List[Dict[str, Any]] = []
+        results: List[Dict[str, Any]] = list(errors)
         for o in app_tagged:
             order_id = str(o.get("orderId"))
             if order_id in known_ids:
                 continue
-            side = str(o.get("side") or "")
-            results.append(
-                {
-                    "symbol": binance_symbol,
-                    "app_order_ref": None,
-                    "binance_order_id": order_id,
-                    "position_side": _position_side("OPEN", side) if side else None,
-                    "side": side or None,
-                    "action": None,
-                    "order_type": o.get("type"),
-                    "requested_qty": None,
-                    "executed_qty": float(o.get("executedQty")) if o.get("executedQty") else None,
-                    "requested_price": None,
-                    "avg_price": float(o.get("avgPrice")) if o.get("avgPrice") else None,
-                    "reference_price": None,
-                    "slippage_pct": None,
-                    "checks": {
-                        "created_in_app": False,
-                        "sent_to_binance": True,
-                        "executed_in_binance": True,
-                    },
-                    "match_status": "ORPHAN_ON_BINANCE",
-                    "severity": "CRITICAL",
-                    "details": (
-                        f"Orden {order_id} ({binance_symbol}, {o.get('side')} {o.get('executedQty')} "
-                        f"@ {o.get('avgPrice')}) ejecutada en Binance con etiqueta de la app pero sin "
-                        f"registro en el ledger local."
-                    ),
-                }
-            )
+            results.append(self._orphan_result(
+                binance_symbol, order_id, str(o.get("side") or ""), o.get("type"),
+                float(o.get("executedQty")) if o.get("executedQty") else None,
+                float(o.get("avgPrice")) if o.get("avgPrice") else None,
+                "Orden",
+            ))
 
-        self._persist_results(results)
+        for o in app_tagged_algo:
+            algo_id = str(o.get("algoId"))
+            if algo_id in known_ids:
+                continue
+            exec_qty = float(o.get("executedQty") or o.get("executedAmt") or 0.0) or None
+            avg_price = float(o.get("avgPrice") or o.get("avgFillPrice") or 0.0) or None
+            actual_order_id = o.get("actualOrderId")
+            if actual_order_id:
+                try:
+                    real = self.client.client.futures_get_order(symbol=binance_symbol, orderId=int(actual_order_id))
+                    exec_qty = float(real.get("executedQty") or 0.0) or exec_qty
+                    avg_price = float(real.get("avgPrice") or 0.0) or avg_price
+                except Exception as e:
+                    logger.warning("No se pudo consultar la orden real %s del algo huérfano %s: %s", actual_order_id, algo_id, e)
+            results.append(self._orphan_result(
+                binance_symbol, algo_id, str(o.get("side") or ""), o.get("type") or o.get("orderType"),
+                exec_qty, avg_price, "Orden condicional (SL/TP)",
+            ))
+
+        self._persist_results([r for r in results if r.get("match_status") == "ORPHAN_ON_BINANCE"])
         return results
 
     # ── Orquestación ─────────────────────────────────────────────────────────
