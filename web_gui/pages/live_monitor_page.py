@@ -407,8 +407,8 @@ class LiveMonitorPage:
                 ).classes('w-36')
 
             with ui.row().classes('w-full gap-3 mb-3'):
-                balance_input = ui.number(label='Saldo Inicial', value=1.0).classes('flex-1')
-                currency_select = ui.select(['BTC', 'USDT', 'ETH', 'SOL', 'USD', 'BNB'], value='BTC', label='Moneda').classes('w-28')
+                balance_input = ui.number(label='Saldo Inicial', value=100.0).classes('flex-1')
+                currency_select = ui.select(['BTC', 'USDT', 'ETH', 'SOL', 'USD', 'BNB'], value='USDT', label='Moneda').classes('w-28')
 
             def on_new_symbol_change(e):
                 sym = str(e.value or '').strip().upper()
@@ -658,7 +658,7 @@ class LiveMonitorPage:
                     ).classes('w-full text-xs')
                     edit_signal_mode = ui.select(
                         {'close': '🕯️ Al cierre de vela (recomendado)', 'intrabar': '⚡ Intravela (en vivo)'},
-                        value=bot_ord_types.get('signal_mode', 'intrabar'), label='Evaluación de señales'
+                        value=bot_ord_types.get('signal_mode', 'close'), label='Evaluación de señales'
                     ).classes('w-full text-xs col-span-2')
 
             ui.label('Parámetros de la Estrategia:').classes('text-sm font-semibold text-gray-300 mt-1 mb-1')

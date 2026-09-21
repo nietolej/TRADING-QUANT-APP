@@ -127,9 +127,9 @@ def test_signal_mode_defaults_persists_and_survives_restore():
     assert clone.signal_mode == "close"
     legacy = make_bot("intrabar")
     legacy.restore_from_dict({**data, "order_types": {"entry": "MARKET", "exit": "MARKET"}})   # estado viejo sin la clave
-    assert legacy.signal_mode == "intrabar"
+    assert legacy.signal_mode == "close"
     legacy.order_types["signal_mode"] = "basura"
-    assert legacy.signal_mode == "intrabar"
+    assert legacy.signal_mode == "close"
 
 
 def test_chart_hover_flags_an_intrabar_exit_and_shows_reason_and_close():

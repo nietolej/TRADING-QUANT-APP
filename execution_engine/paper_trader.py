@@ -84,7 +84,7 @@ class PaperTrader:
             "stop_loss": exec_cfg.get("stop_loss_order_type", "LIMIT").upper(),
             "take_profit": exec_cfg.get("take_profit_order_type", "LIMIT").upper(),
             # Cuándo se evalúan las señales de la estrategia: "intrabar" (en vivo) o "close" (al cierre de vela).
-            "signal_mode": str(exec_cfg.get("signal_mode", "intrabar")).lower(),
+            "signal_mode": str(exec_cfg.get("signal_mode", "close")).lower(),
         }
 
         self.initial_balance = initial_balance
@@ -732,8 +732,8 @@ class PaperTrader:
     @property
     def signal_mode(self) -> str:
         """'intrabar' (señales sobre la vela en curso, en vivo) o 'close' (solo al cierre de cada vela)."""
-        mode = str(self.order_types.get("signal_mode", "intrabar")).lower()
-        return mode if mode in self.SIGNAL_MODES else "intrabar"
+        mode = str(self.order_types.get("signal_mode", "close")).lower()
+        return mode if mode in self.SIGNAL_MODES else "close"
 
     def _take_new_closed_candle(self):
         """
