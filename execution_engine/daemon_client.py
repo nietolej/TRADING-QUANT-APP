@@ -399,9 +399,12 @@ class DaemonClient:
         if not self.is_daemon_online():
             return []
         try:
+            # El daemon revisa cada bot afectado en serie (lectura doble de Binance + ~0.6 s de espera
+            # cada uno, más otra llamada si cierra): con varios bots compartiendo el símbolo puede tardar
+            # más que una petición normal. Margen generoso para no cortar la reconciliación a mitad.
             res = requests.post(
                 f"{self.base_url}/api/reconcile_symbol",
-                json={"symbol": symbol, "use_testnet": use_testnet}, timeout=30.0,
+                json={"symbol": symbol, "use_testnet": use_testnet}, timeout=90.0,
             )
             if res.status_code == 200:
                 return list(res.json().get("touched") or [])

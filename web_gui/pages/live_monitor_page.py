@@ -246,8 +246,13 @@ class LiveMonitorPage:
             self._refresh_ui_elements(force_dom_rebuild=False)
         else:
             err_msg = err or (f"Estado no completado: {order.get('status')}" if order else "Desconocido")
+            hint = (
+                " — La casilla 'Solo reducir' está activa: si quieres ABRIR una posición nueva "
+                "(no cerrar una existente), desactívala y reenvía."
+                if reduce_only and ("-2022" in str(err_msg) or "ReduceOnly" in str(err_msg)) else ""
+            )
             ui.notify(
-                f"🚨 ALERTA: Orden manual {side} {sym} RECHAZADA en Binance: {err_msg}",
+                f"🚨 ALERTA: Orden manual {side} {sym} RECHAZADA en Binance: {err_msg}{hint}",
                 type='negative',
                 close_button=True,
                 duration=10000
@@ -310,12 +315,29 @@ class LiveMonitorPage:
             if net_amt != 0:
                 # Posición neta de la cuenta sin dueño: cerrarla es una decisión del usuario. Se prepara la
                 # orden opuesta en el terminal manual (reduce-only) pero NO se envía sola.
+                #
+                # Si el terminal ya tiene algo distinto de sus valores por defecto, es probable que el
+                # usuario esté a mitad de componer OTRA orden manual (símbolo/bot distinto): sobrescribirla
+                # en silencio la perdería. Se avisa en su lugar, sin tocar los campos.
+                default_side = getattr(self.manual_side_select, 'value', 'BUY') == 'BUY'
+                default_qty = abs(float(getattr(self.manual_qty_input, 'value', 0.001) or 0.0) - 0.001) < 1e-9
+                default_sym = str(getattr(self.manual_symbol_input, 'value', '') or '').strip().upper() in ('', 'BTC/USDT')
+                terminal_in_progress = not (default_side and default_qty and default_sym)
+                net = 'Testnet' if bot.use_testnet else 'Real (Mainnet)'
+                if terminal_in_progress:
+                    ui.notify(
+                        f"'{bot.name}' no tiene posición propia, pero la cuenta ({net}) tiene {net_amt:+.4f} "
+                        f"{bot.symbol} sin dueño. El Terminal de Órdenes Manuales tiene otra orden a medias: no la "
+                        f"he tocado. Para cerrarla a mano: {'SELL' if net_amt > 0 else 'BUY'} MARKET "
+                        f"{abs(net_amt):.6f} {bot.symbol}, reduce-only.",
+                        type='warning', close_button=True, duration=14000,
+                    )
+                    return
                 self.manual_symbol_input.set_value(bot.symbol)
                 self.manual_side_select.set_value('SELL' if net_amt > 0 else 'BUY')
                 self.manual_type_select.set_value('MARKET')
                 self.manual_qty_input.set_value(abs(net_amt))
                 self.manual_reduce_only.set_value(True)
-                net = 'Testnet' if bot.use_testnet else 'Real (Mainnet)'
                 ui.notify(
                     f"'{bot.name}' no tiene posición propia, pero la cuenta ({net}) tiene {net_amt:+.4f} {bot.symbol} "
                     f"sin dueño. He preparado la orden de cierre en el Terminal de Órdenes Manuales: revísala y "

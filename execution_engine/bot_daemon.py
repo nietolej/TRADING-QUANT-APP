@@ -209,10 +209,17 @@ def reconcile_symbol(req: ReconcileSymbolRequest):
 
     Por cada bot afectado se contrasta PRIMERO su posición contra la neta real de Binance
     (`_exchange_position_verdict`, con doble lectura): solo si el veredicto es GONE (la neta ya no
-    incluye a este bot: su posición ya no está en el exchange) se cancela su propio SL/TP y se
-    resuelve el cierre con el mismo camino seguro que el botón manual (contrasta con el historial
-    real de fills; nunca envía una orden de cierre a una posición que sigue viva o cuyo estado es
-    incierto — OPEN/AMBIGUOUS/UNREADABLE se dejan intactos).
+    incluye a este bot: su posición ya no está en el exchange) se cancela su propio SL/TP (solo
+    tiene efecto en Testnet: en Testnet=False el bot nunca coloca protección real, ver
+    `_cancel_own_protection`) y se resuelve el cierre con el mismo camino seguro que el botón manual
+    (contrasta con el historial real de fills; nunca envía una orden de cierre a una posición que
+    sigue viva o cuyo estado es incierto — OPEN/AMBIGUOUS/UNREADABLE se dejan intactos).
+
+    El veredicto se calcula y se actúa sobre él con `bot._lock` sujeto todo el tiempo (es un RLock:
+    `manual_close_position()` puede volver a tomarlo sin bloquearse): sin esto, el hilo de
+    sincronización propio del bot podría cerrar la posición vieja y abrir una nueva legítima en la
+    ventana entre el veredicto y la acción, y este endpoint cerraría esa posición nueva por error.
+    Tras tomar el lock se relee `bot.position`: si ya no es la misma que se evaluó, no se toca nada.
     """
     target = req.symbol.replace("/", "").upper()
     touched = []
@@ -225,8 +232,11 @@ def reconcile_symbol(req: ReconcileSymbolRequest):
         verdict, net_amt, _others = bot._exchange_position_verdict(pos)
         if verdict != "GONE":
             continue  # posición todavía viva, o estado incierto: no se toca
-        bot._cancel_own_protection(pos)
-        ok, message = bot.manual_close_position()
+        with bot._lock:
+            if bot.position is not pos:
+                continue  # cambió mientras se leía el veredicto: no actuar sobre una posición distinta
+            bot._cancel_own_protection(pos)
+            ok, message = bot.manual_close_position()
         touched.append({"bot_id": bot.bot_id, "name": bot.name, "success": ok, "message": message})
     if touched:
         bot_manager.save_state_to_disk()
