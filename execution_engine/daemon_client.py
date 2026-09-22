@@ -390,6 +390,26 @@ class DaemonClient:
             logger.error("Error cerrando la posición del bot %s: %s", bot_id, e)
             return False, f"No se pudo contactar al daemon: {e}"
 
+    def reconcile_symbol(self, symbol: str, use_testnet: bool) -> List[Dict[str, Any]]:
+        """
+        Pide al daemon re-sincronizar con Binance los bots de `symbol`/red con posición registrada,
+        tras una orden manual (Terminal de Órdenes Manuales) que pudo cerrarla por fuera del bot.
+        Devuelve la lista de bots tocados (vacía si ninguno lo necesitaba o el daemon está offline).
+        """
+        if not self.is_daemon_online():
+            return []
+        try:
+            res = requests.post(
+                f"{self.base_url}/api/reconcile_symbol",
+                json={"symbol": symbol, "use_testnet": use_testnet}, timeout=30.0,
+            )
+            if res.status_code == 200:
+                return list(res.json().get("touched") or [])
+            logger.warning("reconcile_symbol: el daemon respondió HTTP %s: %s", res.status_code, res.text[:200])
+        except Exception as e:
+            logger.error("Error en reconcile_symbol: %s", e)
+        return []
+
     def get_portfolio_summary(self) -> Dict[str, Any]:
         """Resumen agregado de la cartera (ceros si el daemon está apagado)."""
         if self.is_daemon_online():

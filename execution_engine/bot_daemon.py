@@ -193,6 +193,46 @@ def close_bot_position(bot_id: str):
     return {"success": ok, "message": message}
 
 
+class ReconcileSymbolRequest(BaseModel):
+    symbol: str
+    use_testnet: bool = True
+
+
+@app.post("/api/reconcile_symbol")
+def reconcile_symbol(req: ReconcileSymbolRequest):
+    """
+    Re-sincroniza con Binance los bots de `symbol`/red que tengan una posición registrada, tras una
+    orden MANUAL (Terminal de Órdenes Manuales) que pudo haber cerrado la posición de alguno de ellos
+    por fuera del bot: esa orden no pasa por el bot, así que su SL/TP puede quedar huérfano en Binance
+    (vivo, sin `reduceOnly`, capaz de abrir una posición nueva si se dispara) y su estado interno,
+    congelado como si la posición siguiera abierta (incidente 2026-09-22).
+
+    Por cada bot afectado se contrasta PRIMERO su posición contra la neta real de Binance
+    (`_exchange_position_verdict`, con doble lectura): solo si el veredicto es GONE (la neta ya no
+    incluye a este bot: su posición ya no está en el exchange) se cancela su propio SL/TP y se
+    resuelve el cierre con el mismo camino seguro que el botón manual (contrasta con el historial
+    real de fills; nunca envía una orden de cierre a una posición que sigue viva o cuyo estado es
+    incierto — OPEN/AMBIGUOUS/UNREADABLE se dejan intactos).
+    """
+    target = req.symbol.replace("/", "").upper()
+    touched = []
+    for bot in bot_manager.get_all_bots():
+        pos = bot.position
+        if pos is None:
+            continue
+        if bot.symbol.replace("/", "").upper() != target or bool(bot.use_testnet) != bool(req.use_testnet):
+            continue
+        verdict, net_amt, _others = bot._exchange_position_verdict(pos)
+        if verdict != "GONE":
+            continue  # posición todavía viva, o estado incierto: no se toca
+        bot._cancel_own_protection(pos)
+        ok, message = bot.manual_close_position()
+        touched.append({"bot_id": bot.bot_id, "name": bot.name, "success": ok, "message": message})
+    if touched:
+        bot_manager.save_state_to_disk()
+    return {"touched": touched}
+
+
 @app.post("/api/bots")
 def create_bot(req: CreateBotRequest):
     """Crea un nuevo bot de trading en el daemon."""
