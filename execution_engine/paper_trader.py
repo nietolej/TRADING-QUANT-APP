@@ -1561,18 +1561,21 @@ class PaperTrader:
         """Coloca las patas SL/TP indicadas si la cuenta tiene una posición que las respalde. Con el lock del bot."""
         # Estas órdenes se colocan SIN reduceOnly (ver place_futures_sl_tp): si no hay posición real que
         # respalden quedan huérfanas y vivas en Binance para siempre (incidente 2026-09-22). Se confirma
-        # SIEMPRE contra la neta real, también con símbolo compartido: en ese caso, contra "los otros bots
-        # + esta posición" (antes se omitía del todo, confiando ciegamente en que self.position era real).
+        # SIEMPRE contra "lo que queda de la neta tras descontar a los otros bots" — nunca contra
+        # `_shares_symbol()`: ese helper solo cuenta bots EN EJECUCIÓN, mientras que
+        # _others_signed_position() suma también los detenidos con una posición real en el exchange;
+        # decidir la fórmula con uno y calcularla con el otro los desincronizaba (un bot compartiendo
+        # símbolo pero detenido quedaba sin contar, enmascarando o inventando exposición). Se exige "al
+        # menos" la cantidad de esta posición, no una igualdad exacta: puede haber exposición extra no
+        # rastreada por ningún PaperTrader vivo (una orden manual, un bot ya eliminado) y eso es normal.
+        # Sin otro bot, `_others_signed_position()` es 0 y esto equivale al chequeo exclusivo de antes.
         net = self._net_position_amount()
         direction = 1.0 if pos.side == "long" else -1.0
         if net is None:
             return  # no se pudo confirmar contra el exchange: no se coloca nada a ciegas
-        if self._shares_symbol():
-            expected = self._others_signed_position() + direction * pos.quantity
-            if abs(net - expected) > 1e-6:
-                return  # la neta no cuadra con "los otros bots + esta posición": no está respaldada
-        elif net * direction < pos.quantity - 1e-9:
-            return  # la cuenta no tiene (todavía/ya) una posición que respalde la de este bot
+        remaining = (net - self._others_signed_position()) * direction
+        if remaining < pos.quantity - 1e-9:
+            return  # descontando a los otros bots, no queda neta suficiente para respaldar esta posición
 
         sl_type = self.order_types.get("stop_loss", "LIMIT").upper()
         tp_type = self.order_types.get("take_profit", "LIMIT").upper()
@@ -1652,16 +1655,21 @@ class PaperTrader:
         # enviar nada a Binance porque el exchange ya estaba plano), el ledger sigue leyendo "abierta sin
         # cierre" en cada reinicio y esto la recreaba sin fin, sin comprobar nunca si de verdad existe
         # (incidente 2026-09-22: recreó una posición SHORT ya cerrada y le repuso SL/TP huérfanos otra vez).
+        #
+        # Se contrasta contra "lo que queda de la neta tras descontar a los otros bots" — nunca contra
+        # `_shares_symbol()`: ese helper solo cuenta bots EN EJECUCIÓN, mientras que
+        # _others_signed_position() suma también los detenidos con una posición real en el exchange;
+        # decidir la fórmula con uno y calcularla con el otro los desincronizaba (un bot compartiendo
+        # símbolo pero detenido quedaba sin contar, enmascarando o inventando exposición). Se exige "al
+        # menos" `qty`, no una igualdad exacta: puede haber exposición extra no rastreada por ningún
+        # PaperTrader vivo y eso es normal. Sin otro bot, esto equivale al chequeo exclusivo de antes.
         net = self._net_position_amount()
         direction = 1.0 if side == "long" else -1.0
         if net is None:
             return  # no se pudo confirmar contra el exchange: no se recupera a ciegas
-        if self._shares_symbol():
-            expected = self._others_signed_position() + direction * qty
-            if abs(net - expected) > 1e-6:
-                return  # la neta no cuadra con "los otros bots + esta posición": no está respaldada
-        elif net * direction < qty - 1e-9:
-            return  # la cuenta no tiene una posición que respalde la que el ledger dice abierta
+        remaining = (net - self._others_signed_position()) * direction
+        if remaining < qty - 1e-9:
+            return  # descontando a los otros bots, no queda neta suficiente para respaldar esta posición
 
         try:
             order = self._client.client.futures_get_order(
