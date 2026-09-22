@@ -1557,15 +1557,44 @@ class PaperTrader:
                 return  # se cerró (o cambió) mientras se consultaba el exchange
             self._place_missing_protection(pos, missing)
 
+    def _net_backs_quantity(self, side: str, qty: float) -> Optional[bool]:
+        """
+        ¿La posición NETA real de Binance respalda, como mínimo, `qty` de este bot en `side`, una vez
+        descontada la posición de los OTROS bots? None si no se pudo confirmar contra el exchange (el
+        llamador no debe actuar a ciegas en ese caso).
+
+        Se usa por partes iguales desde `_place_missing_protection` (¿reponer SL/TP?) y
+        `_recover_position_from_ledger` (¿recrear una posición tras un reinicio?): una única
+        implementación evita que las dos vuelvan a desincronizarse entre sí (incidente 2026-09-22, donde
+        una comparaba con `_shares_symbol()` —que solo cuenta bots EN EJECUCIÓN— mientras calculaba con
+        `_others_signed_position()` —que suma también los detenidos con una posición real en el
+        exchange—, dejando a un bot compartiendo símbolo pero detenido fuera de la cuenta y enmascarando
+        o inventando exposición).
+
+        Se exige "al menos" `qty`, no una igualdad exacta: puede haber exposición extra no rastreada por
+        ningún PaperTrader vivo (una orden manual, un bot ya eliminado) y eso es normal. Sin ningún otro
+        bot, `_others_signed_position()` es 0 y esto equivale al chequeo exclusivo original (comparar
+        directamente contra la neta).
+
+        Nota: esta es una lectura ÚNICA de la neta, más ligera que `_exchange_position_verdict` (que hace
+        doble lectura para descartar una lectura vieja de Testnet justo tras operar); se usa aquí porque
+        ambos llamadores ya se ejecutan en el ciclo periódico de sincronización, que vuelve a intentarlo
+        en la siguiente vuelta si esta lectura fue una casualidad.
+        """
+        net = self._net_position_amount()
+        if net is None:
+            return None  # no se pudo confirmar contra el exchange: no se decide nada a ciegas
+        direction = 1.0 if side == "long" else -1.0
+        remaining = (net - self._others_signed_position()) * direction
+        return remaining >= qty - 1e-9
+
     def _place_missing_protection(self, pos: "Position", missing: list) -> None:
         """Coloca las patas SL/TP indicadas si la cuenta tiene una posición que las respalde. Con el lock del bot."""
-        if not self._shares_symbol():
-            # Con el símbolo para él solo, la posición neta ES la de este bot y debe respaldarla. Si otro bot lo
-            # comparte, la neta mezcla a ambos (puede ser 0 con dos posiciones abiertas): no dice nada de esta.
-            net = self._net_position_amount()
-            direction = 1.0 if pos.side == "long" else -1.0
-            if net is None or net * direction < pos.quantity - 1e-9:
-                return  # la cuenta no tiene (todavía/ya) una posición que respalde la de este bot
+        # Estas órdenes se colocan SIN reduceOnly (ver place_futures_sl_tp): si no hay posición real que
+        # respalden quedan huérfanas y vivas en Binance para siempre (incidente 2026-09-22).
+        backed = self._net_backs_quantity(pos.side, pos.quantity)
+        if not backed:
+            return  # None (no se pudo confirmar) o False (no está respaldada): no se coloca nada a ciegas
 
         sl_type = self.order_types.get("stop_loss", "LIMIT").upper()
         tp_type = self.order_types.get("take_profit", "LIMIT").upper()
@@ -1639,11 +1668,17 @@ class PaperTrader:
         side = "long" if str(open_side).upper() == "BUY" else "short"
         if qty <= 0:
             return
-        if not self._shares_symbol():
-            net = self._net_position_amount()
-            direction = 1.0 if side == "long" else -1.0
-            if net is None or net * direction < qty - 1e-9:
-                return  # la cuenta no tiene una posición que respalde la que el ledger dice abierta
+        # Confirmación contra la posición NETA real de Binance, SIEMPRE (antes se omitía si el símbolo
+        # es compartido, asumiendo que la neta "no dice nada de esta posición" — pero si la posición del
+        # ledger nunca se cerró con una orden real (p. ej. un cierre resuelto solo internamente, sin
+        # enviar nada a Binance porque el exchange ya estaba plano), el ledger sigue leyendo "abierta sin
+        # cierre" en cada reinicio y esto la recreaba sin fin, sin comprobar nunca si de verdad existe
+        # (incidente 2026-09-22: recreó una posición SHORT ya cerrada y le repuso SL/TP huérfanos otra vez).
+        # Ver _net_backs_quantity para el porqué de usar SIEMPRE _others_signed_position() y nunca
+        # _shares_symbol() aquí.
+        backed = self._net_backs_quantity(side, qty)
+        if not backed:
+            return  # None (no se pudo confirmar) o False (no está respaldada): no se recupera a ciegas
 
         try:
             order = self._client.client.futures_get_order(
