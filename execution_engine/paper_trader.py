@@ -1559,13 +1559,20 @@ class PaperTrader:
 
     def _place_missing_protection(self, pos: "Position", missing: list) -> None:
         """Coloca las patas SL/TP indicadas si la cuenta tiene una posición que las respalde. Con el lock del bot."""
-        if not self._shares_symbol():
-            # Con el símbolo para él solo, la posición neta ES la de este bot y debe respaldarla. Si otro bot lo
-            # comparte, la neta mezcla a ambos (puede ser 0 con dos posiciones abiertas): no dice nada de esta.
-            net = self._net_position_amount()
-            direction = 1.0 if pos.side == "long" else -1.0
-            if net is None or net * direction < pos.quantity - 1e-9:
-                return  # la cuenta no tiene (todavía/ya) una posición que respalde la de este bot
+        # Estas órdenes se colocan SIN reduceOnly (ver place_futures_sl_tp): si no hay posición real que
+        # respalden quedan huérfanas y vivas en Binance para siempre (incidente 2026-09-22). Se confirma
+        # SIEMPRE contra la neta real, también con símbolo compartido: en ese caso, contra "los otros bots
+        # + esta posición" (antes se omitía del todo, confiando ciegamente en que self.position era real).
+        net = self._net_position_amount()
+        direction = 1.0 if pos.side == "long" else -1.0
+        if net is None:
+            return  # no se pudo confirmar contra el exchange: no se coloca nada a ciegas
+        if self._shares_symbol():
+            expected = self._others_signed_position() + direction * pos.quantity
+            if abs(net - expected) > 1e-6:
+                return  # la neta no cuadra con "los otros bots + esta posición": no está respaldada
+        elif net * direction < pos.quantity - 1e-9:
+            return  # la cuenta no tiene (todavía/ya) una posición que respalde la de este bot
 
         sl_type = self.order_types.get("stop_loss", "LIMIT").upper()
         tp_type = self.order_types.get("take_profit", "LIMIT").upper()
@@ -1639,11 +1646,22 @@ class PaperTrader:
         side = "long" if str(open_side).upper() == "BUY" else "short"
         if qty <= 0:
             return
-        if not self._shares_symbol():
-            net = self._net_position_amount()
-            direction = 1.0 if side == "long" else -1.0
-            if net is None or net * direction < qty - 1e-9:
-                return  # la cuenta no tiene una posición que respalde la que el ledger dice abierta
+        # Confirmación contra la posición NETA real de Binance, SIEMPRE (antes se omitía si el símbolo
+        # es compartido, asumiendo que la neta "no dice nada de esta posición" — pero si la posición del
+        # ledger nunca se cerró con una orden real (p. ej. un cierre resuelto solo internamente, sin
+        # enviar nada a Binance porque el exchange ya estaba plano), el ledger sigue leyendo "abierta sin
+        # cierre" en cada reinicio y esto la recreaba sin fin, sin comprobar nunca si de verdad existe
+        # (incidente 2026-09-22: recreó una posición SHORT ya cerrada y le repuso SL/TP huérfanos otra vez).
+        net = self._net_position_amount()
+        direction = 1.0 if side == "long" else -1.0
+        if net is None:
+            return  # no se pudo confirmar contra el exchange: no se recupera a ciegas
+        if self._shares_symbol():
+            expected = self._others_signed_position() + direction * qty
+            if abs(net - expected) > 1e-6:
+                return  # la neta no cuadra con "los otros bots + esta posición": no está respaldada
+        elif net * direction < qty - 1e-9:
+            return  # la cuenta no tiene una posición que respalde la que el ledger dice abierta
 
         try:
             order = self._client.client.futures_get_order(
