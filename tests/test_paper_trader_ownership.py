@@ -552,3 +552,38 @@ def test_close_is_not_sent_when_only_the_other_bots_position_remains():
     a._close_position(80100.0, datetime.now(timezone.utc), reason="SL")
     assert ("close_order",) not in client.calls and a.position is None
     assert b.position is not None
+
+
+# ── _net_backs_quantity no confunde "comparte símbolo" (solo corriendo) con "aporta a la neta"
+# (cualquiera con posición registrada) — incidente 2026-09-22: un bot detenido que compartía
+# símbolo quedaba fuera de la fórmula y su exposición real enmascaraba o inventaba un desajuste ──
+
+def test_net_backs_quantity_counts_a_stopped_sharing_bot():
+    """B comparte símbolo pero está detenido (is_running=False por defecto): su corta real sigue
+    descontándose de la neta antes de juzgar si la larga de A está respaldada."""
+    client = FakeClient(net=0.0)  # la larga de A (0.0009) y la corta de B (0.0009) se cancelan en la neta
+    a = make_bot(client, "bot_a", side="long", qty=0.0009)
+    b = make_bot(FakeClient(), "bot_b", side="short", qty=0.0009)
+    assert b.is_running is False
+    assert a._net_backs_quantity("long", 0.0009) is True
+
+
+def test_net_backs_quantity_rejects_when_stopped_sharing_bot_explains_the_net():
+    """Sin ninguna corta de B, esa misma neta (0) NO respalda una larga de A: la diferencia es justo
+    la exposición de B, y con B ausente del cálculo (bug original) esto habría dado un falso positivo."""
+    client = FakeClient(net=0.0)
+    a = make_bot(client, "bot_a", side="long", qty=0.0009)
+    assert a._net_backs_quantity("long", 0.0009) is False
+
+
+def test_place_missing_protection_uses_stopped_sharing_bot_exposure():
+    """Reponer el SL/TP de A ya no se bloquea porque B (mismo símbolo, detenido) también aporta a la
+    neta: antes, `_shares_symbol()` (solo bots corriendo) decidía la fórmula mientras el cálculo usaba
+    `_others_signed_position()` (todos), y un B detenido quedaba invisible para la fórmula elegida."""
+    client = FakeClient(net=0.0)
+    a = make_bot(client, "bot_a", side="long", qty=0.0009)
+    b = make_bot(FakeClient(), "bot_b", side="short", qty=0.0009)  # referencia viva: el registro es WeakValueDictionary
+    assert b.position is not None
+    a.position.sl_ref = a.position.tp_ref = None
+    a._place_missing_protection(a.position, ["sl", "tp"])
+    assert ("place", a.position.sl_price, a.position.tp_price) in client.calls

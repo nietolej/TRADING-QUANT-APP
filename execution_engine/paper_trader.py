@@ -4,6 +4,7 @@ import copy
 import json
 import logging
 import asyncio
+import random
 import threading
 import time
 import weakref
@@ -295,7 +296,8 @@ class PaperTrader:
     REST_POLL_S = 2.0             # cadencia del respaldo REST cuando el WebSocket no está disponible
     WS_WARMUP_S = 3.0             # margen inicial para que el WebSocket conecte antes de usar REST
     EXCHANGE_SYNC_S = 4.0
-    RATE_LIMIT_BACKOFF_S = 30.0   # espera tras un error de límite de peticiones (-1003/-1015)
+    RATE_LIMIT_BACKOFF_BASE_S = 15.0   # espera base tras un error de límite de peticiones (-1003/-1015)
+    RATE_LIMIT_BACKOFF_MAX_S = 180.0   # tope del backoff exponencial, para no esperar horas si persiste
     PROTECTION_CHECK_S = 30.0
 
     def _alive(self, generation: int) -> bool:
@@ -1442,10 +1444,19 @@ class PaperTrader:
                     self.binance_position_info = info
             self._sync_own_position(net_amt, mark_p)
         except Exception as e_pos:
-            # Límite de peticiones de Binance (-1003/-1015, por IP: en Testnet la IP puede ser compartida):
-            # insistir solo lo empeora; se espera antes del siguiente ciclo.
+            # Límite de peticiones de Binance (-1003/-1015, por IP: en Testnet la IP puede ser compartida
+            # por varios bots): insistir solo lo empeora. Backoff EXPONENCIAL con jitter (±20%), no fijo:
+            # con varios bots en la misma IP, una espera fija los sincroniza y todos reintentan a la vez,
+            # volviendo a chocar contra el límite en el mismo instante; el jitter los desincroniza, y el
+            # exponencial da más margen si el límite persiste en vez de seguir golpeando cada 30s.
             if getattr(e_pos, "code", None) in (-1003, -1015):
-                self._sync_backoff_until = time.monotonic() + self.RATE_LIMIT_BACKOFF_S
+                self._rate_limit_hits = getattr(self, "_rate_limit_hits", 0) + 1
+                backoff_s = min(
+                    self.RATE_LIMIT_BACKOFF_MAX_S,
+                    self.RATE_LIMIT_BACKOFF_BASE_S * (2 ** (self._rate_limit_hits - 1)),
+                )
+                backoff_s *= 1.0 + random.uniform(-0.2, 0.2)
+                self._sync_backoff_until = time.monotonic() + backoff_s
             # Un fallo aquí deja al bot sin saber el estado real de su posición: se cuenta y se avisa.
             self._sync_failure_count = getattr(self, "_sync_failure_count", 0) + 1
             logger.warning(
@@ -1460,6 +1471,7 @@ class PaperTrader:
                 )
         else:
             self._sync_failure_count = 0
+            self._rate_limit_hits = 0
 
     def _sync_own_position(self, net_amt: float, mark_p: float) -> None:
         """Resuelve el estado de la posición de ESTE bot a partir de SUS órdenes SL/TP."""
