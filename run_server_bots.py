@@ -3,8 +3,15 @@ Script de inicio de Trading Quant BOTS App (Binance).
 Instancia independiente de la app principal, enfocada solo en los modulos
 de operacion de bots: Live Monitor, Cartera & Riesgo, Operativa Spot/Fut,
 P2P, Derivados & Futuros, Opciones/TWAP/POV, Copiloto IA y Conexion de APIs.
-Corre en un puerto distinto (8001) para poder usarse en paralelo con la app
-principal (run_server.py, puerto 8000).
+Corre en un puerto distinto (8002) para poder usarse en paralelo con la app
+principal (run_server.py, puerto 8000) SIN pisar el puerto 8001, que es del
+Trading Daemon Core (run_bot_daemon.py) — el proceso que de verdad opera los
+bots. Antes ambos reclamaban el 8001: si este script arrancaba después (p.
+ej. via start_bots.bat, que primero levanta el daemon con ensure_daemon.bat),
+su propio kill_listening_process() de más abajo mataba el daemon en marcha
+—con posiciones reales abiertas— para quedarse con el puerto (incidente
+2026-09-23). Esta app solo CONSUME al daemon por HTTP (ver daemon_client.py),
+nunca debe competir por su mismo puerto.
 """
 import subprocess
 import sys
@@ -18,7 +25,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 HOST = "127.0.0.1"
-PORT = 8001
+PORT = 8002  # NUNCA 8001: ese puerto es del Trading Daemon Core (ver docstring arriba)
 URL = f"http://localhost:{PORT}"
 
 GREEN  = "\033[92m"
@@ -94,6 +101,14 @@ def main():
     os.system("")
 
     banner()
+
+    # Guardarraíl contra el incidente 2026-09-23: este script nunca debe competir por el puerto
+    # del Trading Daemon Core (8001) — kill_listening_process() de más abajo mataría el daemon en
+    # marcha, con posiciones reales abiertas, para quedarse con su puerto.
+    if PORT == 8001:
+        print(f"{RED}[ERROR] PORT=8001 está reservado para el Trading Daemon Core. "
+              f"Esta app NUNCA debe usar ese puerto.{RESET}")
+        sys.exit(1)
 
     project_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(project_dir)

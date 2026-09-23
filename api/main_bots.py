@@ -13,9 +13,12 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
+    # 8002, no 8001: ese puerto es del Trading Daemon Core (execution_engine/bot_daemon.py), al
+    # que esta app solo se conecta como cliente HTTP (daemon_client.py) — nunca debe compartirlo
+    # ni pisarlo (ver el guardarraíl en run_server_bots.py, que es quien sirve esta app).
     allow_origins=[
-        "http://localhost:8001",
-        "http://127.0.0.1:8001",
+        "http://localhost:8002",
+        "http://127.0.0.1:8002",
     ],
     allow_credentials=True,
     allow_methods=["*"],
