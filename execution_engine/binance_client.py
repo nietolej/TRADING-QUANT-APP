@@ -504,6 +504,64 @@ class BinanceTestnetClient:
         _, price_prec, _, _ = self.get_symbol_precisions(symbol)
         return round(float(price), price_prec)
 
+    def _recover_order_after_ambiguous_error(self, binance_symbol: str, client_order_id: str, exc: Exception) -> Optional[dict]:
+        """
+        Ante un fallo AMBIGUO al enviar una orden (timeout de red, conexión perdida — no un
+        rechazo explícito de Binance como -2019 margen insuficiente o -4164 notional mínimo),
+        consulta a Binance por `origClientOrderId` antes de asumir que la orden nunca se creó.
+
+        Un timeout puede significar que Binance procesó la orden pero la respuesta nunca llegó:
+        sin esta comprobación, la app la marcaría como fallida y —si algo más tarde reintentara—
+        podría enviar una segunda orden real duplicada. Con el `clientOrderId` original (nunca se
+        reintenta con uno nuevo) se puede confirmar con certeza si existe o no.
+
+        Devuelve la orden real si Binance la tiene, o None si de verdad no se creó (o no se pudo
+        determinar, p. ej. porque la red también falla en esta consulta).
+        """
+        if isinstance(exc, BinanceAPIException):
+            return None  # rechazo explícito de Binance: no es ambiguo, la orden no se creó
+        if not self.client:
+            return None
+        try:
+            existing = self.client.futures_get_order(symbol=binance_symbol, origClientOrderId=client_order_id)
+            if existing and existing.get("orderId"):
+                logger.warning(
+                    "Orden %s recuperada tras un error ambiguo (%s): Binance SÍ la había creado "
+                    "(ID: %s, estado: %s). Se trata como enviada, no como fallida.",
+                    client_order_id, exc, existing.get("orderId"), existing.get("status"),
+                )
+                return existing
+        except Exception as lookup_e:
+            logger.warning(
+                "No se pudo confirmar si la orden %s se creó tras un error ambiguo (%s): %s. "
+                "Se asume no creada (comportamiento previo).", client_order_id, exc, lookup_e,
+            )
+        return None
+
+    def _recover_algo_order_after_ambiguous_error(self, binance_symbol: str, client_algo_id: str, exc: Exception) -> Optional[dict]:
+        """Misma idea que `_recover_order_after_ambiguous_error`, para las condicionales SL/TP
+        (Algo Orders): no tienen un lookup directo por client id, así que se busca entre las
+        abiertas del símbolo por `clientAlgoId`."""
+        if isinstance(exc, BinanceAPIException):
+            return None
+        if not self.client:
+            return None
+        try:
+            for algo in (self.client.futures_get_open_algo_orders(symbol=binance_symbol) or []):
+                if algo.get("clientAlgoId") == client_algo_id:
+                    logger.warning(
+                        "Orden condicional %s recuperada tras un error ambiguo (%s): Binance SÍ la "
+                        "había creado (algoId: %s). Se trata como enviada, no como fallida.",
+                        client_algo_id, exc, algo.get("algoId"),
+                    )
+                    return algo
+        except Exception as lookup_e:
+            logger.warning(
+                "No se pudo confirmar si la condicional %s se creó tras un error ambiguo (%s): %s. "
+                "Se asume no creada (comportamiento previo).", client_algo_id, exc, lookup_e,
+            )
+        return None
+
     def place_futures_order(
         self,
         symbol: str,
@@ -610,6 +668,17 @@ class BinanceTestnetClient:
             return order, None
         except Exception as e:
             logger.error("Error enviando orden %s a Binance Futures: %s", o_type, e)
+            recovered = self._recover_order_after_ambiguous_error(binance_symbol, client_order_id, e)
+            if recovered:
+                _log_order_to_ledger(
+                    bot_id=self.bot_id,
+                    symbol=binance_symbol, side=binance_side, action="OPEN", order_type=o_type,
+                    requested_qty=qty, requested_price=price, reference_price=slippage_ref, use_testnet=self.use_testnet,
+                    status="SENT_OK", binance_order_id=recovered.get("orderId"), client_order_id=client_order_id,
+                    exchange_status=str(recovered.get("status") or "").upper(), executed_qty=recovered.get("executedQty"),
+                    avg_price=recovered.get("avgPrice"),
+                )
+                return recovered, None
             _log_order_to_ledger(
                 bot_id=self.bot_id,
                 symbol=binance_symbol, side=binance_side, action="OPEN", order_type=o_type,
@@ -708,6 +777,17 @@ class BinanceTestnetClient:
             return order, None
         except Exception as e:
             logger.error("Error cerrando posición en Binance Futures: %s", e)
+            recovered = self._recover_order_after_ambiguous_error(binance_symbol, client_order_id, e)
+            if recovered:
+                _log_order_to_ledger(
+                    bot_id=self.bot_id,
+                    symbol=binance_symbol, side=close_side, action="CLOSE", order_type=o_type,
+                    requested_qty=qty, requested_price=price, reference_price=close_ref, use_testnet=self.use_testnet,
+                    status="SENT_OK", binance_order_id=recovered.get("orderId"), client_order_id=client_order_id,
+                    exchange_status=str(recovered.get("status") or "").upper(), executed_qty=recovered.get("executedQty"),
+                    avg_price=recovered.get("avgPrice"),
+                )
+                return recovered, None
             _log_order_to_ledger(
                 bot_id=self.bot_id,
                 symbol=binance_symbol, side=close_side, action="CLOSE", order_type=o_type,
@@ -790,13 +870,25 @@ class BinanceTestnetClient:
                 )
             except Exception as e:
                 logger.warning("No se pudo colocar orden TP en Binance: %s", e)
-                results["errors"].append(f"TP Error: {e}")
-                _log_order_to_ledger(
-                    bot_id=self.bot_id,
-                    symbol=binance_symbol, side=close_side, action="TAKE_PROFIT", order_type=tp_order_type.upper(),
-                    requested_qty=qty, requested_price=tp_price, use_testnet=self.use_testnet,
-                    status="SEND_FAILED", client_order_id=tp_client_order_id, error=str(e),
-                )
+                recovered = self._recover_algo_order_after_ambiguous_error(binance_symbol, tp_client_order_id, e)
+                if recovered:
+                    results["tp_order"] = recovered
+                    _log_order_to_ledger(
+                        bot_id=self.bot_id,
+                        symbol=binance_symbol, side=close_side, action="TAKE_PROFIT",
+                        order_type=str(recovered.get("orderType") or tp_order_type.upper()),
+                        requested_qty=qty, requested_price=tp_price, use_testnet=self.use_testnet,
+                        status="SENT_OK", binance_order_id=recovered.get("algoId"), client_order_id=tp_client_order_id,
+                        exchange_status=str(recovered.get("algoStatus") or "").upper(),
+                    )
+                else:
+                    results["errors"].append(f"TP Error: {e}")
+                    _log_order_to_ledger(
+                        bot_id=self.bot_id,
+                        symbol=binance_symbol, side=close_side, action="TAKE_PROFIT", order_type=tp_order_type.upper(),
+                        requested_qty=qty, requested_price=tp_price, use_testnet=self.use_testnet,
+                        status="SEND_FAILED", client_order_id=tp_client_order_id, error=str(e),
+                    )
 
         # 2. Stop Loss
         if sl_price and sl_price > 0:
@@ -836,13 +928,25 @@ class BinanceTestnetClient:
                 )
             except Exception as e:
                 logger.warning("No se pudo colocar orden SL en Binance: %s", e)
-                results["errors"].append(f"SL Error: {e}")
-                _log_order_to_ledger(
-                    bot_id=self.bot_id,
-                    symbol=binance_symbol, side=close_side, action="STOP_LOSS", order_type=sl_order_type.upper(),
-                    requested_qty=qty, requested_price=sl_price, use_testnet=self.use_testnet,
-                    status="SEND_FAILED", client_order_id=sl_client_order_id, error=str(e),
-                )
+                recovered = self._recover_algo_order_after_ambiguous_error(binance_symbol, sl_client_order_id, e)
+                if recovered:
+                    results["sl_order"] = recovered
+                    _log_order_to_ledger(
+                        bot_id=self.bot_id,
+                        symbol=binance_symbol, side=close_side, action="STOP_LOSS",
+                        order_type=str(recovered.get("orderType") or sl_order_type.upper()),
+                        requested_qty=qty, requested_price=sl_price, use_testnet=self.use_testnet,
+                        status="SENT_OK", binance_order_id=recovered.get("algoId"), client_order_id=sl_client_order_id,
+                        exchange_status=str(recovered.get("algoStatus") or "").upper(),
+                    )
+                else:
+                    results["errors"].append(f"SL Error: {e}")
+                    _log_order_to_ledger(
+                        bot_id=self.bot_id,
+                        symbol=binance_symbol, side=close_side, action="STOP_LOSS", order_type=sl_order_type.upper(),
+                        requested_qty=qty, requested_price=sl_price, use_testnet=self.use_testnet,
+                        status="SEND_FAILED", client_order_id=sl_client_order_id, error=str(e),
+                    )
 
         return results
 
@@ -1280,7 +1384,7 @@ class BinanceTestnetClient:
 
         except Exception as e:
             logger.error("Error en testnet connection test: %s", e)
-            results["error"] = str(e)
+            results["error"] = format_binance_error(e)
             results["latency_ms"] = int((time.time() - t0) * 1000)
             return results
 
@@ -1336,7 +1440,7 @@ class BinanceTestnetClient:
 
         except Exception as e:
             logger.error("Error en mainnet connection test: %s", e)
-            results["error"] = str(e)
+            results["error"] = format_binance_error(e)
             results["latency_ms"] = int((time.time() - t0) * 1000)
             return results
 
@@ -1543,7 +1647,7 @@ class BinanceTestnetClient:
 
         except Exception as e:
             logger.error("Error al obtener información de la cuenta de Binance: %s", e)
-            data["error"] = str(e)
+            data["error"] = format_binance_error(e)
             return data
 
     def cancel_futures_order(self, symbol: str, order_id: int, use_testnet: bool = True) -> Tuple[bool, Optional[str]]:
