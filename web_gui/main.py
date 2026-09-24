@@ -430,11 +430,12 @@ def create_gui(app):
             return render_portfolio_page()
 
         def build_optimizer():
-            def on_opt_go_to_analyzer(strat_name=None, symbol=None, timeframe=None, custom_params=None):
+            def on_opt_go_to_analyzer(strat_name=None, symbol=None, timeframe=None, custom_params=None, market_settings=None):
                 analyzer_state = ensure_page('analyzer')
                 if analyzer_state and 'select_strategy' in analyzer_state:
                     if strat_name:
-                        analyzer_state['select_strategy'](strat_name, symbol=symbol, timeframe=timeframe, custom_params=custom_params)
+                        analyzer_state['select_strategy'](strat_name, symbol=symbol, timeframe=timeframe,
+                                                          custom_params=custom_params, market_settings=market_settings)
                 show_page('analyzer')
 
             render_optimizer_page(on_go_to_analyzer=on_opt_go_to_analyzer)

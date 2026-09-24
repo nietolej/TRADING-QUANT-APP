@@ -159,7 +159,7 @@ def render_strategy_builder():
             # Tipos de Órdenes de Ejecución (Por defecto: Señales a MARKET, SL/TP a LIMIT)
             'entry_order_type': 'MARKET',
             'exit_order_type': 'MARKET',
-            'sl_order_type': 'LIMIT',
+            'sl_order_type': 'MARKET',
             'tp_order_type': 'LIMIT'
         }
         
@@ -267,7 +267,7 @@ def render_strategy_builder():
                 "execution": {
                     "entry_order_type": state.get('entry_order_type', 'MARKET'),
                     "exit_order_type": state.get('exit_order_type', 'MARKET'),
-                    "stop_loss_order_type": state.get('sl_order_type', 'LIMIT'),
+                    "stop_loss_order_type": state.get('sl_order_type', 'MARKET'),
                     "take_profit_order_type": state.get('tp_order_type', 'LIMIT')
                 },
                 "entry_conditions": {
@@ -725,7 +725,7 @@ def render_strategy_builder():
                                 with ui.column().classes('gap-1'):
                                     ui.label('Orden de Stop Loss (SL)').classes('text-xs text-slate-400 font-semibold')
                                     ui.select(
-                                        {'LIMIT': '🛡️ LIMIT (Stop Limit - Predeterminado)', 'MARKET': '⚡ MARKET (Stop Market)'},
+                                        {'MARKET': '⚡ MARKET (Stop Market - Predeterminado)', 'LIMIT': '🛡️ LIMIT (Stop Limit, puede no ejecutarse)'},
                                         value=state['sl_order_type']
                                     ).bind_value(state, 'sl_order_type').classes('w-full')
 

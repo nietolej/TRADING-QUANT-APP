@@ -12,7 +12,7 @@ import asyncio
 import plotly.graph_objects as go
 
 from data_layer.storage import SessionLocal, OHLCV
-from data_layer.market_data import MarketDataManager, normalize_timeframe
+from data_layer.market_data import MarketDataManager, normalize_timeframe, data_symbol, MARKETS, MARKET_COSTS
 from backtest_engine.optimizer import run_grid_search, count_combinations, _build_range, run_walk_forward, MAX_GRID_COMBINATIONS
 from backtest_engine.robustness_analyzer import analyze_robustness
 from sqlalchemy import func
@@ -107,7 +107,7 @@ def render_optimizer_page(on_go_to_analyzer=None):
     def _get_initial_symbols():
         db = SessionLocal()
         try:
-            db_symbols = [r[0] for r in db.query(OHLCV.symbol).distinct().all()]
+            db_symbols = [r[0] for r in db.query(OHLCV.symbol).distinct().all() if '@' not in r[0]]
         except Exception:
             db_symbols = []
         finally:
@@ -115,6 +115,10 @@ def render_optimizer_page(on_go_to_analyzer=None):
         return sorted(list(set(POPULAR_CRYPTO_SYMBOLS + db_symbols)))
 
     available_symbols = _get_initial_symbols()
+
+    def _market_settings() -> dict:
+        """Mercado y costos para que el Analizador reproduzca exactamente la optimización."""
+        return {k: state.get(k) for k in ('data_market', 'commission_pct', 'slippage_pct')}
 
     state = {
         'strategy_name': default_strategy,
@@ -128,6 +132,7 @@ def render_optimizer_page(on_go_to_analyzer=None):
         'sizing_mode': 'Interés Compuesto (100% Capital)',
         'fixed_amount': 1.0,
         'commission_pct': 0.1,
+        'data_market': 'spot',
         'slippage_pct': 0.05,
         'ec_enabled': False,
         'ec_start_dd': 30.0,
@@ -162,7 +167,7 @@ def render_optimizer_page(on_go_to_analyzer=None):
                     ui.button('📂 Mis Optimizaciones', icon='folder_open', on_click=lambda: open_saved_optimizations_modal()).props('dense size=sm rounded').classes('bg-blue-600 hover:bg-blue-500 text-white font-bold px-3 py-1 text-xs shadow transition-all')
                     ui.button('💾 Guardar Resultados', icon='save', on_click=lambda: open_save_optimization_modal()).props('dense size=sm rounded').classes('bg-purple-600 hover:bg-purple-500 text-white font-bold px-3 py-1 text-xs shadow transition-all')
                     if on_go_to_analyzer:
-                        ui.button('Ir a Strategy Analyzer', icon='analytics', on_click=lambda: on_go_to_analyzer(state.get('strategy_name'), state.get('symbol'), state.get('timeframe'))) \
+                        ui.button('Ir a Strategy Analyzer', icon='analytics', on_click=lambda: on_go_to_analyzer(state.get('strategy_name'), state.get('symbol'), state.get('timeframe'), market_settings=_market_settings())) \
                             .props('dense size=sm rounded').classes('bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-3 py-1')
 
         # ════════════════════════════════════════════════════════
@@ -189,7 +194,7 @@ def render_optimizer_page(on_go_to_analyzer=None):
                             ui.notify('Buscando pares en base de datos y Binance...', type='info', timeout=1500)
                             db = SessionLocal()
                             try:
-                                db_syms = sorted([r[0] for r in db.query(OHLCV.symbol).distinct().all()])
+                                db_syms = sorted([r[0] for r in db.query(OHLCV.symbol).distinct().all() if '@' not in r[0]])
                             except Exception:
                                 db_syms = []
                             finally:
@@ -214,6 +219,23 @@ def render_optimizer_page(on_go_to_analyzer=None):
                         with_input=True,
                         new_value_mode='add-unique'
                     ).bind_value(state, 'symbol').classes('w-full')
+
+                # Mercado de las velas (mismo selector que el Analizador): Spot, Futures o Futures Testnet
+                with ui.column().classes('w-56 gap-0'):
+                    ui.label('Mercado de datos').classes('text-xs text-gray-400 mb-1')
+                    opt_market_combo = ui.select(dict(MARKETS), value=state['data_market']).bind_value(state, 'data_market').classes('w-full')
+
+                    def _on_opt_market_change(e, _prev={'m': state['data_market']}):
+                        old = MARKET_COSTS.get(_prev['m'], MARKET_COSTS['spot'])
+                        new = MARKET_COSTS.get(e.value, MARKET_COSTS['spot'])
+                        for k in ('commission_pct', 'slippage_pct'):
+                            try:
+                                if abs(float(state.get(k)) - old[k]) < 1e-9:
+                                    state[k] = new[k]
+                            except (TypeError, ValueError):
+                                state[k] = new[k]
+                        _prev['m'] = e.value
+                    opt_market_combo.on_value_change(_on_opt_market_change)
 
                 # Selector de Temporalidad
                 with ui.column().classes('w-32 gap-0'):
@@ -818,7 +840,7 @@ def render_optimizer_page(on_go_to_analyzer=None):
                     raw_p = {}
 
                 if on_go_to_analyzer:
-                    on_go_to_analyzer(state.get('strategy_name'), state.get('symbol'), state.get('timeframe'), raw_p)
+                    on_go_to_analyzer(state.get('strategy_name'), state.get('symbol'), state.get('timeframe'), raw_p, market_settings=_market_settings())
                 else:
                     ui.notify(f"Parámetros seleccionados: {raw_p}", type='positive')
 
@@ -1251,7 +1273,7 @@ def render_optimizer_page(on_go_to_analyzer=None):
                 end_dt = parse_flexible_date(state.get('end_date', ''), default=datetime.now(timezone.utc), is_end_of_day=True)
                 
                 df_opt = await run.io_bound(
-                    lambda: _fetch_market_data_sync(state['symbol'], state['timeframe'], start_dt, end_dt)
+                    lambda: _fetch_market_data_sync(data_symbol(state['symbol'], state.get('data_market', 'spot')), state['timeframe'], start_dt, end_dt)
                 )
 
                 if df_opt is None or df_opt.empty:
@@ -1628,7 +1650,7 @@ def render_optimizer_page(on_go_to_analyzer=None):
                 end_dt = parse_flexible_date(state.get('end_date', ''), default=datetime.now(timezone.utc), is_end_of_day=True)
                 
                 df_wf = await run.io_bound(
-                    lambda: _fetch_market_data_sync(state['symbol'], state['timeframe'], start_dt, end_dt)
+                    lambda: _fetch_market_data_sync(data_symbol(state['symbol'], state.get('data_market', 'spot')), state['timeframe'], start_dt, end_dt)
                 )
 
                 if df_wf is None or df_wf.empty:

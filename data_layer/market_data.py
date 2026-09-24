@@ -108,6 +108,44 @@ def normalize_timeframe(tf: str) -> str:
     return tf
 
 
+# Mercados de datos disponibles para backtesting. "spot" es el histórico de siempre; los de
+# futuros son los mercados donde operan los bots en vivo (USDⓈ-M perpetuo), para que el
+# backtest use EXACTAMENTE las mismas velas que el bot. Futures testnet tiene su propio libro
+# de órdenes: su cierre de 1m difiere del de mainnet (~0.03% de mediana, hasta ~1%), lo que
+# con estrategias rápidas cambia la mayoría de los cruces.
+MARKETS = {
+    "spot": "Spot (Binance)",
+    "futures": "Futures USDⓈ-M (Binance)",
+    "futures_testnet": "Futures USDⓈ-M Testnet (Binance)",
+}
+FUTURES_KLINES_URLS = {
+    "futures": "https://fapi.binance.com/fapi/v1/klines",
+    "futures_testnet": "https://testnet.binancefuture.com/fapi/v1/klines",
+}
+# Comisión taker por lado (%) y slippage sugerido (%) por mercado. En futuros el slippage
+# medido de los bots (órdenes MARKET al abrir la vela) fue ~0.013% por operación completa.
+MARKET_COSTS = {
+    "spot": {"commission_pct": 0.1, "slippage_pct": 0.05},
+    "futures": {"commission_pct": 0.05, "slippage_pct": 0.01},
+    "futures_testnet": {"commission_pct": 0.05, "slippage_pct": 0.01},
+}
+
+
+def data_symbol(symbol: str, market: str = "spot") -> str:
+    """Clave de almacenamiento: 'BTC/USDT' (spot) o 'BTC/USDT@futures' / '@futures_testnet'."""
+    market = (market or "spot").lower()
+    return symbol if market == "spot" else f"{symbol}@{market}"
+
+
+def split_data_symbol(stored_symbol: str) -> tuple:
+    """Inversa de data_symbol: ('BTC/USDT', 'futures')."""
+    if "@" in stored_symbol:
+        sym, market = stored_symbol.rsplit("@", 1)
+        if market in MARKETS:
+            return sym, market
+    return stored_symbol, "spot"
+
+
 def timeframe_seconds(timeframe: str) -> int:
     """Duración de una vela en segundos ('4h' -> 14400). 0 si no se reconoce."""
     try:
@@ -152,7 +190,11 @@ class MarketDataManager:
         timeframe = normalize_timeframe(timeframe)
         since = ensure_utc(since)
         since_ms = int(since.timestamp() * 1000) if since else None
-        
+
+        base_symbol, market = split_data_symbol(symbol)
+        if market != "spot":
+            return self._fetch_futures_klines(symbol, base_symbol, market, timeframe, since_ms, limit)
+
         try:
             ccxt_symbol = symbol
             if '/' not in ccxt_symbol:
@@ -175,6 +217,30 @@ class MarketDataManager:
         except Exception as e:
             print(f"Error fetching data for {symbol} {timeframe}: {e}")
             return pd.DataFrame()
+
+    @staticmethod
+    def _fetch_futures_klines(stored_symbol: str, base_symbol: str, market: str, timeframe: str,
+                              since_ms: int = None, limit: int = 1000) -> pd.DataFrame:
+        """Velas de Binance Futures USDⓈ-M (mainnet o testnet) por su API pública de klines."""
+        import requests
+        params = {"symbol": base_symbol.replace("/", "").upper(), "interval": timeframe, "limit": min(int(limit), 1500)}
+        if since_ms is not None:
+            params["startTime"] = since_ms
+        try:
+            resp = requests.get(FUTURES_KLINES_URLS[market], params=params, timeout=30)
+            resp.raise_for_status()
+            rows = resp.json()
+        except Exception as e:
+            print(f"Error fetching futures data for {stored_symbol} {timeframe}: {e}")
+            return pd.DataFrame()
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame([r[:6] for r in rows], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+        df['symbol'] = stored_symbol
+        df['timeframe'] = timeframe
+        return df
 
     def fetch_ohlcv_yahoo(self, symbol: str, timeframe: str, start_date: datetime, end_date: datetime) -> pd.DataFrame:
         """

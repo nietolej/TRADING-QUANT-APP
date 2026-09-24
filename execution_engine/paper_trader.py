@@ -1,6 +1,5 @@
 import os
 import re
-import copy
 import json
 import logging
 import asyncio
@@ -16,7 +15,8 @@ from .binance_client import BinanceTestnetClient, format_binance_error
 from .market_stream import stream_hub
 from .trade_stats import compute_detailed_stats
 from strategy_engine.base_strategy import BaseStrategy
-from strategy_engine.conditions import ConditionEvaluator
+from strategy_engine.conditions import ConditionEvaluator, state_exit_conditions, is_short_direction
+from strategy_engine.risk_management import RiskManager
 from data_layer.storage import SessionLocal, PaperTrade
 
 logger = logging.getLogger(__name__)
@@ -77,12 +77,14 @@ class PaperTrader:
         self.name = name if name else f"{self.symbol} ({self.strategy_name})"
         self.currency = currency
 
-        # Tipos de órdenes de ejecución (Por defecto: Señales a MARKET, SL/TP a LIMIT)
+        # Tipos de órdenes de ejecución (Por defecto: Señales a MARKET, SL a MARKET, TP a LIMIT).
+        # El SL por defecto es STOP_MARKET: un STOP (stop-limit) con límite = precio del stop puede
+        # quedar sin ejecutarse si el precio salta más allá, mientras el backtest asume que sale.
         exec_cfg = self.strategy.config.get("execution", {})
         self.order_types = {
             "entry": exec_cfg.get("entry_order_type", "MARKET").upper(),
             "exit": exec_cfg.get("exit_order_type", "MARKET").upper(),
-            "stop_loss": exec_cfg.get("stop_loss_order_type", "LIMIT").upper(),
+            "stop_loss": exec_cfg.get("stop_loss_order_type", "MARKET").upper(),
             "take_profit": exec_cfg.get("take_profit_order_type", "LIMIT").upper(),
             # Cuándo se evalúan las señales de la estrategia: "intrabar" (en vivo) o "close" (al cierre de vela).
             "signal_mode": str(exec_cfg.get("signal_mode", "close")).lower(),
@@ -179,6 +181,73 @@ class PaperTrader:
         if "TP" in legs:
             self._notify(f"ℹ️ '{self.name}' opera sin Take Profit (TP en 0 o sin configurar).")
 
+    SIZING_MODES = ("compounding", "fixed_fractional", "fixed_amount")
+
+    def _sizing_config(self, initial_capital_quote: float) -> dict:
+        """
+        Tamaño de posición con los mismos modos que el Analizador de Estrategias (que ignora el
+        sizing del YAML y usa el que elige el usuario). Antes el bot solo leía el del YAML, así
+        que un backtest con "Riesgo fijo" o "Monto fijo" no correspondía a lo que operaba el bot.
+        """
+        mode = str(self.order_types.get("sizing", "compounding")).lower()
+        if mode == "fixed_fractional":
+            return {"method": "fixed_fractional", "risk_per_trade_pct": 1.0}
+        if mode == "fixed_amount":
+            return {"method": "fixed_amount", "value": float(initial_capital_quote)}
+        return {"method": "compounding", "value": 100.0}
+
+    def _live_unsupported_reason(self) -> Optional[str]:
+        """
+        Motivo por el que esta estrategia NO puede ejecutarse en vivo, o None. El motor en vivo
+        evalúa las reglas entry/exit_conditions del YAML; las estrategias con clase propia
+        (class_name) generan sus señales con código Python que solo usa el backtest, y sin
+        reglas de entrada el bot arrancaba y nunca operaba, sin avisar.
+        """
+        class_name = self.strategy.config.get("class_name")
+        if class_name:
+            return (f"la estrategia usa la clase '{class_name}', cuyas señales solo existen en el "
+                    f"backtest; el motor en vivo no puede reproducirlas.")
+        rules = (self.strategy.config.get("entry_conditions") or {}).get("rules") or []
+        if not rules:
+            return "la estrategia no tiene reglas de entrada (entry_conditions) en su YAML."
+        unsupported = sorted({r.get("type") for r in rules if r.get("type") == "onchain_threshold"})
+        if unsupported:
+            return "las reglas on-chain no tienen datos en vivo (solo existen en el backtest)."
+        return None
+
+    def _indicator_periods(self) -> list:
+        periods = []
+        for block in ("entry_conditions", "exit_conditions"):
+            for rule in (self.strategy.config.get(block) or {}).get("rules", []) or []:
+                for key in ("period1", "period2", "period", "fast_period", "slow_period"):
+                    periods.append(rule.get(key))
+                for key in ("indicator_1", "indicator_2"):
+                    if isinstance(rule.get(key), dict):
+                        periods.append(rule[key].get("period"))
+        out = []
+        for p in periods:
+            try:
+                out.append(int(float(p)))
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    def _warn_if_warmup_short(self):
+        """Avisa si algún indicador necesita más historia de la que el bot mantiene en memoria:
+        sus valores (y por tanto sus cruces) no coincidirían con los del backtest."""
+        try:
+            longest = max(self._indicator_periods(), default=0)
+        except Exception:
+            logger.warning("[%s] No se pudieron leer los periodos de la estrategia", self.name, exc_info=True)
+            return
+        if longest > self.MAX_FAITHFUL_PERIOD:
+            self._notify(
+                f"⚠️ La estrategia usa un indicador de periodo {longest}: con {self.KLINES_WINDOW} velas de "
+                f"historia en vivo sus valores pueden diferir de los del backtest (fiable hasta periodo "
+                f"{self.MAX_FAITHFUL_PERIOD}).",
+                is_alert=True
+            )
+
     def _warn_if_dynamic_sl_unsupported_live(self):
         """Alerta si la estrategia usa un SL dinámico que solo se respeta en backtest.
 
@@ -216,6 +285,13 @@ class PaperTrader:
         if self.is_running:
             return
 
+        unsupported = self._live_unsupported_reason()
+        if unsupported:
+            self.status = "ERROR"
+            self.status_message = unsupported
+            self._notify(f"⛔ No se puede iniciar '{self.name}': {unsupported}", is_alert=True)
+            return
+
         self.status = "STARTING"
         self.status_message = "Iniciando..."
         self.is_running = True
@@ -229,6 +305,7 @@ class PaperTrader:
         )
         self._warn_if_dynamic_sl_unsupported_live()
         self._warn_if_sl_tp_disabled()
+        self._warn_if_warmup_short()
 
         try:
             self._client = BinanceTestnetClient(use_testnet=self.use_testnet, bot_id=self.bot_id)
@@ -240,7 +317,7 @@ class PaperTrader:
             self.is_running = False
             return
 
-        # Warm-up: descargar últimas 300 velas
+        # Warm-up: descargar las últimas KLINES_WINDOW velas
         self._notify("⏳ Descargando histórico para calentar indicadores...")
         try:
             binance_symbol = self.symbol.replace("/", "").upper()
@@ -249,7 +326,7 @@ class PaperTrader:
             # de precio entre el historico y las velas en vivo dentro del mismo klines_df, pudiendo
             # generar cruces de indicadores (EMA, etc.) falsos justo al arrancar el bot.
             raw_klines = self._client.client.futures_klines(
-                symbol=binance_symbol, interval=self.timeframe, limit=300
+                symbol=binance_symbol, interval=self.timeframe, limit=self.KLINES_WINDOW
             )
         except Exception as e:
             friendly_msg = format_binance_error(e)
@@ -317,6 +394,14 @@ class PaperTrader:
     # Hilos de fondo: datos de mercado (WebSocket + respaldo REST) y sincronización con el exchange
     # ──────────────────────────────────────────────────────────────
 
+    # Velas en memoria (y de calentamiento al arrancar). Antes eran 300: una EMA de 200 conservaba
+    # ~5% del valor inicial arbitrario y difería de la del backtest (calculada con todo el
+    # histórico), y una SMA de más de 299 velas no llegaba a calcularse nunca. Máximo de Binance: 1500.
+    KLINES_WINDOW = 1000
+    # Periodo máximo de indicador que el calentamiento reproduce fielmente (una EMA necesita ~4x
+    # su periodo para que el valor inicial deje de pesar).
+    MAX_FAITHFUL_PERIOD = KLINES_WINDOW // 4
+
     USE_WEBSOCKET = True          # datos por WebSocket; con False (o si se corta) se usa el polling REST
     MIN_EVAL_INTERVAL_S = 0.25    # como mucho una evaluación de estrategia cada 250 ms
     REST_POLL_S = 2.0             # cadencia del respaldo REST cuando el WebSocket no está disponible
@@ -349,6 +434,14 @@ class PaperTrader:
             float(ticker["bidPrice"]), float(ticker["askPrice"]), float(ticker["bidQty"]), float(ticker["askQty"])
         )
         raw_klines = self._client.client.futures_klines(symbol=binance_symbol, interval=self.timeframe, limit=2)
+        if len(raw_klines) >= 2:
+            # Cierre FINAL de la vela anterior: antes solo se procesaba la vela en curso y la
+            # anterior quedaba con el último precio visto (hasta REST_POLL_S antes de su cierre).
+            p = raw_klines[-2]
+            self._apply_closed_kline({
+                "timestamp": int(p[0]), "open": float(p[1]), "high": float(p[2]),
+                "low": float(p[3]), "close": float(p[4]), "volume": float(p[5]),
+            })
         if raw_klines:
             k = raw_klines[-1]
             self._on_new_kline({
@@ -387,6 +480,9 @@ class PaperTrader:
                         now = time.monotonic()
                         if sub.kline_changed() and (now - last_eval) >= self.MIN_EVAL_INTERVAL_S:
                             last_eval = now
+                            closed = sub.latest_closed()
+                            if closed:
+                                self._apply_closed_kline(closed)
                             self._on_new_kline({k: kline[k] for k in ("timestamp", "open", "high", "low", "close", "volume")})
                     else:
                         if mode is None and sub is not None and time.monotonic() < warmup_until:
@@ -714,35 +810,40 @@ class PaperTrader:
     # Callbacks del WebSocket
     # ──────────────────────────────────────────────────────────────
 
+    def _upsert_kline(self, kline_data: dict) -> None:
+        """Inserta o actualiza una vela en klines_df (llamar con self._lock tomado)."""
+        ts = pd.to_datetime(kline_data["timestamp"], unit="ms", utc=True)
+        new_row = pd.DataFrame(
+            [{k: float(kline_data[k]) for k in ("open", "high", "low", "close", "volume")}],
+            index=[ts],
+        )
+        # Si ya existe esa timestamp (vela duplicada), actualizar en lugar de concatenar
+        if ts in self.klines_df.index:
+            self.klines_df.loc[ts] = new_row.iloc[0]
+        else:
+            self.klines_df = pd.concat([self.klines_df, new_row]).sort_index()
+        if len(self.klines_df) > self.KLINES_WINDOW:
+            self.klines_df = self.klines_df.iloc[-self.KLINES_WINDOW:]
+
+    def _apply_closed_kline(self, kline_data: dict) -> None:
+        """Fija los valores FINALES de una vela ya cerrada, sin evaluar la estrategia. Se llama
+        antes de procesar la vela en curso para que la señal de 'close' use el cierre real."""
+        if not self.is_running:
+            return
+        ts = int(kline_data["timestamp"])
+        if ts == getattr(self, "_last_closed_applied", None):
+            return
+        with self._lock:
+            self._upsert_kline(kline_data)
+        self._last_closed_applied = ts
+
     def _on_new_kline(self, kline_data: dict):
-        """Callback invocado por el WebSocket al cerrar cada vela."""
+        """Callback invocado con cada actualización de la vela en curso."""
         if not self.is_running:
             return
 
         with self._lock:
-            ts = pd.to_datetime(kline_data["timestamp"], unit="ms", utc=True)
-            new_row = pd.DataFrame(
-                [
-                    {
-                        "open": float(kline_data["open"]),
-                        "high": float(kline_data["high"]),
-                        "low": float(kline_data["low"]),
-                        "close": float(kline_data["close"]),
-                        "volume": float(kline_data["volume"]),
-                    }
-                ],
-                index=[ts],
-            )
-
-            # Si ya existe esa timestamp (vela duplicada), actualizar en lugar de concatenar
-            if ts in self.klines_df.index:
-                self.klines_df.loc[ts] = new_row.iloc[0]
-            else:
-                self.klines_df = pd.concat([self.klines_df, new_row])
-
-            # Mantener ventana de 300 velas en memoria
-            if len(self.klines_df) > 300:
-                self.klines_df = self.klines_df.iloc[-300:]
+            self._upsert_kline(kline_data)
 
             try:
                 self._evaluate_market()
@@ -837,8 +938,7 @@ class PaperTrader:
                 )
                 if not entry_signal.empty and bool(entry_signal.iloc[-1]):
                     # Detectar dirección de la estrategia (Long o Short)
-                    trade_dir = str(self.strategy.config.get("trade_direction", "Long")).strip().lower()
-                    side = "short" if "short" in trade_dir else "long"
+                    side = "short" if is_short_direction(self.strategy.config) else "long"
                     self._open_position(side, current_price, current_ts)
             except Exception as exc:
                 logger.warning("Error evaluando entry_conditions: %s", exc)
@@ -962,20 +1062,29 @@ class PaperTrader:
         is_base_currency = (self.currency.upper() == base_asset)
         is_btc_account = (self.currency.upper() == "BTC")
 
-        method = str(risk_mgr.sizing_config.get("method", "compounding")).lower()
-        pct = float(risk_mgr.sizing_config.get("value", 100.0)) / 100.0 if method in ["compounding", "percent_equity", "full_capital"] else 1.0
+        # Calcular SL y TP usando compute_sl_tp del RiskManager (antes del tamaño: el modo
+        # "riesgo fijo" necesita la distancia al stop, igual que en el backtest).
+        idx = len(self.klines_df) - 1
+        try:
+            # strict=True: SL/TP sin configurar o en 0 = sin esa orden, igual que en el backtest
+            # (antes el motor en vivo aplicaba en silencio un 2% / 4%).
+            sl_price, tp_price = risk_mgr.compute_sl_tp(self.klines_df, idx, side, strict=True)
+        except Exception:
+            sl_price = price * (0.98 if side == "long" else 1.02)
+            tp_price = price * (1.04 if side == "long" else 0.96)
 
+        # Saldo de la cuenta expresado en la divisa cotizada del par (ej. USDT)
         if is_base_currency:
-            quantity = self.current_balance * pct
+            to_quote = price
         elif is_btc_account:
             # Colateral en BTC operando otro par (ej. ETH/USDT, SOL/USDT) con Multi-Assets
-            btc_price = self._client.get_symbol_price("BTCUSDT") if self._client else 0.0
-            if btc_price <= 0:
-                btc_price = float(self.klines_df["close"].iloc[-1]) if "BTC" in self.symbol else 80000.0
-            capital_in_quote = self.current_balance * btc_price
-            quantity = risk_mgr.compute_position_size(capital_in_quote, price)
+            to_quote = self._client.get_symbol_price("BTCUSDT") if self._client else 0.0
+            if to_quote <= 0:
+                to_quote = float(self.klines_df["close"].iloc[-1]) if "BTC" in self.symbol else 80000.0
         else:
-            quantity = risk_mgr.compute_position_size(self.current_balance, price)
+            to_quote = 1.0
+        sizer = RiskManager({**risk_mgr.config, "position_sizing": self._sizing_config(self.initial_balance * to_quote)})
+        quantity = sizer.compute_position_size(self.current_balance * to_quote, price, sl_price)
 
         entry_type = self.order_types.get("entry", "MARKET").upper()
 
@@ -993,17 +1102,7 @@ class PaperTrader:
             self._notify(f"⚠️ {err_msg}.")
             return
 
-        # Calcular SL y TP usando compute_sl_tp del RiskManager
-        idx = len(self.klines_df) - 1
-        try:
-            # strict=True: SL/TP sin configurar o en 0 = sin esa orden, igual que en el backtest
-            # (antes el motor en vivo aplicaba en silencio un 2% / 4%).
-            sl_price, tp_price = risk_mgr.compute_sl_tp(self.klines_df, idx, side, strict=True)
-        except Exception:
-            sl_price = price * (0.98 if side == "long" else 1.02)
-            tp_price = price * (1.04 if side == "long" else 0.96)
-
-        sl_type = self.order_types.get("stop_loss", "LIMIT").upper()
+        sl_type = self.order_types.get("stop_loss", "MARKET").upper()
         tp_type = self.order_types.get("take_profit", "LIMIT").upper()
 
         own_sl_ref = own_tp_ref = None
@@ -1638,7 +1737,7 @@ class PaperTrader:
         if not backed:
             return  # None (no se pudo confirmar) o False (no está respaldada): no se coloca nada a ciegas
 
-        sl_type = self.order_types.get("stop_loss", "LIMIT").upper()
+        sl_type = self.order_types.get("stop_loss", "MARKET").upper()
         tp_type = self.order_types.get("take_profit", "LIMIT").upper()
         self._notify(
             f"🛡️ La posición {pos.side.upper()} {pos.quantity:.6f} no tiene su "
@@ -1753,7 +1852,6 @@ class PaperTrader:
         self._save_state()
 
     # Operadores de "cruce" (evento) -> su equivalente de "estado" para la salida por estado.
-    _STATE_OPERATOR = {"crosses_below": "is_below", "crosses_above": "is_above"}
 
     @staticmethod
     def _timeframe_delta(timeframe: str) -> Optional[pd.Timedelta]:
@@ -1784,18 +1882,10 @@ class PaperTrader:
         if last_closed_open + delta <= entry_ts:
             return False  # esa vela cerró antes de que se abriera la posición
 
-        exit_cfg = copy.deepcopy(self.strategy.config.get("exit_conditions", {}) or {})
-        rules = exit_cfg.get("rules", []) or []
-        state_rules = []
-        for rule in rules:
-            if rule.get("type") == "technical_indicator" and rule.get("operator") in self._STATE_OPERATOR:
-                rule["operator"] = self._STATE_OPERATOR[rule["operator"]]
-                state_rules.append(rule)
-        if not state_rules:
+        # Misma conversión cruce -> estado que aplica el backtest (conditions.apply_state_exit).
+        exit_cfg = state_exit_conditions(self.strategy.config.get("exit_conditions", {}))
+        if exit_cfg is None:
             return False
-        if len(state_rules) != len(rules) and str(exit_cfg.get("logic", "OR")).upper() != "OR":
-            return False  # con AND no se puede evaluar solo una parte de las reglas
-        exit_cfg["rules"] = state_rules
 
         signal = ConditionEvaluator.evaluate_conditions(self.klines_df.iloc[:-1], exit_cfg)
         return (not signal.empty) and bool(signal.iloc[-1])

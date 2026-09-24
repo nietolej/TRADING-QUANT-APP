@@ -4,6 +4,7 @@ from datetime import datetime
 import uuid
 from strategy_engine.base_strategy import BaseStrategy
 from .metrics import calculate_metrics, calculate_equity_curve_metrics
+from strategy_engine.conditions import apply_state_exit
 import json
 
 class Backtester:
@@ -17,7 +18,8 @@ class Backtester:
         leverage: float = 1.0,
         initial_base_capital: float = None,
         entry_on_next_open: bool = True,
-        trade_start=None
+        trade_start=None,
+        exit_on_state: bool = True
     ):
         self.strategy = strategy
         self.initial_capital = initial_capital
@@ -36,6 +38,8 @@ class Backtester:
         # de las métricas. Sin esto cada ventana arrancaba "en frío" (EMA/SMA en NaN al
         # inicio) y perdía parte de sus velas sin posibilidad de dar señal.
         self.trade_start = pd.Timestamp(trade_start) if trade_start is not None else None
+        # Salida por estado al cierre de vela, igual que el motor en vivo (ver apply_state_exit).
+        self.exit_on_state = exit_on_state
 
     def run_vectorized(self, df: pd.DataFrame) -> dict:
         """
@@ -49,6 +53,8 @@ class Backtester:
             
         # Generar señales vectorizadas
         df = self.strategy.generate_signals(df)
+        if self.exit_on_state:
+            df = apply_state_exit(df, self.strategy.config)
         
         # Si el modelo usa Machine Learning, las señales vendrán pre-calculadas en df['ml_signal']
         entries = df.get('entry_long', pd.Series(False, index=df.index))
@@ -149,6 +155,8 @@ class Backtester:
             
         # Generar señales (vectorizado)
         df = self.strategy.generate_signals(df)
+        if self.exit_on_state:
+            df = apply_state_exit(df, self.strategy.config)
         
         start_price = float(df['open'].iloc[0]) if len(df) > 0 and 'open' in df.columns else float(df['close'].iloc[0])
         is_coin_m = (self.account_mode == "coin_margined_hold")

@@ -1,7 +1,7 @@
 import yaml
 import pandas as pd
 from typing import Dict, Any
-from .conditions import ConditionEvaluator
+from .conditions import ConditionEvaluator, is_short_direction
 from .risk_management import RiskManager
 
 class BaseStrategy:
@@ -143,7 +143,6 @@ class BaseStrategy:
         """
         df = df.copy()
         
-        direction = self.config.get("trade_direction", "Long").lower()
         
         # Calcular condiciones de entrada
         entry_conditions = self.config.get("entry_conditions", {})
@@ -153,7 +152,7 @@ class BaseStrategy:
         exit_conditions = self.config.get("exit_conditions", {})
         exit_signals = ConditionEvaluator.evaluate_conditions(df, exit_conditions)
         
-        if direction == "short":
+        if is_short_direction(self.config):
             df['entry_short'] = entry_signals
             df['exit_short'] = exit_signals
             df['entry_long'] = False
