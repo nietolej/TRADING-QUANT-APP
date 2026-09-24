@@ -34,16 +34,38 @@ class RiskManager:
         period = max(1, int(period))
         return ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=period)
 
-    def compute_sl_tp(self, df: pd.DataFrame, entry_index: int, side: str = "long") -> tuple:
+    def compute_sl_tp(
+        self,
+        df: pd.DataFrame,
+        entry_index: int,
+        side: str = "long",
+        entry_price: float = None,
+        strict: bool = False
+    ) -> tuple:
         """
         Retorna (stop_loss_price, take_profit_price) para una entrada dada.
+
+        `entry_index` es la ultima vela CONOCIDA al decidir la entrada (ATR, chandelier y
+        swing solo leen datos hasta ella). `entry_price` es el precio real de ejecucion: si
+        no se pasa se usa el close de `entry_index` (entrada al cierre de esa vela). Antes el
+        backtester en modo "entrada al Open siguiente" anclaba el SL/TP al close de la vela
+        de entrada — un precio que aun no existia al ejecutar — y el SL podia quedar a
+        -13% o incluso por encima del precio de compra con un SL configurado de -1%.
+
+        `strict`: con True, un SL/TP ausente en la configuracion o porcentual de valor 0
+        significa "sin SL/TP" (None). Con False se conserva el comportamiento historico
+        (ausente o 0 -> 2% SL / 4% TP), que es el que usa el motor en vivo (paper_trader).
         """
-        entry_price = float(df['close'].iloc[entry_index])
+        if entry_price is None:
+            entry_price = float(df['close'].iloc[entry_index])
+        entry_price = float(entry_price)
         
         # ═════════════════════════════════════════════════════════════
         # 1. CÁLCULO DE STOP LOSS (SL)
         # ═════════════════════════════════════════════════════════════
-        raw_sl_type = str(self.sl_config.get("type", "fixed")).lower().strip().replace(" ", "_")
+        # Sin stop_loss configurado: en modo estricto no hay SL (antes se asumia un 2%
+        # "fixed" aunque Backtester.run tratara la estrategia como "sin SL").
+        raw_sl_type = str(self.sl_config.get("type", "none" if strict else "fixed")).lower().strip().replace(" ", "_")
         if raw_sl_type == "dynamic":
             # Igual que el Take Profit (ver mas abajo): "dynamic" no es un metodo de calculo
             # en si mismo, es un indicador de que el metodo real vive en dynamic_method
@@ -57,7 +79,11 @@ class RiskManager:
 
         if raw_sl_type in ["fixed", "percentage", "trailing_percent", "trailing", "break_even", "breakeven"]:
             pct = (sl_val / 100.0) if sl_val != 0 else 0.02
-            if side == "long":
+            if sl_val == 0 and strict:
+                pct = None
+            if pct is None:
+                sl_price = None
+            elif side == "long":
                 sl_price = entry_price * (1.0 - pct)
             else:
                 sl_price = entry_price * (1.0 + pct)
@@ -110,7 +136,7 @@ class RiskManager:
         # ═════════════════════════════════════════════════════════════
         # 2. CÁLCULO DE TAKE PROFIT (TP)
         # ═════════════════════════════════════════════════════════════
-        raw_tp_type = str(self.tp_config.get("type", "fixed")).lower().strip().replace(" ", "_")
+        raw_tp_type = str(self.tp_config.get("type", "none" if strict else "fixed")).lower().strip().replace(" ", "_")
         if raw_tp_type == "dynamic":
             raw_tp_type = str(self.tp_config.get("dynamic_method", self.tp_config.get("method", "risk_reward"))).lower().strip().replace(" ", "_")
         tp_val = float(self.tp_config.get("value", 4.0))
@@ -118,7 +144,11 @@ class RiskManager:
 
         if raw_tp_type in ["fixed", "percentage", "partial", "multi_tp"]:
             pct = (tp_val / 100.0) if tp_val != 0 else 0.04
-            if side == "long":
+            if tp_val == 0 and strict:
+                pct = None
+            if pct is None:
+                tp_price = None
+            elif side == "long":
                 tp_price = entry_price * (1.0 + pct)
             else:
                 tp_price = entry_price * (1.0 - pct)
@@ -193,6 +223,15 @@ class RiskManager:
         Actualiza el nivel de Stop Loss dinámicamente según la lógica de Trailing / Break-Even.
         """
         raw_sl_type = str(self.sl_config.get("type", "")).lower().strip().replace(" ", "_")
+
+        # Un trailing/break-even de 0% no es un stop valido: dejaria el SL pegado al high
+        # de la vela y forzaria la salida en la vela siguiente. Se trata como desactivado.
+        if raw_sl_type in ["trailing_percent", "trailing", "break_even", "breakeven"]:
+            try:
+                if float(self.sl_config.get("value", 2.0)) == 0:
+                    return current_sl
+            except (TypeError, ValueError):
+                pass
 
         # 1. Trailing Stop Porcentual
         if raw_sl_type in ["trailing_percent", "trailing"]:

@@ -107,10 +107,7 @@ def _sync_run_portfolio_backtest(
                 all_unique_assets.add(s_parts[0].strip().upper())
                 all_unique_assets.add(s_parts[1].strip().upper())
 
-            df = market_mgr.get_data(symbol, timeframe, start_dt, end_dt)
-            if df.empty:
-                market_mgr.update_historical_data(symbol, timeframe, start_dt, end_dt)
-                df = market_mgr.get_data(symbol, timeframe, start_dt, end_dt)
+            df = market_mgr.get_data_refreshed(symbol, timeframe, start_dt, end_dt)
             if not df.empty:
                 strat_data_dict[idx] = df
 
@@ -122,10 +119,7 @@ def _sync_run_portfolio_backtest(
         for asset in all_unique_assets:
             if asset in ['USDT', 'USD', 'FDUSD', 'USDC']:
                 continue
-            df_p = market_mgr.get_data(f"{asset}/USDT", '1d', start_dt, end_dt)
-            if df_p.empty:
-                market_mgr.update_historical_data(f"{asset}/USDT", '1d', start_dt, end_dt)
-                df_p = market_mgr.get_data(f"{asset}/USDT", '1d', start_dt, end_dt)
+            df_p = market_mgr.get_data_refreshed(f"{asset}/USDT", '1d', start_dt, end_dt)
             if not df_p.empty:
                 price_series_df_dict[asset] = df_p['close']
 

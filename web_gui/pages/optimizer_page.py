@@ -68,10 +68,7 @@ def _fetch_market_data_sync(symbol: str, timeframe: str, start_dt: datetime, end
     db = SessionLocal()
     try:
         market_mgr = MarketDataManager(db)
-        df = market_mgr.get_data(symbol, timeframe, start_dt, end_dt)
-        if df.empty:
-            market_mgr.update_historical_data(symbol, timeframe, start_dt, end_dt)
-            df = market_mgr.get_data(symbol, timeframe, start_dt, end_dt)
+        df = market_mgr.get_data_refreshed(symbol, timeframe, start_dt, end_dt)
         return df
     finally:
         db.close()

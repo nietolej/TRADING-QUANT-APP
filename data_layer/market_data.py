@@ -8,40 +8,67 @@ from .storage import OHLCV, SessionLocal
 
 import yfinance as yf
 
-_working_exchange_class = None
+_working_exchange_factory = None
+
+# Espejo oficial de Binance (global) solo para datos públicos de mercado. Sirve los mismos
+# klines que api.binance.com y no está sujeto al bloqueo geográfico (HTTP 451) de este.
+BINANCE_PUBLIC_DATA_URL = "https://data-api.binance.vision/api/v3"
+
+
+def _binance_global(config):
+    return ccxt.binance(config)
+
+
+def _binance_global_mirror(config):
+    cfg = dict(config)
+    # El espejo solo expone el mercado spot: sin esto load_markets() también consulta los
+    # endpoints de futuros (fapi/dapi), que siguen bloqueados.
+    cfg['options'] = {**cfg.get('options', {}), 'fetchMarkets': ['spot']}
+    exchange = ccxt.binance(cfg)
+    exchange.urls['api']['public'] = BINANCE_PUBLIC_DATA_URL
+    return exchange
+
 
 def get_binance_exchange(config=None):
-    global _working_exchange_class
-    import os
-    
+    """
+    Exchange ccxt para datos PÚBLICOS de mercado (klines, símbolos). Orden de preferencia:
+    1. Binance global.
+    2. Espejo oficial de Binance global (data-api.binance.vision) si el anterior está
+       bloqueado por región.
+    3. Binance US, solo como último recurso: es otro exchange con precios parecidos pero
+       volumen ~1000x menor. Antes se usaba en silencio apenas fallaba Binance global, y
+       desde 2023 la serie BTC/USDT de la BD mezclaba ambos mercados.
+    """
+    global _working_exchange_factory
+
     if config is None:
         config = {'enableRateLimit': True}
-        
+
     # Public market data does not require API keys, and testnet keys break mainnet endpoints.
-    
-    if _working_exchange_class is not None:
-        exchange = _working_exchange_class(config)
-        return exchange
-        
-    # Try global Binance first
-    try:
-        exchange = ccxt.binance(config)
-        exchange.load_markets()
-        _working_exchange_class = ccxt.binance
-        return exchange
-    except Exception as e:
-        print(f"Failed to load global Binance: {e}. Trying Binance US...")
-    # Try Binance US fallback
-    try:
-        exchange = ccxt.binanceus(config)
-        exchange.load_markets()
-        _working_exchange_class = ccxt.binanceus
-        return exchange
-    except Exception as e:
-        print(f"Failed to load Binance US: {e}")
+
+    if _working_exchange_factory is not None:
+        return _working_exchange_factory(config)
+
+    for factory, label in (
+        (_binance_global, "Binance global"),
+        (_binance_global_mirror, f"Binance global (espejo {BINANCE_PUBLIC_DATA_URL})"),
+        (lambda c: ccxt.binanceus(c), "Binance US"),
+    ):
+        try:
+            exchange = factory(config)
+            exchange.load_markets()
+            _working_exchange_factory = factory
+            if label == "Binance US":
+                print("ADVERTENCIA: usando Binance US como fuente de datos. Es un mercado distinto "
+                      "(volumen muy bajo); los datos NO son de Binance global.")
+            else:
+                print(f"Fuente de datos de mercado: {label}")
+            return exchange
+        except Exception as e:
+            print(f"No se pudo usar {label}: {e}")
+
     # Default fallback
-    exchange = ccxt.binance(config)
-    return exchange
+    return ccxt.binance(config)
 
 def ensure_utc(dt: datetime) -> datetime:
     if dt is None:
@@ -80,7 +107,38 @@ def normalize_timeframe(tf: str) -> str:
         if unit.startswith('w') or unit.startswith('s'): return f"{num}w"
     return tf
 
+
+def timeframe_seconds(timeframe: str) -> int:
+    """Duración de una vela en segundos ('4h' -> 14400). 0 si no se reconoce."""
+    try:
+        return int(ccxt.Exchange.parse_timeframe(normalize_timeframe(timeframe)))
+    except Exception:
+        return 0
+
+
+def drop_unclosed_candles(df: pd.DataFrame, timeframe: str, now: datetime = None) -> pd.DataFrame:
+    """
+    Quita las velas que todavía no cerraron (timestamp de apertura + duración > ahora).
+    Los exchanges devuelven la vela en curso como última fila; guardarla dejaba en la BD
+    un OHLC parcial (ej. BTC/USDT 1d del 18/09/2026: rango 0.2% y cierre 76,396 cuando
+    la vela siguiente abrió en 80,896) que luego nunca se corregía.
+    """
+    if df is None or df.empty or 'timestamp' not in df.columns:
+        return df
+    tf_sec = timeframe_seconds(timeframe)
+    if tf_sec <= 0:
+        return df
+    now = ensure_utc(now or datetime.now(timezone.utc))
+    ts = pd.to_datetime(df['timestamp'], utc=True)
+    closed = (ts + pd.Timedelta(seconds=tf_sec)) <= pd.Timestamp(now)
+    return df[closed.values]
+
+
 class MarketDataManager:
+    # Velas finales que se re-descargan en cada actualización incremental para corregir
+    # las que se guardaron antes de cerrar.
+    REFRESH_LAST_CANDLES = 5
+
     def __init__(self, db_session: Session = None):
         self.exchange = get_binance_exchange({
             'enableRateLimit': True,
@@ -200,8 +258,12 @@ class MarketDataManager:
             if start_date < min_db:
                 since_dt = start_date
             else:
-                # Si ya cubre la fecha solicitada, resumimos desde el último registro guardado
-                since_dt = max_db
+                # Si ya cubre la fecha solicitada, resumimos desde el último registro guardado,
+                # retrocediendo unas velas para re-descargar (y corregir vía upsert en
+                # _save_df_to_db) las últimas que pudieron guardarse incompletas.
+                tf_sec = timeframe_seconds(timeframe)
+                since_dt = max_db - pd.Timedelta(seconds=tf_sec * self.REFRESH_LAST_CANDLES) if tf_sec > 0 else max_db
+                since_dt = max(since_dt, min_db)
         else:
             since_dt = start_date
         
@@ -217,7 +279,7 @@ class MarketDataManager:
         
         if source == "yahoo":
             _end_dt = end_date if end_date else ensure_utc(datetime.now(timezone.utc))
-            df = self.fetch_ohlcv_yahoo(symbol, timeframe, start_date=since_dt, end_date=_end_dt)
+            df = drop_unclosed_candles(self.fetch_ohlcv_yahoo(symbol, timeframe, start_date=since_dt, end_date=_end_dt), timeframe)
             if df.empty:
                 msg2 = f"No data found in Yahoo Finance for {symbol}."
                 print(msg2)
@@ -232,19 +294,30 @@ class MarketDataManager:
         
         # Binance source logic
         while True:
-            df = self.fetch_ohlcv(symbol, timeframe, since=since_dt)
-            if df.empty or len(df) <= 1: 
+            raw = self.fetch_ohlcv(symbol, timeframe, since=since_dt)
+            if raw.empty or len(raw) <= 1:
+                # Una sola fila = solo la vela ya guardada (o la vela en curso): no hay más.
+                # Igual se guarda por si corrige una vela incompleta previa.
+                self._save_df_to_db(drop_unclosed_candles(raw, timeframe))
                 break
-                
+            df = drop_unclosed_candles(raw, timeframe)
+            if df.empty:
+                break
+
             # Filter out records beyond end_date
             if end_date:
                 df = df[df['timestamp'] <= end_date]
                 if df.empty:
                     break
-                    
+
             self._save_df_to_db(df)
-            
+
+            prev_since = since_dt
             since_dt = ensure_utc(df['timestamp'].iloc[-1])
+            # Se descartó la vela en curso (ya estamos en la cabeza de la serie) o no hubo
+            # avance: sin esta salida el bucle volvería a pedir siempre la misma página.
+            if len(df) < len(raw) or since_dt <= ensure_utc(prev_since):
+                break
             msg2 = f"Downloaded {len(df)} candles for {symbol}. Next fetch from {since_dt}"
             print(msg2)
             if progress_callback: progress_callback(msg2)
@@ -255,8 +328,9 @@ class MarketDataManager:
             time.sleep(self.exchange.rateLimit / 1000) # Respetar rate limits
             
     def _save_df_to_db(self, df):
+        """Inserta velas nuevas y corrige las existentes. Devuelve (insertadas, actualizadas)."""
         if df is None or df.empty:
-            return
+            return 0, 0
             
         symbol = df['symbol'].iloc[0]
         timeframe = df['timeframe'].iloc[0]
@@ -270,36 +344,62 @@ class MarketDataManager:
         # el IN(...) en lotes de 500: una descarga histórica grande puede traer más
         # timestamps de los que SQLite admite en un solo IN() ("too many SQL variables"),
         # ver mismo fix en onchain_data.py:update_historical_data.
-        existing_ts = set()
+        existing = {}
         batch_size = 500
         for i in range(0, len(ts_list), batch_size):
             batch = ts_list[i:i + batch_size]
-            existing_ts.update(
-                r[0] for r in self.db.query(OHLCV.timestamp).filter(
-                    OHLCV.symbol == symbol,
-                    OHLCV.timeframe == timeframe,
-                    OHLCV.timestamp.in_(batch)
-                ).all()
-            )
-        
+            for obj in self.db.query(OHLCV).filter(
+                OHLCV.symbol == symbol,
+                OHLCV.timeframe == timeframe,
+                OHLCV.timestamp.in_(batch)
+            ).all():
+                existing[obj.timestamp] = obj
+
         new_objects = []
+        updated = 0
         for ts_naive, rec in ts_map.items():
-            if ts_naive not in existing_ts:
+            vals = {k: float(rec[k]) for k in ('open', 'high', 'low', 'close', 'volume')}
+            obj = existing.get(ts_naive)
+            if obj is None:
                 new_objects.append(OHLCV(
                     symbol=rec['symbol'],
                     timeframe=rec['timeframe'],
                     timestamp=ts_naive,
-                    open=float(rec['open']),
-                    high=float(rec['high']),
-                    low=float(rec['low']),
-                    close=float(rec['close']),
-                    volume=float(rec['volume'])
+                    **vals
                 ))
-                
+            elif any(abs((getattr(obj, k) or 0.0) - v) > 1e-9 for k, v in vals.items()):
+                # Upsert: antes una vela ya guardada nunca se actualizaba, así que una vela
+                # descargada antes de cerrar quedaba incompleta para siempre.
+                for k, v in vals.items():
+                    setattr(obj, k, v)
+                updated += 1
+
         if new_objects:
             self.db.bulk_save_objects(new_objects)
+        if new_objects or updated:
             self.db.commit()
+        return len(new_objects), updated
             
+    def get_data_refreshed(self, symbol: str, timeframe: str, start_date: datetime, end_date: datetime = None) -> pd.DataFrame:
+        """
+        Como get_data, pero descarga lo que falta si la BD está vacía o si su última vela
+        cerrada queda antes del final del rango pedido. Antes los backtests solo descargaban
+        cuando no había NINGÚN dato, así que una serie desactualizada se usaba en silencio.
+        Si la descarga falla se devuelve lo que haya en la BD.
+        """
+        df = self.get_data(symbol, timeframe, start_date, end_date)
+        tf_sec = timeframe_seconds(timeframe)
+        target_end = min(ensure_utc(end_date) if end_date else ensure_utc(datetime.now(timezone.utc)),
+                         ensure_utc(datetime.now(timezone.utc)))
+        stale = df.empty or (tf_sec > 0 and df.index[-1] + pd.Timedelta(seconds=2 * tf_sec) <= pd.Timestamp(target_end))
+        if stale:
+            try:
+                self.update_historical_data(symbol, timeframe, start_date, end_date)
+            except Exception as e:
+                print(f"No se pudo actualizar {symbol} {timeframe}: {e}")
+            df = self.get_data(symbol, timeframe, start_date, end_date)
+        return df
+
     def get_data(self, symbol: str, timeframe: str, start_date: datetime, end_date: datetime = None) -> pd.DataFrame:
         """
         Obtiene datos históricos desde la base de datos local.
