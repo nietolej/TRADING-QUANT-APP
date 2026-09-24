@@ -55,6 +55,14 @@ def _delete_optimization_entry(opt_id: str) -> bool:
         return True
     return False
 
+def _pct_or_default(value, default: float) -> float:
+    """Comisión/slippage de la UI; 0 es un valor válido (antes `or` lo reemplazaba por el default)."""
+    try:
+        return float(value) if value is not None and str(value).strip() != '' else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _parse_assets(symbol: str) -> tuple[str, str]:
     """Extrae (base_asset, quote_asset) de un string 'BTC/USDT'."""
     if symbol and '/' in symbol:
@@ -1281,8 +1289,8 @@ def render_optimizer_page(on_go_to_analyzer=None):
                     'cl_stop': float(state.get('cl_stop', 0.0))
                 }
 
-                comm_pct = float(state.get('commission_pct', 0.1) or 0.1)
-                slip_pct = float(state.get('slippage_pct', 0.05) or 0.05)
+                comm_pct = _pct_or_default(state.get('commission_pct'), 0.1)
+                slip_pct = _pct_or_default(state.get('slippage_pct'), 0.05)
                 metric_key = state.get('optimize_metric', 'sharpe_ratio')
 
                 done_counter = [0]
@@ -1630,8 +1638,8 @@ def render_optimizer_page(on_go_to_analyzer=None):
                 start_price = float(df_wf.iloc[0]['open']) if not df_wf.empty and 'open' in df_wf.columns else 1.0
                 cap_val = float(state.get('capital', 1.0) or 1.0)
                 initial_cap = cap_val * start_price if state.get('capital_type', 'QUOTE') == 'BASE' else cap_val
-                comm_pct = float(state.get('commission_pct', 0.1) or 0.1)
-                slip_pct = float(state.get('slippage_pct', 0.05) or 0.05)
+                comm_pct = _pct_or_default(state.get('commission_pct'), 0.1)
+                slip_pct = _pct_or_default(state.get('slippage_pct'), 0.05)
                 metric_key = state.get('optimize_metric', 'sharpe_ratio')
 
                 import copy
@@ -1671,7 +1679,7 @@ def render_optimizer_page(on_go_to_analyzer=None):
                     lbl_wf_verdict.classes(remove='text-red-400', add='text-green-400')
 
                 consensus = wf_result.get('consensus_params', {})
-                lbl_wf_consensus.set_text(' | '.join(f"{k}={v}" for k, v in consensus.items()) or '--')
+                lbl_wf_consensus.set_text((' | '.join(f"{k}={v}" for k, v in consensus.items()) + f"  ({wf_result.get('consensus_folds', 0)}/{wf_result['n_folds']} folds)") if consensus else '--')
 
                 fold_rows = []
                 for f in wf_result['folds']:

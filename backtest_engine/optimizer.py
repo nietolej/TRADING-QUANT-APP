@@ -11,7 +11,6 @@ import itertools
 import math
 import os
 import concurrent.futures
-from collections import Counter
 from typing import Any, Callable, Dict, Generator, List, Optional
 
 import pandas as pd
@@ -136,10 +135,12 @@ def _optimizer_worker(
     commission_pct: float = 0.1,
     slippage_pct: float = 0.05,
     ec_config: Optional[Dict[str, Any]] = None,
-    sizing_config: Optional[Dict[str, Any]] = None
+    sizing_config: Optional[Dict[str, Any]] = None,
+    trade_start: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Ejecuta un backtest individual para una combinación específica de parámetros.
+    `trade_start`: las velas previas solo calientan indicadores (ver Backtester).
     """
     try:
         config_copy = copy.deepcopy(base_config)
@@ -169,7 +170,8 @@ def _optimizer_worker(
                 strategy,
                 initial_capital=initial_capital,
                 commission_pct=commission_pct,
-                slippage_pct=slippage_pct
+                slippage_pct=slippage_pct,
+                trade_start=trade_start
             )
             
         run_result = bt.run(df)
@@ -246,6 +248,26 @@ def _optimizer_worker(
 # Optimizer Entry Point
 # ──────────────────────────────────────────────
 
+def rank_key(r: Dict[str, Any], optimize_metric: str) -> tuple:
+    """Clave de orden del Grid Search (mayor = mejor): errores al final, luego sin operaciones."""
+    if r.get('error'):
+        return (-2, 0.0)
+    # Una combinación sin operaciones no es un resultado: con la métrica Max Drawdown
+    # (DD 0%) ganaba el ranking justamente por no operar nunca.
+    if int(r.get('total_trades', 0) or 0) == 0:
+        return (-1, 0.0)
+    val = float(r.get(optimize_metric, -999))
+    # Para drawdown: menor (menos negativo/menor % caída) es mejor
+    if optimize_metric == 'max_drawdown_pct':
+        val = -abs(val)
+    # profit_factor con muestra insuficiente (ver metrics.MIN_TRADES_FOR_RELIABLE_PF)
+    # no debe poder ganar el ranking solo por ser matemáticamente "inf" (0 perdedoras):
+    # se penaliza por debajo de cualquier resultado confiable, sin tratarlo como error duro.
+    if optimize_metric == 'profit_factor' and not r.get('profit_factor_reliable', False):
+        val = -1.0
+    return (0, val)
+
+
 def run_grid_search(
     strategy_path: str,
     df: pd.DataFrame,
@@ -257,7 +279,8 @@ def run_grid_search(
     slippage_pct: float = 0.05,
     ec_config: Optional[Dict[str, Any]] = None,
     sizing_config: Optional[Dict[str, Any]] = None,
-    cancel_event: Optional[Any] = None
+    cancel_event: Optional[Any] = None,
+    trade_start: Optional[Any] = None
 ) -> List[Dict[str, Any]]:
     """
     Ejecuta Grid Search de forma segura y multihilo.
@@ -298,7 +321,8 @@ def run_grid_search(
                 commission_pct,
                 slippage_pct,
                 ec_config,
-                sizing_config
+                sizing_config,
+                trade_start
             ): params
             for params in param_grids
         }
@@ -340,28 +364,40 @@ def run_grid_search(
                 except Exception:
                     pass
 
-    # Ordenar: sin errores primero, luego por métrica descendente
-    def _sort_key(r):
-        if r.get('error'):
-            return -999_999.0
-        val = float(r.get(optimize_metric, -999))
-        # Para drawdown: menor (menos negativo/menor % caída) es mejor
-        if optimize_metric == 'max_drawdown_pct':
-            val = -abs(val)
-        # profit_factor con muestra insuficiente (ver metrics.MIN_TRADES_FOR_RELIABLE_PF)
-        # no debe poder ganar el ranking solo por ser matemáticamente "inf" (0 perdedoras):
-        # se penaliza por debajo de cualquier resultado confiable, sin tratarlo como error duro.
-        if optimize_metric == 'profit_factor' and not r.get('profit_factor_reliable', False):
-            val = -1.0
-        return val
-
-    results.sort(key=_sort_key, reverse=True)
+    results.sort(key=lambda r: rank_key(r, optimize_metric), reverse=True)
     return results
 
 
 # ──────────────────────────────────────────────────────────────
 # Walk-Forward Validation
 # ──────────────────────────────────────────────────────────────
+
+# Velas previas que se usan solo para calentar indicadores en cada ventana del walk-forward.
+WF_WARMUP_BARS = 300
+# Tope de la eficiencia por fold: un ratio OOS/IS con un IS casi nulo explota (ej. 50x) y
+# dominaba el promedio.
+WF_EFFICIENCY_CLIP = 2.0
+
+
+def _fold_efficiency(metric: str, is_metric: float, oos_metric: float) -> float:
+    """
+    Cuánto del resultado in-sample se conserva fuera de muestra (1.0 = todo).
+    Antes, si IS y OOS eran ambos negativos la eficiencia valía 1.0 ("degradación
+    proporcional"): una estrategia que pierde en los dos tramos salía como robusta. Y con
+    max_drawdown_pct (siempre <= 0) todos los folds caían en ese caso.
+    """
+    if is_metric == -999 or oos_metric == -999:
+        return 0.0
+    if metric == 'max_drawdown_pct':
+        is_dd, oos_dd = abs(is_metric), abs(oos_metric)
+        eff = 1.0 if oos_dd <= 1e-9 else is_dd / oos_dd  # OOS con el doble de caída -> 0.5
+    elif is_metric <= 0:
+        # Sin ventaja in-sample no hay nada que "conservar".
+        eff = 0.0
+    else:
+        eff = oos_metric / is_metric
+    return float(max(-WF_EFFICIENCY_CLIP, min(WF_EFFICIENCY_CLIP, eff)))
+
 
 def run_walk_forward(
     strategy_path: str,
@@ -383,11 +419,13 @@ def run_walk_forward(
     Divide el dataset en `n_splits` ventanas. Para cada ventana:
       1. In-Sample (IS, 70%): ejecuta Grid Search y elige los mejores parámetros.
       2. Out-of-Sample (OOS, 30%): aplica esos parámetros en datos no vistos.
+    Cada tramo se simula con hasta WF_WARMUP_BARS velas previas que solo calientan los
+    indicadores (no se opera en ellas ni cuentan en las métricas).
 
     Métricas clave del resultado:
-      - wf_efficiency: OOS_metric / IS_metric. >0.7 = robusto, <0.5 = sobreajuste.
-      - overfitting_detected: True si la eficiencia es baja.
-      - consensus_params: los parámetros ganadores más frecuentes entre todos los folds.
+      - wf_efficiency: media de la eficiencia por fold (ver _fold_efficiency). >0.7 = robusto, <0.5 = sobreajuste.
+      - overfitting_detected: eficiencia < 0.5 o menos de la mitad de los folds ganan dinero OOS.
+      - consensus_params: la combinación ganadora más repetida entre folds.
     """
     if df.empty or len(df) < 40:
         return {'error': 'DataFrame insuficiente para Walk-Forward (min 40 velas).'}
@@ -401,23 +439,26 @@ def run_walk_forward(
     total_steps = n_splits
     done = 0
 
+    def _d(i):
+        ts = df.index[i]
+        return str(ts)[:10] if hasattr(ts, 'strftime') else str(i)
+
     for fold_idx in range(n_splits):
         if cancel_event and getattr(cancel_event, 'is_set', lambda: False)():
             break
 
         fold_start = fold_idx * window_size
         fold_end = fold_start + window_size if fold_idx < n_splits - 1 else n
-        fold_df = df.iloc[fold_start:fold_end].copy()
-
-        if len(fold_df) < 20:
+        if fold_end - fold_start < 20:
             continue
 
-        split_point = int(len(fold_df) * in_sample_pct)
-        df_is = fold_df.iloc[:split_point].copy()
-        df_oos = fold_df.iloc[split_point:].copy()
-
-        if len(df_is) < 10 or len(df_oos) < 5:
+        split_abs = fold_start + int((fold_end - fold_start) * in_sample_pct)
+        if split_abs - fold_start < 10 or fold_end - split_abs < 5:
             continue
+
+        # Tramos con calentamiento: se opera en IS desde fold_start y en OOS desde split_abs.
+        df_is = df.iloc[max(0, fold_start - WF_WARMUP_BARS):split_abs].copy()
+        df_oos = df.iloc[max(0, split_abs - WF_WARMUP_BARS):fold_end].copy()
 
         # ─── Fase 1: Grid Search sobre IS ───
         is_results = run_grid_search(
@@ -430,6 +471,7 @@ def run_walk_forward(
             slippage_pct=slippage_pct,
             sizing_config=sizing_config,
             cancel_event=cancel_event,
+            trade_start=df.index[fold_start],
         )
 
         if not is_results or is_results[0].get('error'):
@@ -448,23 +490,17 @@ def run_walk_forward(
             commission_pct=commission_pct,
             slippage_pct=slippage_pct,
             sizing_config=sizing_config,
+            trade_start=df.index[split_abs],
         )
         oos_metric = float(oos_result.get(optimize_metric, -999))
-
-        # Eficiencia del fold
-        if is_metric > 0 and is_metric != -999:
-            fold_efficiency = oos_metric / is_metric
-        elif is_metric <= 0 and oos_metric <= 0:
-            fold_efficiency = 1.0  # Ambos negativos: degradación proporcional
-        else:
-            fold_efficiency = 0.0  # IS positivo, OOS negativo = sobreajuste total
+        fold_efficiency = _fold_efficiency(optimize_metric, is_metric, oos_metric)
 
         folds.append({
             'fold': fold_idx + 1,
-            'is_start': str(df_is.index[0])[:10] if hasattr(df_is.index[0], 'strftime') else str(fold_start),
-            'is_end': str(df_is.index[-1])[:10] if hasattr(df_is.index[-1], 'strftime') else str(split_point),
-            'oos_start': str(df_oos.index[0])[:10] if hasattr(df_oos.index[0], 'strftime') else str(split_point),
-            'oos_end': str(df_oos.index[-1])[:10] if hasattr(df_oos.index[-1], 'strftime') else str(fold_end),
+            'is_start': _d(fold_start),
+            'is_end': _d(split_abs - 1),
+            'oos_start': _d(split_abs),
+            'oos_end': _d(fold_end - 1),
             'best_params': best_params,
             'is_metric': round(is_metric, 4),
             'oos_metric': round(oos_metric, 4),
@@ -474,6 +510,7 @@ def run_walk_forward(
             'oos_cagr': round(float(oos_result.get('cagr', 0)), 2),
             'is_dd': round(float(best_is.get('max_drawdown_pct', 0)), 2),
             'oos_dd': round(float(oos_result.get('max_drawdown_pct', 0)), 2),
+            'oos_net_pnl': round(float(oos_result.get('net_pnl', 0)), 6),
             'fold_efficiency': round(fold_efficiency, 3),
         })
 
@@ -497,16 +534,18 @@ def run_walk_forward(
     is_mean = float(np.mean(is_metrics)) if is_metrics else 0.0
     oos_mean = float(np.mean(oos_metrics)) if oos_metrics else 0.0
     oos_cagr_mean = float(np.mean(oos_cagrs)) if oos_cagrs else 0.0
-    oos_positive_folds = sum(1 for m in oos_metrics if m > 0)
-    overfitting_detected = wf_efficiency < 0.5 or oos_positive_folds < len(folds) // 2
+    # Fold "positivo" = ganó dinero fuera de muestra (antes: metric > 0, que con
+    # max_drawdown_pct nunca se cumplía y marcaba siempre sobreajuste).
+    oos_positive_folds = sum(1 for f in folds if f['oos_net_pnl'] > 0)
+    overfitting_detected = wf_efficiency < 0.5 or oos_positive_folds * 2 < len(folds)
 
-    # Parámetros más frecuentes en IS (consenso robusto entre folds)
-    all_param_keys = list(folds[0]['best_params'].keys()) if folds else []
-    consensus_params: Dict[str, Any] = {}
-    for key in all_param_keys:
-        values = [str(f['best_params'].get(key, '')) for f in folds]
-        most_common = Counter(values).most_common(1)
-        consensus_params[key] = most_common[0][0] if most_common else ''
+    # Consenso = combinación COMPLETA más repetida (desempate: mejor métrica OOS media).
+    # Antes se tomaba la moda de cada parámetro por separado, lo que podía dar una
+    # combinación que nunca ganó ningún fold.
+    combos: Dict[tuple, List[float]] = {}
+    for f in folds:
+        combos.setdefault(tuple(sorted(f['best_params'].items())), []).append(f['oos_metric'])
+    best_combo = max(combos.items(), key=lambda kv: (len(kv[1]), float(np.mean(kv[1]))))[0]
 
     return {
         'status': 'success',
@@ -518,8 +557,10 @@ def run_walk_forward(
         'oos_cagr_mean': round(oos_cagr_mean, 2),
         'oos_positive_folds': oos_positive_folds,
         'overfitting_detected': overfitting_detected,
-        'consensus_params': consensus_params,
+        'consensus_params': dict(best_combo),
+        'consensus_folds': len(combos[best_combo]),
         'optimize_metric': optimize_metric,
         'in_sample_pct': in_sample_pct,
         'n_splits': n_splits,
+        'warmup_bars': WF_WARMUP_BARS,
     }

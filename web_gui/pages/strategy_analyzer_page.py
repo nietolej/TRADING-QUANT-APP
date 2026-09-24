@@ -2320,7 +2320,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                 strategy.config['equity_curve_management'] = ec_config
                 
                 if ec_config.get('enabled', False):
-                    backtester = EquityCurveBacktester(strategy, initial_capital=initial_capital, commission_pct=comm_pct, slippage_pct=slip_pct)
+                    backtester = EquityCurveBacktester(strategy, initial_capital=initial_capital, commission_pct=comm_pct, slippage_pct=slip_pct, entry_on_next_open=entry_on_next_open)
                 else:
                     backtester = Backtester(
                         strategy,
