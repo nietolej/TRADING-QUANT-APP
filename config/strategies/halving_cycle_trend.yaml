@@ -1,0 +1,72 @@
+strategy_name: Halving Cycle Trend
+description: >
+  Long de tendencia (EMA20/EMA100) que solo se habilita dentro de la ventana
+  historica de +30 a +900 dias post-Halving (cubre los 3 picos de ciclos
+  pasados: H+366, H+548 y H+890) y se fuerza a cerrar a partir de H+950,
+  sin importar la tendencia, para no quedar largo en la fase de distribucion
+  observada en los 3 ciclos completados. Salida tambien por reversion de
+  tendencia o por Chandelier Exit (ATR) si el precio retrocede antes.
+trade_direction: Long
+symbol: BTC/USDT
+timeframe: 1d
+parameters:
+  FAST: 20
+  SLOW: 100
+  MIN_DAY: 30
+  MAX_DAY: 900
+  HARD_EXIT_DAY: 950
+  ATR_PERIOD: 14
+  ATR_MULT: 3.0
+  LOOKBACK: 22
+risk_management:
+  take_profit:
+    type: none
+  stop_loss:
+    type: chandelier
+    atr_period: ATR_PERIOD
+    atr_multiplier: ATR_MULT
+    lookback: LOOKBACK
+  position_sizing:
+    method: percent_equity
+    value: 100
+entry_conditions:
+  logic: AND
+  rules:
+  - name: rule_regimen_ciclo
+    type: halving_cycle
+    condition: between
+    min_days: MIN_DAY
+    max_days: MAX_DAY
+    details: Dias desde el Halving entre MIN_DAY y MAX_DAY (ventana historica de rally)
+  - name: rule_tendencia_alcista
+    type: technical_indicator
+    indicator_1:
+      name: EMA
+      period: FAST
+    operator: crosses_above
+    indicator_2:
+      name: EMA
+      period: SLOW
+    details: EMA(FAST) crosses_above EMA(SLOW)
+exit_conditions:
+  logic: OR
+  rules:
+  - name: rule_fin_ventana_ciclo
+    type: halving_cycle
+    condition: above
+    min_days: HARD_EXIT_DAY
+    details: Cierre forzado a partir de HARD_EXIT_DAY dias post-Halving (fase de distribucion historica)
+  - name: rule_reversion_tendencia
+    type: technical_indicator
+    indicator_1:
+      name: EMA
+      period: FAST
+    operator: crosses_below
+    indicator_2:
+      name: EMA
+      period: SLOW
+    details: EMA(FAST) crosses_below EMA(SLOW)
+equity_curve_management:
+  enabled: false
+  start_trading_at_dd_pct: 30
+  stop_trading_at_dd_pct: 0
