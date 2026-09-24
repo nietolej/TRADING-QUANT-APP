@@ -35,7 +35,7 @@ def render_halving_analyzer():
     state = {
         "scale_mode": "multiplier",      # 'multiplier', 'percentage', 'usd'
         "y_axis_type": "log",            # 'log', 'linear'
-        "time_window": "post_800",       # 'full_1000', 'post_800', 'year_1', 'extended'
+        "time_window": "post_800",       # 'full_1000', 'post_800', 'year_1', 'full_cycle', 'extended'
         "selected_cycles": ["H1", "H2", "H3", "H4", "bench"],
         "is_loading": False
     }
@@ -89,11 +89,12 @@ def render_halving_analyzer():
                     options={
                         'post_800': 'Post-Halving (0 a +800 días)',
                         'year_1': 'Primer Año Post-Halving (0 a +365 días)',
+                        'full_cycle': 'Ciclo Completo Halving-a-Halving (0 a +1400 días)',
                         'full_1000': 'Pre + Post (-180 a +1000 días)',
                         'extended': 'Ciclo Extendido (-365 a +1400 días)'
                     },
                     value=state['time_window']
-                ).props('dense outlined dark options-dense').classes('w-64 text-xs')
+                ).props('dense outlined dark options-dense').classes('w-72 text-xs')
 
             with ui.row().classes('items-center gap-2 flex-wrap'):
                 ui.label('CICLOS:').classes('text-[11px] font-bold text-slate-400 font-mono self-center')
@@ -229,6 +230,8 @@ def render_halving_analyzer():
                 pre_d, post_d = 0, 800
             elif win == 'year_1':
                 pre_d, post_d = 0, 365
+            elif win == 'full_cycle':
+                pre_d, post_d = 0, 1400
             elif win == 'full_1000':
                 pre_d, post_d = 180, 1000
             else:  # extended
