@@ -16,7 +16,8 @@ class Backtester:
         account_mode: str = "spot_cash",
         leverage: float = 1.0,
         initial_base_capital: float = None,
-        entry_on_next_open: bool = True
+        entry_on_next_open: bool = True,
+        trade_start=None
     ):
         self.strategy = strategy
         self.initial_capital = initial_capital
@@ -30,6 +31,11 @@ class Backtester:
         # misma vela que genero la señal (look-ahead). Solo se usa cuando el propio usuario
         # desactiva explicitamente el modo realista, aceptando ese sesgo a cambio de velocidad.
         self.use_vectorbt = (account_mode == "spot_cash") and not entry_on_next_open
+        # Calentamiento de indicadores (walk-forward): las velas anteriores a trade_start solo
+        # alimentan los indicadores; no se opera en ellas y quedan fuera de la equity curve y
+        # de las métricas. Sin esto cada ventana arrancaba "en frío" (EMA/SMA en NaN al
+        # inicio) y perdía parte de sus velas sin posibilidad de dar señal.
+        self.trade_start = pd.Timestamp(trade_start) if trade_start is not None else None
 
     def run_vectorized(self, df: pd.DataFrame) -> dict:
         """
@@ -118,7 +124,7 @@ class Backtester:
         has_tp = tp_type not in ["none", ""]
         
         # En modo Coin-Margined o con SL/TP activos siempre usamos modo iterativo (máxima precisión)
-        if self.account_mode == "coin_margined_hold" or has_sl or has_tp:
+        if self.account_mode == "coin_margined_hold" or has_sl or has_tp or self.trade_start is not None:
             return self.run_iterative(df)
         
         # Sin SL/TP en spot cash intentamos vectorbt; si falla, caemos a iterativo
@@ -363,7 +369,8 @@ class Backtester:
                     )
 
             # ── 3. Señales de entrada: se encolan para el Open siguiente o se ejecutan al close ──
-            if position == 0 and pending_entry_side is None:
+            in_warmup = self.trade_start is not None and timestamp < self.trade_start
+            if position == 0 and pending_entry_side is None and not in_warmup:
                 side = 'long' if row.get('entry_long', False) else ('short' if row.get('entry_short', False) else None)
                 if side:
                     if self.entry_on_next_open:
@@ -392,6 +399,8 @@ class Backtester:
         # Calcular Métricas
         trades_df = pd.DataFrame(trades)
         equity_df = pd.DataFrame(equity).set_index('timestamp')
+        if self.trade_start is not None:
+            equity_df = equity_df[equity_df.index >= self.trade_start]
         
         run_results = {
             "run_id": str(uuid.uuid4()),

@@ -64,15 +64,21 @@ def analyze_robustness(
     # ─────────────────────────────────────────────────────────────
     # A. CONFIGURACIÓN MÁS ROBUSTA (MESETA / VECTORIZED PLATEAU)
     # ─────────────────────────────────────────────────────────────
+    # Una combinación sin operaciones no puede ser "la mejor" ni "la más robusta": con
+    # max_drawdown_pct ganaba justamente por no operar (DD 0%). Sigue contando como vecina.
+    has_trades = (df['total_trades'] > 0).to_numpy()
+    if not has_trades.any():
+        has_trades = np.ones(len(df), dtype=bool)
+    df_ranked = df[has_trades]
     if target_metric == 'profit_factor':
         # Igual que en optimizer._sort_key: un profit_factor "inf" con muestra insuficiente
         # (ver metrics.MIN_TRADES_FOR_RELIABLE_PF) no debe poder ganar la meseta de robustez.
-        effective_metric = df['profit_factor'].where(df['profit_factor_reliable'], -1.0)
+        effective_metric = df_ranked['profit_factor'].where(df_ranked['profit_factor_reliable'], -1.0)
         best_peak_idx = effective_metric.idxmax()
     elif target_metric != 'max_drawdown_pct':
-        best_peak_idx = df[target_metric].idxmax()
+        best_peak_idx = df_ranked[target_metric].idxmax()
     else:
-        best_peak_idx = df['max_drawdown_pct'].abs().idxmin()
+        best_peak_idx = df_ranked['max_drawdown_pct'].abs().idxmin()
     best_peak_row = df.loc[best_peak_idx]
 
     param_steps = {}
@@ -118,14 +124,18 @@ def analyze_robustness(
     else:
         robust_scores = neigh_metric_mean - 0.5 * neigh_metric_std
 
-    coverage_factor = np.minimum(1.0, neigh_counts / (2 ** len(param_keys)))
-    adjusted_robust_scores = robust_scores * (0.7 + 0.3 * coverage_factor)
+    # Vecindad completa en una malla de d parámetros = 3^d puntos (incluido el propio).
+    # La penalización por poca cobertura (bordes/esquinas de la malla, huecos) RESTA
+    # siempre: antes se multiplicaba el score por (0.7 + 0.3*cobertura), y con scores
+    # negativos (siempre con max_drawdown_pct) eso los acercaba a 0, premiando los bordes.
+    coverage_factor = np.minimum(1.0, neigh_counts / (3 ** len(param_keys)))
+    adjusted_robust_scores = robust_scores - np.abs(robust_scores) * 0.3 * (1.0 - coverage_factor)
 
     plateau_scores = []
-    for idx in range(N):
+    for idx in np.flatnonzero(has_trades):
         row = df.iloc[idx]
         plateau_scores.append({
-            'index': idx,
+            'index': int(idx),
             'robust_score': float(adjusted_robust_scores[idx]),
             'neigh_metric_mean': float(neigh_metric_mean[idx]),
             'neigh_metric_std': float(neigh_metric_std[idx]),
@@ -225,7 +235,7 @@ def analyze_robustness(
     if global_score >= 80:
         health_status = 'ALTA ROBUSTEZ (Excelente Tolerancia)'
         health_color = '#10b981'
-        health_desc = 'El espacio de parámetros forma mesetas amplias y estables. El riesgo de sobreajuste es muy bajo y la estrategia tolera cambios en el mercado.'
+        health_desc = 'La mayor parte de la malla es rentable y estable ante cambios de parámetros. Es un indicio favorable, no una prueba: confírmalo con Walk-Forward antes de operar.'
     elif global_score >= 60:
         health_status = 'ROBUSTEZ MODERADA (Aceptable)'
         health_color = '#f59e0b'
