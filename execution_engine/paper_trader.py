@@ -119,6 +119,7 @@ class PaperTrader:
         self._last_open_ts: float = 0.0
         self._zero_pos_reads: int = 0
         self._last_signal_candle = None   # última vela cerrada ya evaluada (modo 'close')
+        self._last_trailing_candle = None  # última vela cerrada ya usada para recalcular el SL dinámico
 
         self._client: Optional[BinanceTestnetClient] = None
         # RLock (no Lock simple) porque _save_state()/to_dict() puede invocarse desde
@@ -142,17 +143,6 @@ class PaperTrader:
     # ──────────────────────────────────────────────────────────────
     # Ciclo de vida
     # ──────────────────────────────────────────────────────────────
-
-    # Tipos de Stop Loss que el backtester SÍ recalcula vela a vela (ver
-    # backtest_engine/backtester.py y RiskManager.update_trailing_sl) pero que este motor
-    # de ejecución en vivo/paper AÚN NO implementa: compute_sl_tp solo calcula el SL una
-    # vez, al abrir la posición, y jamás se vuelve a mover mientras el trade sigue abierto.
-    # PENDIENTE DE ANALIZAR/IMPLEMENTAR: aplicar update_trailing_sl en el loop de polling
-    # de _poll_binance_klines y re-emitir la orden condicional SL en Binance cuando cambie.
-    _LIVE_UNSUPPORTED_SL_TYPES = {
-        "trailing_percent", "trailing", "break_even", "breakeven",
-        "chandelier", "chandelier_exit",
-    }
 
     @staticmethod
     def _fmt_level(price) -> str:
@@ -179,38 +169,6 @@ class PaperTrader:
         if "TP" in legs:
             self._notify(f"ℹ️ '{self.name}' opera sin Take Profit (TP en 0 o sin configurar).")
 
-    def _warn_if_dynamic_sl_unsupported_live(self):
-        """Alerta si la estrategia usa un SL dinámico que solo se respeta en backtest.
-
-        Riesgo: el Stop Loss se fija una sola vez al entrar y nunca se mueve, aunque el
-        backtest con el que se validó la estrategia SÍ lo iba desplazando (protegiendo
-        ganancias / moviendo a break-even). En vivo, el bot queda con más riesgo del que
-        el backtest sugiere. Esto es una funcionalidad pendiente, no un valor por defecto.
-        """
-        try:
-            raw_sl_type = str(
-                self.strategy.risk_manager.sl_config.get("type", "")
-            ).lower().strip().replace(" ", "_")
-            is_dynamic_flagged = (
-                raw_sl_type == "dynamic"
-                and str(self.strategy.risk_manager.sl_config.get("dynamic_method", "")).lower() == "chandelier"
-            )
-            if raw_sl_type in self._LIVE_UNSUPPORTED_SL_TYPES or is_dynamic_flagged:
-                self._notify(
-                    f"⚠️ RIESGO: la estrategia usa Stop Loss tipo '{raw_sl_type}' "
-                    f"(trailing/break-even/chandelier), que en este motor de ejecución en vivo "
-                    f"NO se recalcula tras la entrada — el SL queda fijo en el nivel inicial "
-                    f"durante todo el trade, a diferencia del backtest. El riesgo real puede ser "
-                    f"mayor al esperado. [Pendiente de analizar/implementar]"
-                )
-                logger.warning(
-                    "[%s] SL dinámico '%s' configurado pero no soportado por el motor en vivo "
-                    "(pendiente de implementar trailing/break-even/chandelier en tiempo real).",
-                    self.name, raw_sl_type,
-                )
-        except Exception as e:
-            logger.debug("No se pudo evaluar el tipo de SL dinámico para alerta: %s", e)
-
     def start(self, reset_started_at: bool = True):
         """Descarga histórico de velas y conecta el polling de Binance."""
         if self.is_running:
@@ -227,7 +185,6 @@ class PaperTrader:
             f"🚀 Iniciando Bot '{self.name}' | {self.symbol} {self.timeframe} | "
             f"Balance: {self.current_balance:,.2f} {self.currency}"
         )
-        self._warn_if_dynamic_sl_unsupported_live()
         self._warn_if_sl_tp_disabled()
 
         try:
@@ -295,6 +252,7 @@ class PaperTrader:
             return
 
         self._last_signal_candle = None   # tras (re)iniciar, la última vela cerrada no se trata como señal nueva
+        self._last_trailing_candle = None  # ídem para el recálculo del SL dinámico
         # Recuperar la posición propia (si el bot cayó con una abierta y no llegó a guardarla)
         try:
             self._recover_position_from_ledger()
@@ -828,6 +786,15 @@ class PaperTrader:
             except Exception as exc:
                 logger.warning("Error evaluando la salida por estado: %s", exc)
 
+            # ── SL dinámico (trailing / break-even / chandelier) ─
+            # Solo si la posición sigue abierta tras los chequeos de arriba, y con el mismo
+            # orden que el backtester: el SL/TP se revisó recién con el nivel VIGENTE: el
+            # trailing se recalcula después, para regir desde la vela siguiente.
+            try:
+                self._update_trailing_stop()
+            except Exception as exc:
+                logger.warning("Error actualizando el SL dinámico (trailing): %s", exc)
+
         elif signal_frame is not None:
             # ── Condición de entrada ─────────────────────────────
             try:
@@ -862,6 +829,110 @@ class PaperTrader:
             if tp is not None and price <= tp:
                 return "TP"
         return None
+
+    def _update_trailing_stop(self) -> None:
+        """Recalcula el SL dinámico (trailing_percent/trailing, break_even, chandelier) al
+        cierre de cada vela, con la misma lógica que usa el backtest
+        (RiskManager.update_trailing_sl): solo usa el rango (high/low/ATR) de la última vela
+        YA CERRADA, nunca el de la vela en curso, y una sola vez por vela. Antes de esta
+        función el SL se fijaba al abrir la posición y ya no se movía en el motor en vivo,
+        a diferencia del backtest, que sí lo desplaza vela a vela.
+        """
+        pos = self.position
+        if pos is None or pos.sl_price is None or len(self.klines_df) < 2:
+            return
+
+        closed = self.klines_df.iloc[:-1]
+        closed_ts = closed.index[-1]
+        if closed_ts == self._last_trailing_candle:
+            return
+        self._last_trailing_candle = closed_ts
+
+        risk_mgr = self.strategy.risk_manager
+        raw_sl_type = str(risk_mgr.sl_config.get("type", "")).lower().strip().replace(" ", "_")
+        is_chandelier = raw_sl_type in ("chandelier", "chandelier_exit") or (
+            raw_sl_type == "dynamic"
+            and str(risk_mgr.sl_config.get("dynamic_method", "")).lower() == "chandelier"
+        )
+        if raw_sl_type not in ("trailing_percent", "trailing", "break_even", "breakeven") and not is_chandelier:
+            return  # SL estático (fixed/atr calculado una vez/swing/none): nada que recalcular
+
+        row = closed.iloc[-1]
+        current_atr = None
+        if is_chandelier:
+            atr_period = int(risk_mgr.sl_config.get("atr_period", 14))
+            try:
+                atr_series = risk_mgr.calculate_atr(closed, atr_period)
+                if not atr_series.empty and pd.notna(atr_series.iloc[-1]):
+                    current_atr = float(atr_series.iloc[-1])
+            except Exception:
+                logger.warning("[%s] No se pudo calcular el ATR para el trailing chandelier", self.name, exc_info=True)
+                return
+
+        try:
+            new_sl = risk_mgr.update_trailing_sl(
+                current_sl=pos.sl_price,
+                current_price=float(row["close"]),
+                current_high=float(row["high"]),
+                current_low=float(row["low"]),
+                current_atr=current_atr,
+                side=pos.side,
+                entry_price=pos.entry_price,
+            )
+        except Exception:
+            logger.warning("[%s] Error recalculando el trailing SL", self.name, exc_info=True)
+            return
+
+        if new_sl is None or abs(new_sl - pos.sl_price) < 1e-9:
+            return
+
+        old_sl = pos.sl_price
+        if self.use_testnet and self._client and self._client.api_key and pos.sl_ref is not None:
+            if not self._move_sl_order(pos, new_sl):
+                return  # no se pudo confirmar en Binance: se mantiene el nivel vigente y se reintenta en la vela siguiente
+
+        pos.sl_price = new_sl
+        self._notify(f"🔧 SL dinámico ({raw_sl_type}) actualizado: {self._fmt_level(old_sl)} → {self._fmt_level(new_sl)}")
+        self._save_state()
+
+    def _move_sl_order(self, pos: "Position", new_sl_price: float) -> bool:
+        """Cancela la orden SL vigente en Binance y coloca una nueva en `new_sl_price`.
+
+        Devuelve True cuando es seguro que `_update_trailing_stop` avance `pos.sl_price` al
+        nuevo nivel: o bien la nueva orden quedó colocada, o bien la vieja ya se canceló y
+        `_ensure_exchange_sl_tp` (ciclo de sincronización periódico) repondrá el SL que falta
+        usando ya el nivel actualizado. Devuelve False solo si NO se pudo cancelar la orden
+        vieja (posible error de red o SL ya disparado): en ese caso no se toca nada, para no
+        arriesgar una segunda orden viva encima de la anterior ni dejar la posición sin SL.
+        """
+        sl_type = self.order_types.get("stop_loss", "LIMIT").upper()
+        ok, errors = self._client.cancel_order_refs(self.symbol, [pos.sl_ref])
+        if not ok:
+            logger.warning("[%s] No se pudo cancelar el SL anterior en Binance para el trailing: %s", self.name, errors)
+            return False
+
+        res = self._client.place_futures_sl_tp(
+            self.symbol, pos.side, pos.quantity,
+            sl_price=new_sl_price, tp_price=None,
+            sl_order_type=sl_type, reduce_only=False,
+        )
+        if not res.get("sl_order"):
+            # La orden vieja ya se canceló: no queda ninguna orden SL viva en Binance hasta que
+            # el ciclo de sincronización la reponga (a más tardar en PROTECTION_CHECK_S).
+            pos.sl_ref = None
+            self._trigger_critical_order_alert(
+                "No se pudo colocar la nueva orden SL tras mover el trailing — "
+                "posición temporalmente sin protección en el exchange",
+                {
+                    "Símbolo": self.symbol,
+                    "Nuevo SL": f"{new_sl_price:.4f}",
+                    "Errores": ", ".join(res.get("errors") or []),
+                },
+            )
+            return True
+
+        pos.sl_ref = self._client.order_ref(res["sl_order"])
+        return True
 
     def _trigger_critical_order_alert(self, title: str, details: Optional[dict] = None):
         """Genera una alerta crítica inmediata en logs, estado, Telegram y UI."""

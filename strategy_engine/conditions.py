@@ -19,6 +19,8 @@ class ConditionEvaluator:
             return ConditionEvaluator._eval_onchain(df, rule)
         elif rule_type == "technical_indicator":
             return ConditionEvaluator._eval_technical_indicator(df, rule)
+        elif rule_type == "halving_cycle":
+            return ConditionEvaluator._eval_halving_cycle(df, rule)
         else:
             raise ValueError(f"Regla no soportada: {rule_type}")
             
@@ -100,6 +102,46 @@ class ConditionEvaluator:
         elif op == "is_below": return s1 < s2
         
         return pd.Series(False, index=df.index)
+
+    @staticmethod
+    def _eval_halving_cycle(df: pd.DataFrame, rule: dict) -> pd.Series:
+        """
+        Régimen de ciclo de Halving: True cuando la vela cae en la ventana de días
+        transcurridos desde el Halving más reciente (día 0 = fecha del Halving).
+
+        `condition`: 'between' (min_days <= dias <= max_days, default), 'above'
+        (dias > min_days) o 'below' (dias < max_days). No es una señal de cruce
+        (evento puntual) sino de ESTADO: se mantiene True mientras la vela esté
+        dentro de la ventana, igual que 'onchain_threshold'.
+        """
+        from data_layer.halving_analyzer import HALVING_EVENTS
+
+        idx = df.index
+        if not isinstance(idx, pd.DatetimeIndex):
+            return pd.Series(False, index=df.index)
+
+        condition = rule.get("condition", "between")
+        min_days = float(rule.get("min_days", 0))
+        max_days = float(rule.get("max_days", 10_000))
+
+        idx_utc = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+        halving_dates = sorted(pd.Timestamp(h["date"], tz="UTC") for h in HALVING_EVENTS if h.get("date"))
+
+        # Se recorren los Halvings en orden ascendente: cada fecha alcanzada sobreescribe con
+        # los dias transcurridos desde ESE Halving, dejando siempre vigente el más reciente.
+        days_since = pd.Series(np.nan, index=df.index)
+        for h_date in halving_dates:
+            reached = idx_utc >= h_date
+            if not reached.any():
+                break
+            days_elapsed = (idx_utc - h_date).days
+            days_since[reached] = days_elapsed[reached]
+
+        if condition == "above":
+            return (days_since > min_days).fillna(False)
+        elif condition == "below":
+            return (days_since < max_days).fillna(False)
+        return ((days_since >= min_days) & (days_since <= max_days)).fillna(False)
 
     @staticmethod
     def _eval_onchain(df: pd.DataFrame, rule: dict) -> pd.Series:
