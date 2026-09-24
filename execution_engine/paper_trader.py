@@ -154,6 +154,31 @@ class PaperTrader:
         "chandelier", "chandelier_exit",
     }
 
+    @staticmethod
+    def _fmt_level(price) -> str:
+        return f"{price:.4f}" if price is not None else "sin orden"
+
+    def _warn_if_sl_tp_disabled(self):
+        """Avisa si el bot va a operar sin Stop Loss o sin Take Profit (configurado en 0 o
+        ausente). Desde que el motor en vivo usa la misma regla que el backtest (0 = sin
+        orden) ya no se aplica un 2% / 4% por defecto, así que esto se hace visible."""
+        try:
+            legs = self.strategy.risk_manager.disabled_legs()
+        except Exception:
+            logger.warning("[%s] No se pudo comprobar la configuración de SL/TP", self.name, exc_info=True)
+            return
+        if not legs:
+            return
+        if "SL" in legs:
+            self._notify(
+                f"⚠️ RIESGO: '{self.name}' opera SIN STOP LOSS (SL en 0 o sin configurar). "
+                f"No se colocará orden de stop en Binance: la pérdida por operación no tiene límite "
+                f"hasta la señal de salida.",
+                is_alert=True
+            )
+        if "TP" in legs:
+            self._notify(f"ℹ️ '{self.name}' opera sin Take Profit (TP en 0 o sin configurar).")
+
     def _warn_if_dynamic_sl_unsupported_live(self):
         """Alerta si la estrategia usa un SL dinámico que solo se respeta en backtest.
 
@@ -203,6 +228,7 @@ class PaperTrader:
             f"Balance: {self.current_balance:,.2f} {self.currency}"
         )
         self._warn_if_dynamic_sl_unsupported_live()
+        self._warn_if_sl_tp_disabled()
 
         try:
             self._client = BinanceTestnetClient(use_testnet=self.use_testnet, bot_id=self.bot_id)
@@ -430,7 +456,9 @@ class PaperTrader:
         
         self.strategy = BaseStrategy(self.strategy_yaml_path, custom_parameters=self.custom_parameters)
         self.strategy_name = self.strategy.config.get("strategy_name", os.path.splitext(os.path.basename(self.strategy_yaml_path))[0])
-        
+        if self.is_running:
+            self._warn_if_sl_tp_disabled()
+
         if name is not None and name.strip():
             self.name = name.strip()
         if symbol is not None and symbol.strip() and symbol.strip().upper() != self.symbol:
@@ -453,7 +481,7 @@ class PaperTrader:
         if self.position and not self.klines_df.empty:
             idx = len(self.klines_df) - 1
             try:
-                sl_price, tp_price = self.strategy.risk_manager.compute_sl_tp(self.klines_df, idx, self.position.side)
+                sl_price, tp_price = self.strategy.risk_manager.compute_sl_tp(self.klines_df, idx, self.position.side, strict=True)
                 self.position.sl_price = sl_price
                 self.position.tp_price = tp_price
             except Exception:
@@ -968,7 +996,9 @@ class PaperTrader:
         # Calcular SL y TP usando compute_sl_tp del RiskManager
         idx = len(self.klines_df) - 1
         try:
-            sl_price, tp_price = risk_mgr.compute_sl_tp(self.klines_df, idx, side)
+            # strict=True: SL/TP sin configurar o en 0 = sin esa orden, igual que en el backtest
+            # (antes el motor en vivo aplicaba en silencio un 2% / 4%).
+            sl_price, tp_price = risk_mgr.compute_sl_tp(self.klines_df, idx, side, strict=True)
         except Exception:
             sl_price = price * (0.98 if side == "long" else 1.02)
             tp_price = price * (1.04 if side == "long" else 0.96)
@@ -1163,7 +1193,7 @@ class PaperTrader:
 
         self._notify(
             f"🟢 OPEN {side.upper()} [{entry_type}] | Precio: {price:.4f} | "
-            f"SL ({sl_type}): {sl_price:.4f} | TP ({tp_type}): {tp_price:.4f} | "
+            f"SL ({sl_type}): {self._fmt_level(sl_price)} | TP ({tp_type}): {self._fmt_level(tp_price)} | "
             f"Qty: {quantity:.6f} {base_asset}"
         )
         self._save_state()
@@ -1707,7 +1737,7 @@ class PaperTrader:
         pos = Position(side, entry_price, qty, pd.Timestamp(open_time, tz="UTC"))
         try:
             idx = len(self.klines_df) - 1
-            sl_p, tp_p = self.strategy.risk_manager.compute_sl_tp(self.klines_df, idx, side)
+            sl_p, tp_p = self.strategy.risk_manager.compute_sl_tp(self.klines_df, idx, side, strict=True)
             sl_p, tp_p = self._anchor_sl_tp(sl_p, tp_p, float(self.klines_df["close"].iloc[idx]), entry_price)
         except Exception:
             logger.exception("[%s] compute_sl_tp falló al recuperar la posición; se usa SL/TP de emergencia", self.name)
