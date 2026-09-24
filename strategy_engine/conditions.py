@@ -1,6 +1,56 @@
+import copy
+
 import pandas as pd
 import numpy as np
 import ta
+
+# Operador de "cruce" (evento) -> su equivalente de "estado", para la salida por estado.
+STATE_OPERATOR = {"crosses_below": "is_below", "crosses_above": "is_above"}
+
+
+def state_exit_conditions(exit_conditions: dict):
+    """
+    Versión "por estado" de las reglas de salida: cada cruce se convierte en la condición de
+    estado equivalente (EMA rápida POR DEBAJO de la lenta, en vez de "la cruza hacia abajo").
+    La usa el motor en vivo para salir aunque el evento de cruce no se haya visto, y el
+    backtest para reproducir esa misma regla. Devuelve None si no aplica: sin reglas de cruce
+    técnicas, o con lógica AND y reglas que no se pueden convertir (evaluar solo una parte de
+    un AND cambiaría su significado).
+    """
+    exit_cfg = copy.deepcopy(exit_conditions or {})
+    rules = exit_cfg.get("rules", []) or []
+    state_rules = []
+    for rule in rules:
+        if rule.get("type") == "technical_indicator" and rule.get("operator") in STATE_OPERATOR:
+            rule["operator"] = STATE_OPERATOR[rule["operator"]]
+            state_rules.append(rule)
+    if not state_rules:
+        return None
+    if len(state_rules) != len(rules) and str(exit_cfg.get("logic", "OR")).upper() != "OR":
+        return None
+    exit_cfg["rules"] = state_rules
+    return exit_cfg
+
+
+def is_short_direction(config: dict) -> bool:
+    """Misma regla de dirección en backtest y en vivo ('Short', 'short', ...)."""
+    return "short" in str((config or {}).get("trade_direction", "Long")).strip().lower()
+
+
+def apply_state_exit(df: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """
+    Añade a exit_long/exit_short la salida por estado del motor en vivo. Sin esto el backtest
+    solo salía con el evento de cruce, mientras el bot también sale si al cierre de una vela
+    la condición se cumple como estado: distinto cuando las reglas de salida usan indicadores
+    diferentes a las de entrada (ej. entrar con EMA1>EMA35 y salir con EMA1<EMA10).
+    """
+    cfg = state_exit_conditions((config or {}).get("exit_conditions", {}))
+    if cfg is None:
+        return df
+    state = ConditionEvaluator.evaluate_conditions(df, cfg).fillna(False).astype(bool)
+    col = "exit_short" if is_short_direction(config) else "exit_long"
+    df[col] = df[col].fillna(False).astype(bool) | state if col in df.columns else state
+    return df
 
 class ConditionEvaluator:
     """

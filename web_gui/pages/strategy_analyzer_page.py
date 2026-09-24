@@ -15,7 +15,7 @@ from strategy_engine.risk_management import RiskManager
 from backtest_engine.backtester import Backtester
 from backtest_engine.equity_curve_backtester import EquityCurveBacktester
 from backtest_engine.optimizer import run_grid_search, count_combinations
-from data_layer.market_data import MarketDataManager, normalize_timeframe
+from data_layer.market_data import MarketDataManager, normalize_timeframe, data_symbol, MARKETS, MARKET_COSTS
 from data_layer.storage import SessionLocal, OHLCV, BacktestRun
 from backtest_engine.metrics import calculate_metrics, calculate_equity_curve_metrics
 import yaml
@@ -570,7 +570,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
         # Load available symbols from database
         db = SessionLocal()
         try:
-            available_symbols = [r[0] for r in db.query(OHLCV.symbol).distinct().all()]
+            available_symbols = [r[0] for r in db.query(OHLCV.symbol).distinct().all() if '@' not in r[0]]
         except Exception:
             available_symbols = []
         finally:
@@ -591,6 +591,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
             'fixed_amount': 1.0,
             'commission_pct': 0.1,
             'slippage_pct': 0.05,
+            'data_market': 'spot',
             'account_mode': 'spot_cash',
             'leverage': 1.0,
             
@@ -675,7 +676,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                 # Para estimar capital inicial si se configuró en activo BASE
                 db_temp = SessionLocal()
                 mgr_temp = MarketDataManager(db_temp)
-                first_candle = mgr_temp.get_data(symbol, timeframe, start_dt, end_dt)
+                first_candle = mgr_temp.get_data(data_symbol(symbol, state.get('data_market', 'spot')), timeframe, start_dt, end_dt)
                 db_temp.close()
                 
                 start_price = first_candle.iloc[0]['open'] if not first_candle.empty else 1.0
@@ -719,7 +720,8 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                     acct_mode,
                     lev_val,
                     initial_cap_base,
-                    bool(state.get('entry_on_next_open', True))
+                    bool(state.get('entry_on_next_open', True)),
+                    state.get('data_market', 'spot')
                 )
                 
                 with client:
@@ -1296,6 +1298,27 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                     value=state['symbol'],
                     new_value_mode='add-unique'
                 ).bind_value(state, 'symbol').classes('w-full')
+
+            # Mercado de las velas: para reproducir un bot hay que usar el MISMO mercado en el
+            # que opera (los bots operan Futures; Futures Testnet tiene precios propios).
+            with ui.column().classes('w-56 gap-0'):
+                ui.label('Mercado de datos').classes('text-xs text-gray-500 mb-1')
+                if 'data_market' not in state: state['data_market'] = 'spot'
+                market_combo = ui.select(dict(MARKETS), label='Mercado', value=state['data_market']).bind_value(state, 'data_market').classes('w-full')
+
+                def _on_market_change(e, _prev={'m': state['data_market']}):
+                    # Ajusta comisión/slippage a los del nuevo mercado solo si el usuario no los
+                    # había cambiado (siguen siendo los por defecto del mercado anterior).
+                    old = MARKET_COSTS.get(_prev['m'], MARKET_COSTS['spot'])
+                    new = MARKET_COSTS.get(e.value, MARKET_COSTS['spot'])
+                    for k in ('commission_pct', 'slippage_pct'):
+                        try:
+                            if abs(float(state.get(k)) - old[k]) < 1e-9:
+                                state[k] = new[k]
+                        except (TypeError, ValueError):
+                            state[k] = new[k]
+                    _prev['m'] = e.value
+                market_combo.on_value_change(_on_market_change)
 
             with ui.column().classes('w-32 gap-0'):
                 ui.label('Timeframe').classes('text-xs text-gray-500 mb-1')
@@ -2269,14 +2292,14 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                 </q-tr>
             ''')
 
-        def _sync_load_and_run(strategy_path, custom_params, symbol, timeframe, start_dt, end_dt, initial_capital, sizing_mode, comm_pct, slip_pct, fixed_quote_amt=None, account_mode="spot_cash", leverage=1.0, initial_base_capital=None, entry_on_next_open=True):
+        def _sync_load_and_run(strategy_path, custom_params, symbol, timeframe, start_dt, end_dt, initial_capital, sizing_mode, comm_pct, slip_pct, fixed_quote_amt=None, account_mode="spot_cash", leverage=1.0, initial_base_capital=None, entry_on_next_open=True, data_market='spot'):
             db = SessionLocal()
             try:
                 market_mgr = MarketDataManager(db)
-                df = market_mgr.get_data_refreshed(symbol, timeframe, start_dt, end_dt)
+                df = market_mgr.get_data_refreshed(data_symbol(symbol, data_market), timeframe, start_dt, end_dt)
                     
                 if df.empty:
-                    return {'error': f"No hay datos históricos disponibles para {symbol} en {timeframe}."}
+                    return {'error': f"No hay datos históricos disponibles para {symbol} ({MARKETS.get(data_market, data_market)}) en {timeframe}."}
                     
                 strategy = BaseStrategy(strategy_path, custom_parameters=custom_params)
                 strategy.symbol = symbol
@@ -2879,8 +2902,13 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
 
         btn_portfolio.on_click(on_go_to_portfolio if on_go_to_portfolio else open_portfolio_modal)
 
-    def select_strategy(filename, symbol=None, timeframe=None, custom_params=None):
+    def select_strategy(filename, symbol=None, timeframe=None, custom_params=None, market_settings=None):
         try:
+            # Mercado y costos con los que se optimizó: sin esto el analizador volvía a Spot y
+            # el resultado "llevado" desde el optimizador no se reproducía.
+            for k, v in (market_settings or {}).items():
+                if v is not None:
+                    state[k] = v
             if filename in strategies:
                 state['strategy_name'] = filename
                 strat_combo.value = filename

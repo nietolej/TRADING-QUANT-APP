@@ -66,6 +66,12 @@ class Subscription:
         """(kline_en_curso, mejor_bid_ask) más recientes, o None si aún no llegaron."""
         return self._stream.latest()
 
+    def latest_closed(self) -> Optional[Dict[str, Any]]:
+        """Última vela CERRADA (mensaje con x=true) o None. latest() solo guarda la actualización
+        más reciente: si la primera de la vela nueva llega antes de que el bot lea, el cierre final
+        de la anterior se perdía y la señal se calculaba con un precio de hasta ~250 ms antes."""
+        return self._stream.latest_closed()
+
     def kline_changed(self) -> bool:
         """True si la vela cambió desde la última vez que se preguntó (evita reevaluar lo mismo)."""
         seq = self._stream.kline_seq
@@ -92,6 +98,7 @@ class SymbolStream:
         self._subs: List[Subscription] = []
         self._lock = threading.Lock()
         self._kline: Optional[Dict[str, Any]] = None
+        self._closed_kline: Optional[Dict[str, Any]] = None
         self._book: Optional[Dict[str, Any]] = None
         self._kline_at = 0.0
         self._book_at = 0.0
@@ -133,6 +140,10 @@ class SymbolStream:
         with self._lock:
             return self._kline, self._book
 
+    def latest_closed(self):
+        with self._lock:
+            return self._closed_kline
+
     def is_fresh(self) -> bool:
         now = time.monotonic()
         return (
@@ -155,6 +166,8 @@ class SymbolStream:
             }
             with self._lock:
                 self._kline, self._kline_at = kline, now
+                if kline["closed"]:
+                    self._closed_kline = kline
                 self.kline_seq += 1
                 subs = list(self._subs)
         elif event == "bookTicker":

@@ -5,6 +5,7 @@ import uuid
 import json
 from strategy_engine.base_strategy import BaseStrategy
 from .metrics import calculate_metrics, calculate_equity_curve_metrics
+from strategy_engine.conditions import apply_state_exit
 
 
 class _SpotBook:
@@ -148,8 +149,8 @@ class EquityCurveBacktester:
         cl_start = ec_config.get("cl_start", 3)
         cl_stop = ec_config.get("cl_stop", 0)
 
-        # 2. Generar señales (vectorizado)
-        df = self.strategy.generate_signals(df)
+        # 2. Generar señales (vectorizado) + salida por estado del motor en vivo
+        df = apply_state_exit(self.strategy.generate_signals(df), self.strategy.config)
         rm = self.strategy.risk_manager
 
         # 3. Cuentas Virtual y Real

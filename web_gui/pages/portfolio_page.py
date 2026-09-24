@@ -457,7 +457,7 @@ def render_portfolio_page():
     def _get_initial_symbols():
         db = SessionLocal()
         try:
-            db_symbols = [r[0] for r in db.query(OHLCV.symbol).distinct().all()]
+            db_symbols = [r[0] for r in db.query(OHLCV.symbol).distinct().all() if '@' not in r[0]]
         except Exception:
             db_symbols = []
         finally:

@@ -524,7 +524,7 @@ class LiveMonitorPage:
             with ui.card().classes('w-full p-3 bg-slate-900/90 border border-slate-700 rounded-lg mb-3'):
                 with ui.row().classes('items-center justify-between w-full mb-2'):
                     ui.label('⚡ Tipos de Órdenes de Ejecución').classes('text-xs font-bold text-amber-400')
-                    ui.badge('Por defecto: Señales Market / SL-TP Limit', color='slate-800').props('rounded').classes('text-[10px] text-slate-400')
+                    ui.badge('Por defecto: Señales y SL Market / TP Limit', color='slate-800').props('rounded').classes('text-[10px] text-slate-400')
                 with ui.grid(columns=2).classes('w-full gap-2'):
                     new_entry_type = ui.select(
                         {'MARKET': '⚡ Entrada: MARKET', 'LIMIT': '🎯 Entrada: LIMIT'},
@@ -535,8 +535,8 @@ class LiveMonitorPage:
                         value='MARKET', label='Orden de Salida'
                     ).classes('w-full text-xs')
                     new_sl_type = ui.select(
-                        {'LIMIT': '🛡️ Stop Loss: LIMIT (Predet.)', 'MARKET': '⚡ Stop Loss: MARKET'},
-                        value='LIMIT', label='Orden de Stop Loss'
+                        {'MARKET': '⚡ Stop Loss: MARKET (Predet.)', 'LIMIT': '🛡️ Stop Loss: LIMIT (puede no ejecutarse)'},
+                        value='MARKET', label='Orden de Stop Loss'
                     ).classes('w-full text-xs')
                     new_tp_type = ui.select(
                         {'LIMIT': '🎯 Take Profit: LIMIT (Predet.)', 'MARKET': '⚡ Take Profit: MARKET'},
@@ -547,6 +547,11 @@ class LiveMonitorPage:
                     new_signal_mode = ui.select(
                         {'close': '🕯️ Al cierre de vela (recomendado)', 'intrabar': '⚡ Intravela (en vivo)'},
                         value='close', label='Evaluación de señales'
+                    ).classes('w-full text-xs col-span-2')
+                    # Mismos modos que el Analizador de Estrategias, para operar con el tamaño backtesteado.
+                    new_sizing = ui.select(
+                        {'compounding': '📈 Tamaño: Interés compuesto (100% saldo)', 'fixed_fractional': '🛡️ Tamaño: Riesgo fijo (1% por trade)', 'fixed_amount': '💵 Tamaño: Monto fijo (saldo inicial)'},
+                        value='compounding', label='Tamaño de posición (igual que en el Analizador)'
                     ).classes('w-full text-xs col-span-2')
 
             # Contenedor de parámetros de estrategia
@@ -624,6 +629,7 @@ class LiveMonitorPage:
                         'stop_loss': new_sl_type.value,
                         'take_profit': new_tp_type.value,
                         'signal_mode': new_signal_mode.value,
+                        'sizing': new_sizing.value,
                     })
 
                     self.selected_bot_id = new_bot.bot_id
@@ -724,7 +730,7 @@ class LiveMonitorPage:
             with ui.card().classes('w-full p-3 bg-slate-900/90 border border-slate-700 rounded-lg mb-3'):
                 with ui.row().classes('items-center justify-between w-full mb-2'):
                     ui.label('⚡ Tipos de Órdenes de Ejecución').classes('text-xs font-bold text-amber-400')
-                    ui.badge('Por defecto: Señales Market / SL-TP Limit', color='slate-800').props('rounded').classes('text-[10px] text-slate-400')
+                    ui.badge('Por defecto: Señales y SL Market / TP Limit', color='slate-800').props('rounded').classes('text-[10px] text-slate-400')
                 with ui.grid(columns=2).classes('w-full gap-2'):
                     edit_entry_type = ui.select(
                         {'MARKET': '⚡ Entrada: MARKET', 'LIMIT': '🎯 Entrada: LIMIT'},
@@ -735,8 +741,8 @@ class LiveMonitorPage:
                         value=bot_ord_types.get('exit', 'MARKET'), label='Orden de Salida'
                     ).classes('w-full text-xs')
                     edit_sl_type = ui.select(
-                        {'LIMIT': '🛡️ Stop Loss: LIMIT (Predet.)', 'MARKET': '⚡ Stop Loss: MARKET'},
-                        value=bot_ord_types.get('stop_loss', 'LIMIT'), label='Orden de Stop Loss'
+                        {'MARKET': '⚡ Stop Loss: MARKET (Predet.)', 'LIMIT': '🛡️ Stop Loss: LIMIT (puede no ejecutarse)'},
+                        value=bot_ord_types.get('stop_loss', 'MARKET'), label='Orden de Stop Loss'
                     ).classes('w-full text-xs')
                     edit_tp_type = ui.select(
                         {'LIMIT': '🎯 Take Profit: LIMIT (Predet.)', 'MARKET': '⚡ Take Profit: MARKET'},
@@ -745,6 +751,10 @@ class LiveMonitorPage:
                     edit_signal_mode = ui.select(
                         {'close': '🕯️ Al cierre de vela (recomendado)', 'intrabar': '⚡ Intravela (en vivo)'},
                         value=bot_ord_types.get('signal_mode', 'close'), label='Evaluación de señales'
+                    ).classes('w-full text-xs col-span-2')
+                    edit_sizing = ui.select(
+                        {'compounding': '📈 Tamaño: Interés compuesto (100% saldo)', 'fixed_fractional': '🛡️ Tamaño: Riesgo fijo (1% por trade)', 'fixed_amount': '💵 Tamaño: Monto fijo (saldo inicial)'},
+                        value=bot_ord_types.get('sizing', 'compounding'), label='Tamaño de posición (igual que en el Analizador)'
                     ).classes('w-full text-xs col-span-2')
 
             ui.label('Parámetros de la Estrategia:').classes('text-sm font-semibold text-gray-300 mt-1 mb-1')
@@ -801,6 +811,7 @@ class LiveMonitorPage:
                         'stop_loss': edit_sl_type.value,
                         'take_profit': edit_tp_type.value,
                         'signal_mode': edit_signal_mode.value,
+                        'sizing': edit_sizing.value,
                     }
                 )
 
