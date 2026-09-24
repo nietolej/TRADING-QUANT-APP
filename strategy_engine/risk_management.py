@@ -29,6 +29,29 @@ class RiskManager:
         self.tp_config = self.config.get("take_profit", {})
         self.sizing_config = self.config.get("position_sizing", {})
 
+    _PCT_SL_TYPES = ("fixed", "percentage", "trailing_percent", "trailing", "break_even", "breakeven")
+    _PCT_TP_TYPES = ("fixed", "percentage", "partial", "multi_tp")
+
+    def disabled_legs(self) -> list:
+        """
+        Patas ('SL', 'TP') que compute_sl_tp(strict=True) deja en None: sin configurar, tipo
+        'none' o porcentaje 0. Sirve para avisar antes de operar sin esa protección.
+        """
+        legs = []
+        for leg, cfg, pct_types in (("SL", self.sl_config, self._PCT_SL_TYPES),
+                                    ("TP", self.tp_config, self._PCT_TP_TYPES)):
+            raw_type = str((cfg or {}).get("type", "none")).lower().strip().replace(" ", "_")
+            if raw_type in ("none", ""):
+                legs.append(leg)
+                continue
+            if raw_type in pct_types:
+                try:
+                    if float(cfg.get("value", 1.0)) == 0:
+                        legs.append(leg)
+                except (TypeError, ValueError):
+                    pass
+        return legs
+
     def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
         """Calcula el Average True Range (ATR)."""
         period = max(1, int(period))
@@ -53,8 +76,8 @@ class RiskManager:
         -13% o incluso por encima del precio de compra con un SL configurado de -1%.
 
         `strict`: con True, un SL/TP ausente en la configuracion o porcentual de valor 0
-        significa "sin SL/TP" (None). Con False se conserva el comportamiento historico
-        (ausente o 0 -> 2% SL / 4% TP), que es el que usa el motor en vivo (paper_trader).
+        significa "sin SL/TP" (None). Lo usan el backtest y el motor en vivo (paper_trader).
+        Con False se conserva el comportamiento historico (ausente o 0 -> 2% SL / 4% TP).
         """
         if entry_price is None:
             entry_price = float(df['close'].iloc[entry_index])
