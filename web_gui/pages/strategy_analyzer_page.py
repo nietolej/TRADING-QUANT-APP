@@ -44,10 +44,7 @@ def _sync_run_portfolio_backtest(portfolio_items, total_capital, start_dt, end_d
 
             allocated_cap = total_capital * (weight_pct / 100.0)
 
-            df = market_mgr.get_data(symbol, timeframe, start_dt, end_dt)
-            if df.empty:
-                market_mgr.update_historical_data(symbol, timeframe, start_dt, end_dt)
-                df = market_mgr.get_data(symbol, timeframe, start_dt, end_dt)
+            df = market_mgr.get_data_refreshed(symbol, timeframe, start_dt, end_dt)
 
             if df.empty:
                 continue
@@ -722,7 +719,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                     acct_mode,
                     lev_val,
                     initial_cap_base,
-                    bool(state.get('entry_on_next_open', False))
+                    bool(state.get('entry_on_next_open', True))
                 )
                 
                 with client:
@@ -1453,6 +1450,7 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
         # ── Fila 3.5: Modo de Cuenta (Spot Efectivo vs Hold Colateral Coin-M) ──
         if 'account_mode' not in state: state['account_mode'] = 'spot_cash'
         if 'leverage' not in state: state['leverage'] = 1.0
+        if 'entry_on_next_open' not in state: state['entry_on_next_open'] = True
 
         with ui.row().classes('w-full gap-3 items-center mt-2 bg-slate-900/70 p-2.5 rounded-xl border border-slate-800 flex-wrap'):
             with ui.row().classes('items-center gap-2 min-w-[240px]'):
@@ -1481,6 +1479,15 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
 
             acct_mode_select.on_value_change(_update_acct_mode_ui)
             _update_acct_mode_ui()
+
+            # Mismo modo de ejecución que el Optimizador y el Simulador de Portafolio
+            # (entrada al Open de la vela siguiente). Antes este valor nunca se exponía en la
+            # UI y quedaba siempre en False: el analizador entraba al close de la vela de la
+            # señal y sus resultados no coincidían con los del optimizador para los mismos
+            # parámetros.
+            with ui.column().classes('gap-0 min-w-[220px]'):
+                ui.switch('Entrar al Open de la vela siguiente (realista)').bind_value(state, 'entry_on_next_open').props('dense color=emerald').classes('text-xs text-slate-200')
+                ui.label('Desactivar = entrar al cierre de la vela de la señal (optimista)').classes('text-[10px] text-slate-400')
 
         # ── Fila 4: Filtro de Equity Curve (Backtest Virtual vs Real) ──
         if 'ec_enabled' not in state: state['ec_enabled'] = False
@@ -2262,14 +2269,11 @@ def render_strategy_analyzer(on_back_to_builder=None, on_go_to_live=None, on_go_
                 </q-tr>
             ''')
 
-        def _sync_load_and_run(strategy_path, custom_params, symbol, timeframe, start_dt, end_dt, initial_capital, sizing_mode, comm_pct, slip_pct, fixed_quote_amt=None, account_mode="spot_cash", leverage=1.0, initial_base_capital=None, entry_on_next_open=False):
+        def _sync_load_and_run(strategy_path, custom_params, symbol, timeframe, start_dt, end_dt, initial_capital, sizing_mode, comm_pct, slip_pct, fixed_quote_amt=None, account_mode="spot_cash", leverage=1.0, initial_base_capital=None, entry_on_next_open=True):
             db = SessionLocal()
             try:
                 market_mgr = MarketDataManager(db)
-                df = market_mgr.get_data(symbol, timeframe, start_dt, end_dt)
-                if df.empty:
-                    market_mgr.update_historical_data(symbol, timeframe, start_dt, end_dt)
-                    df = market_mgr.get_data(symbol, timeframe, start_dt, end_dt)
+                df = market_mgr.get_data_refreshed(symbol, timeframe, start_dt, end_dt)
                     
                 if df.empty:
                     return {'error': f"No hay datos históricos disponibles para {symbol} en {timeframe}."}
