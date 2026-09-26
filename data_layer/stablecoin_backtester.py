@@ -123,12 +123,23 @@ class StablecoinBacktester:
         stop_loss_pct: float = 8.0,
         take_profit_pct: float = 45.0,
         trailing_stop: bool = True,
+        flat_asset: str = "usdt",
         start_date: Optional[str] = None,
         end_date: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Ejecuta la simulación cuantitativa trade-a-trade sobre el histórico.
+
+        :param flat_asset: Activo en el que se mantiene el capital mientras la
+            estrategia está fuera de posición ("en hold"). 'usdt' lo deja como
+            efectivo sin exposición al mercado (comportamiento clásico). 'btc'
+            mantiene el capital expuesto al precio de BTC incluso mientras la
+            estrategia no está operando activamente (sin comisión/slippage de
+            reentrada, ya que el capital nunca deja de estar en BTC).
         """
+        flat_asset = (flat_asset or "usdt").lower()
+        if flat_asset not in ("usdt", "btc"):
+            flat_asset = "usdt"
         if self.df_merged is None or self.df_merged.empty:
             self._load_datasets()
 
@@ -167,7 +178,8 @@ class StablecoinBacktester:
                 "min_post_halving_days": min_post_halving_days,
                 "max_post_halving_days": max_post_halving_days,
                 "SL": stop_loss_pct,
-                "TP": take_profit_pct
+                "TP": take_profit_pct,
+                "flat_asset": flat_asset
             }
         }
 
@@ -187,12 +199,16 @@ class StablecoinBacktester:
         entry_date = None
         entry_halving_day = 0
         highest_price_in_trade = 0.0
+        flat_btc_amount = 0.0 # Cantidad de BTC mantenida como exposición pasiva mientras se está "en hold" (solo si flat_asset == 'btc')
 
         trades_list = []
         equity_records = []
 
         initial_btc_price = float(df_signals.iloc[0]['close'])
         bnh_btc_amount = (initial_capital * (1.0 - comm_factor)) / (initial_btc_price * (1.0 + slip_factor))
+
+        if flat_asset == "btc":
+            flat_btc_amount = capital / initial_btc_price if initial_btc_price > 0 else 0.0
 
         for i in range(len(df_signals)):
             row = df_signals.iloc[i]
@@ -271,8 +287,21 @@ class StablecoinBacktester:
                     entry_price = 0.0
                     highest_price_in_trade = 0.0
 
+                    # Si el "hold" se mantiene en BTC en vez de efectivo, el capital
+                    # recién liberado se reconvierte de inmediato en exposición pasiva
+                    # a BTC (sin comisión/slippage adicional: es solo contabilidad de
+                    # a qué activo queda expuesto el capital, no una operación nueva).
+                    if flat_asset == "btc":
+                        flat_btc_amount = capital / curr_close if curr_close > 0 else 0.0
+
             # 2. Si no estamos en posición, evaluar entrada
             elif is_entry_signal and capital > 10.0:
+                # Si el capital estaba parqueado como exposición pasiva a BTC, se
+                # marca a mercado antes de calcular el tamaño de la nueva posición.
+                if flat_asset == "btc" and flat_btc_amount > 0:
+                    capital = flat_btc_amount * curr_close
+                    flat_btc_amount = 0.0
+
                 exec_entry_price = curr_close * (1.0 + slip_factor)
                 fee = capital * comm_factor
                 capital_after_fee = capital - fee
@@ -284,7 +313,12 @@ class StablecoinBacktester:
                 highest_price_in_trade = curr_high
 
             # 3. Registrar Equity diario
-            current_portfolio_value = (position * curr_close) if position > 0 else capital
+            if position > 0:
+                current_portfolio_value = position * curr_close
+            elif flat_asset == "btc" and flat_btc_amount > 0:
+                current_portfolio_value = flat_btc_amount * curr_close
+            else:
+                current_portfolio_value = capital
             bnh_value = bnh_btc_amount * curr_close
 
             equity_records.append({

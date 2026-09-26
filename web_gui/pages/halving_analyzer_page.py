@@ -1640,6 +1640,7 @@ def render_halving_analyzer():
             "stop_loss_pct": 12.0,
             "take_profit_pct": 60.0,
             "trailing_stop": False,
+            "flat_asset": "usdt",
             "commission_pct": 0.1,
             "slippage_pct": 0.05,
             "last_results": None
@@ -1729,7 +1730,8 @@ def render_halving_analyzer():
                                 max_post_halving_days=bt_state["max_post_halving_days"],
                                 stop_loss_pct=bt_state["stop_loss_pct"],
                                 take_profit_pct=bt_state["take_profit_pct"],
-                                trailing_stop=bt_state["trailing_stop"]
+                                trailing_stop=bt_state["trailing_stop"],
+                                flat_asset=bt_state["flat_asset"]
                             )
                         )
                     except Exception as err:
@@ -1843,6 +1845,17 @@ def render_halving_analyzer():
                                 ).props('dense outlined dark').classes('w-1/2 text-xs')
 
                             bt_cap_in = ui.number('Capital Inicial ($ USD)', value=bt_state['initial_capital'], min=100, step=1000).props('dense outlined dark').classes('w-full text-xs')
+
+                            bt_flat_asset_in = ui.select(
+                                options={
+                                    'usdt': 'USDT / Cash (sin exposición al mercado)',
+                                    'btc': 'BTC (mantener exposición mientras no se opera)'
+                                },
+                                value=bt_state['flat_asset'],
+                                label='Activo en Hold (fuera de posición)'
+                            ).props('dense outlined dark options-dense').classes('w-full text-xs')
+                            bt_flat_asset_in.tooltip('Qué activo mantiene el capital mientras la estrategia está "en hold" (sin señal de entrada activa): USDT lo deja como efectivo sin riesgo; BTC lo mantiene expuesto al precio de BTC incluso fuera de posición.')
+
                             bt_trail_in = ui.checkbox('Trailing Stop', value=bt_state['trailing_stop']).props('dense dark color=teal').classes('text-xs font-semibold text-slate-300')
 
                     # Botón Ejecutar
@@ -1931,6 +1944,7 @@ def render_halving_analyzer():
                     bt_state["stop_loss_pct"] = float(bt_sl_in.value or 0.0)
                     bt_state["take_profit_pct"] = float(bt_tp_in.value or 0.0)
                     bt_state["trailing_stop"] = bool(bt_trail_in.value)
+                    bt_state["flat_asset"] = str(bt_flat_asset_in.value or 'usdt')
 
                     try:
                         loop = asyncio.get_event_loop()
@@ -1953,7 +1967,8 @@ def render_halving_analyzer():
                                 max_post_halving_days=bt_state["max_post_halving_days"],
                                 stop_loss_pct=bt_state["stop_loss_pct"],
                                 take_profit_pct=bt_state["take_profit_pct"],
-                                trailing_stop=bt_state["trailing_stop"]
+                                trailing_stop=bt_state["trailing_stop"],
+                                flat_asset=bt_state["flat_asset"]
                             )
                         )
                         ui.notify('¡Simulación de backtest completada!', type='positive', position='top-right')
@@ -2342,7 +2357,8 @@ def render_halving_analyzer():
                             max_post_halving_days=bt_state["max_post_halving_days"],
                             stop_loss_pct=bt_state["stop_loss_pct"],
                             take_profit_pct=bt_state["take_profit_pct"],
-                            trailing_stop=bt_state["trailing_stop"]
+                            trailing_stop=bt_state["trailing_stop"],
+                            flat_asset=bt_state["flat_asset"]
                         )
                     )
                 except Exception as bt_err:
