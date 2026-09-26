@@ -62,6 +62,9 @@ def render_halving_analyzer():
         # --- KPI CARDS SUPERIORES ---
         kpi_container = ui.row().classes('w-full grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4')
 
+        # --- BANNER DE SEÑAL DE DESVIACIÓN DE CICLO (Z-SCORE) ---
+        signal_banner_container = ui.column().classes('w-full')
+
         # --- CONTROLES DE GRÁFICO ---
         with ui.row().classes('w-full items-center justify-between flex-wrap gap-3 bg-[#111827] p-3 rounded-xl border border-[#1e293b] shadow-md'):
             with ui.row().classes('items-center flex-wrap gap-3'):
@@ -221,6 +224,44 @@ def render_halving_analyzer():
                     with ui.row().classes('items-baseline gap-2 mt-1'):
                         ui.label(f'Multiplicador: {base_mult:.2f}x').classes('text-xs font-bold text-slate-300 font-mono')
                     ui.label(f'Ventana estimada pico: {peak_window}').classes('text-[10px] text-slate-400 font-mono mt-1')
+
+        def render_signal_banner():
+            signal_banner_container.clear()
+            deviation = analyzer.calculate_cycle_deviation_signal()
+            if not deviation:
+                return
+
+            z = deviation['current_z_score']
+            color = deviation['signal_color']
+            label = deviation['signal_label']
+            band_pos = deviation['current_band_position_pct']
+            mult = deviation['current_multiplier']
+            mean_mult = deviation['bench_mean']
+            rel_day = deviation['current_rel_day']
+
+            with signal_banner_container:
+                with ui.row().classes('w-full items-center justify-between flex-wrap gap-4 p-4 rounded-xl shadow-lg').style(
+                    f'background: linear-gradient(90deg, {color}1A 0%, #111827 65%); border: 1px solid {color}55;'
+                ):
+                    with ui.row().classes('items-center gap-3'):
+                        ui.icon('speed', size='1.8rem').style(f'color: {color}')
+                        with ui.column().classes('gap-0'):
+                            with ui.row().classes('items-center gap-2'):
+                                ui.label('SEÑAL DE DESVIACIÓN DE CICLO (Z-SCORE)').classes('text-[11px] font-bold text-slate-400 tracking-wider font-mono')
+                                ui.badge('EXPERIMENTAL', color='grey-8').classes('text-[9px] font-mono')
+                            ui.label(label).classes('text-lg font-black font-heading').style(f'color: {color}')
+                            ui.label(deviation['interpretation']).classes('text-xs text-slate-400 max-w-2xl mt-0.5')
+
+                    with ui.row().classes('items-center gap-6 font-mono'):
+                        with ui.column().classes('items-end gap-0'):
+                            ui.label('Z-SCORE (H+' + str(rel_day) + 'd)').classes('text-[10px] text-slate-500')
+                            ui.label(f'{z:+.2f}σ').classes('text-xl font-black').style(f'color: {color}')
+                        with ui.column().classes('items-end gap-0'):
+                            ui.label('MÚLTIPLO ACTUAL vs. PROMEDIO').classes('text-[10px] text-slate-500')
+                            ui.label(f'{mult:.2f}x vs {mean_mult:.2f}x').classes('text-sm font-bold text-slate-200')
+                        with ui.column().classes('items-end gap-0'):
+                            ui.label('POSICIÓN EN BANDA HISTÓRICA').classes('text-[10px] text-slate-500')
+                            ui.label(f'{band_pos:.0f}%').classes('text-sm font-bold text-slate-200')
 
         def build_main_figure() -> go.Figure:
             # Configurar ventana
@@ -2310,6 +2351,7 @@ def render_halving_analyzer():
 
                 # Re-renderizar todos los componentes
                 render_kpi_cards()
+                render_signal_banner()
                 render_main_chart()
                 render_growth_tab()
                 render_stables_tab()
@@ -2337,6 +2379,7 @@ def render_halving_analyzer():
 
         # Render inicial de todas las vistas
         render_kpi_cards()
+        render_signal_banner()
         render_main_chart()
         render_growth_tab()
         render_stables_tab()

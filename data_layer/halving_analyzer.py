@@ -862,6 +862,93 @@ class BTCHalvingAnalyzer:
         }
 
     @_memoized
+    def calculate_cycle_deviation_signal(self) -> Dict[str, Any]:
+        """
+        Mide cuántas desviaciones estándar se aleja el múltiplo actual de H4
+        del promedio de H1-H3 en el mismo día relativo post-Halving, y traduce
+        esa distancia en una señal de posicionamiento (acumulación/neutral/
+        distribución). Un z-score muy negativo indica que el ciclo actual está
+        rezagado frente a su historia (zona de acumulación relativa); uno muy
+        positivo indica euforia relativa frente a ciclos pasados.
+        """
+        series_dict = self.get_halving_series(pre_days=0, post_days=1200)
+        h4_df = series_dict.get("H4")
+        if h4_df is None or h4_df.empty:
+            return {}
+
+        completed = {h_id: df for h_id, df in series_dict.items() if df.attrs.get('is_completed', False)}
+        if len(completed) < 2:
+            return {}
+
+        max_day = int(h4_df['rel_day'].max())
+        rows = []
+        for d in range(0, max_day + 1):
+            vals = []
+            for df_c in completed.values():
+                match = df_c[df_c['rel_day'] == d]
+                if not match.empty:
+                    vals.append(float(match.iloc[0]['multiplier']))
+            h4_match = h4_df[h4_df['rel_day'] == d]
+            if len(vals) < 2 or h4_match.empty:
+                continue
+
+            mean_v = float(np.mean(vals))
+            std_v = float(np.std(vals, ddof=1))
+            h4_val = float(h4_match.iloc[0]['multiplier'])
+            z = (h4_val - mean_v) / std_v if std_v > 0 else 0.0
+            min_v, max_v = float(np.min(vals)), float(np.max(vals))
+            band_pos = ((h4_val - min_v) / (max_v - min_v) * 100.0) if max_v > min_v else 50.0
+
+            rows.append({
+                "rel_day": d,
+                "h4_multiplier": round(h4_val, 4),
+                "bench_mean": round(mean_v, 4),
+                "bench_std": round(std_v, 4),
+                "bench_min": round(min_v, 4),
+                "bench_max": round(max_v, 4),
+                "z_score": round(z, 3),
+                "band_position_pct": round(band_pos, 1)
+            })
+
+        if not rows:
+            return {}
+
+        current = rows[-1]
+        z_now = current["z_score"]
+
+        if z_now <= -1.5:
+            signal, label, color = "STRONG_ACCUMULATION", "Acumulación Fuerte", "#10b981"
+            interpretation = "El ciclo actual está muy por debajo del comportamiento histórico en este punto temporal. Zona de posible acumulación relativa si se mantiene la tesis estructural del mercado, o señal de ruptura de patrón si el mercado ha madurado."
+        elif z_now <= -0.5:
+            signal, label, color = "ACCUMULATION", "Acumulación", "#34d399"
+            interpretation = "El múltiplo actual está por debajo del promedio histórico. El ciclo va rezagado frente a H1-H3 en el mismo día relativo."
+        elif z_now < 0.5:
+            signal, label, color = "NEUTRAL", "Neutral", "#94a3b8"
+            interpretation = "El ciclo actual se mueve dentro del rango normal respecto al promedio histórico."
+        elif z_now < 1.5:
+            signal, label, color = "DISTRIBUTION_WATCH", "Vigilancia de Distribución", "#fbbf24"
+            interpretation = "El múltiplo actual supera el promedio histórico. Vigilar señales de sobreextensión."
+        else:
+            signal, label, color = "STRONG_DISTRIBUTION", "Distribución Fuerte / Euforia", "#f87171"
+            interpretation = "El ciclo actual está muy por encima del comportamiento histórico. Zona de posible euforia/distribución relativa."
+
+        return {
+            "series": rows,
+            "current_rel_day": current["rel_day"],
+            "current_multiplier": current["h4_multiplier"],
+            "current_z_score": z_now,
+            "current_band_position_pct": current["band_position_pct"],
+            "bench_mean": current["bench_mean"],
+            "bench_std": current["bench_std"],
+            "bench_min": current["bench_min"],
+            "bench_max": current["bench_max"],
+            "signal": signal,
+            "signal_label": label,
+            "signal_color": color,
+            "interpretation": interpretation
+        }
+
+    @_memoized
     def calculate_periodic_growth_analysis(
         self,
         timeframe: str = "month",
