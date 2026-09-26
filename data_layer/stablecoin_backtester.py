@@ -124,6 +124,7 @@ class StablecoinBacktester:
         take_profit_pct: float = 45.0,
         trailing_stop: bool = True,
         flat_asset: str = "usdt",
+        initial_capital_btc: Optional[float] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -136,6 +137,10 @@ class StablecoinBacktester:
             mantiene el capital expuesto al precio de BTC incluso mientras la
             estrategia no está operando activamente (sin comisión/slippage de
             reentrada, ya que el capital nunca deja de estar en BTC).
+        :param initial_capital_btc: Si se especifica, el capital inicial se
+            denomina en BTC en vez de USD: se convierte a `initial_capital`
+            (USD) usando el precio de cierre del primer día simulado, y este
+            parámetro tiene prioridad sobre `initial_capital`.
         """
         flat_asset = (flat_asset or "usdt").lower()
         if flat_asset not in ("usdt", "btc"):
@@ -185,6 +190,11 @@ class StablecoinBacktester:
 
         strat = StablecoinEmissionEMAStrategy(strategy_config)
         df_signals = strat.generate_signals(df)
+
+        # Si el capital inicial se especificó en BTC, convertirlo a USD usando
+        # el precio de cierre del primer día simulado.
+        if initial_capital_btc is not None and initial_capital_btc > 0:
+            initial_capital = float(initial_capital_btc) * float(df_signals.iloc[0]['close'])
 
         # -------------------------------------------------------------
         # SIMULACIÓN ITERATIVA DE TRADES (SIN LOOK-AHEAD BIAS)

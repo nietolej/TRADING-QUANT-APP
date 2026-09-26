@@ -1626,6 +1626,8 @@ def render_halving_analyzer():
         # -------------------------------------------------------------
         bt_state = {
             "initial_capital": 10000.0,
+            "initial_capital_unit": "usd",  # 'usd' o 'btc'
+            "initial_capital_btc": 0.15,
             "ema_fast": 20,
             "ema_slow": 50,
             "ema_trend": 100,
@@ -1715,6 +1717,7 @@ def render_halving_analyzer():
                         bt_state["last_results"] = await run.io_bound(
                             lambda: bt_engine.run_backtest(
                                 initial_capital=bt_state["initial_capital"],
+                                initial_capital_btc=(bt_state["initial_capital_btc"] if bt_state["initial_capital_unit"] == "btc" else None),
                                 commission_pct=bt_state["commission_pct"],
                                 slippage_pct=bt_state["slippage_pct"],
                                 ema_fast=bt_state["ema_fast"],
@@ -1844,7 +1847,23 @@ def render_halving_analyzer():
                                     label='Take Profit'
                                 ).props('dense outlined dark').classes('w-1/2 text-xs')
 
-                            bt_cap_in = ui.number('Capital Inicial ($ USD)', value=bt_state['initial_capital'], min=100, step=1000).props('dense outlined dark').classes('w-full text-xs')
+                            with ui.row().classes('w-full items-center gap-2'):
+                                bt_cap_unit_in = ui.select(
+                                    options={'usd': '$ USD', 'btc': '₿ BTC'},
+                                    value=bt_state['initial_capital_unit'],
+                                    label='Unidad'
+                                ).props('dense outlined dark options-dense').classes('w-28 text-xs')
+
+                                bt_cap_usd_in = ui.number(
+                                    'Capital Inicial ($ USD)', value=bt_state['initial_capital'], min=100, step=1000
+                                ).props('dense outlined dark').classes('flex-1 text-xs')
+                                bt_cap_usd_in.bind_visibility_from(bt_cap_unit_in, 'value', backward=lambda v: v == 'usd')
+
+                                bt_cap_btc_in = ui.number(
+                                    'Capital Inicial (₿ BTC)', value=bt_state['initial_capital_btc'], min=0.0001, step=0.01, format='%.4f'
+                                ).props('dense outlined dark').classes('flex-1 text-xs')
+                                bt_cap_btc_in.bind_visibility_from(bt_cap_unit_in, 'value', backward=lambda v: v == 'btc')
+                            ui.label('Si eliges BTC, la cantidad se convierte a USD usando el precio de cierre del primer día simulado.').classes('text-[10px] text-slate-500 font-mono')
 
                             bt_flat_asset_in = ui.select(
                                 options={
@@ -1930,7 +1949,9 @@ def render_halving_analyzer():
                     ui.notify('Ejecutando simulación de backtest...', type='info', position='top-right')
 
                     # Actualizar estado desde los inputs
-                    bt_state["initial_capital"] = float(bt_cap_in.value or 10000.0)
+                    bt_state["initial_capital_unit"] = str(bt_cap_unit_in.value or 'usd')
+                    bt_state["initial_capital"] = float(bt_cap_usd_in.value or 10000.0)
+                    bt_state["initial_capital_btc"] = float(bt_cap_btc_in.value or 0.0)
                     bt_state["ema_fast"] = int(bt_fast_in.value or 20)
                     bt_state["ema_slow"] = int(bt_slow_in.value or 50)
                     bt_state["trend_mode"] = str(bt_mode_in.value or 'price_above')
@@ -1952,6 +1973,7 @@ def render_halving_analyzer():
                             None,
                             lambda: bt_engine.run_backtest(
                                 initial_capital=bt_state["initial_capital"],
+                                initial_capital_btc=(bt_state["initial_capital_btc"] if bt_state["initial_capital_unit"] == "btc" else None),
                                 commission_pct=bt_state["commission_pct"],
                                 slippage_pct=bt_state["slippage_pct"],
                                 ema_fast=bt_state["ema_fast"],
@@ -2342,6 +2364,7 @@ def render_halving_analyzer():
                     bt_state["last_results"] = await run.io_bound(
                         lambda: bt_engine.run_backtest(
                             initial_capital=bt_state["initial_capital"],
+                            initial_capital_btc=(bt_state["initial_capital_btc"] if bt_state["initial_capital_unit"] == "btc" else None),
                             commission_pct=bt_state["commission_pct"],
                             slippage_pct=bt_state["slippage_pct"],
                             ema_fast=bt_state["ema_fast"],
